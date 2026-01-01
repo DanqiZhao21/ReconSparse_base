@@ -1,0 +1,40 @@
+model:
+  image_architecture: resnet34
+  image_in_chans: 3
+  lidar_architecture: resnet34
+  tf_d_model: 256
+  tf_num_head: 8
+  tf_d_ffn: 1024
+  tf_dropout: 0.1
+  tf_num_layers: 2
+  num_bounding_boxes: 32
+  num_groups: 4
+  trajectory_sampling:
+    num_poses: 8
+  plan_anchor_path: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/resnet34.a1_in1k/kmeans_navsim_traj_20.npy
+  bkb_path: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/resnet34.a1_in1k/pytorch_model.bin
+  bev_features_channels: 256
+  num_bev_classes: 20
+  lidar_resolution_height: 256
+  lidar_resolution_width: 256
+
+env:
+  cuda: 0
+  scene: 0
+  max_steps: 200
+  reward:
+    mode: four_component   # four_component | legacy
+    dmax: 2.0              # meters, positional deviation threshold
+    psi_max_deg: 30.0      # degrees, heading deviation threshold
+    w_dynamic: 5.0         # penalty for dynamic collision
+    w_static: 5.0          # penalty for static collision
+    w_pos: 2.0             # penalty for exceeding dmax
+    w_heading: 1.0         # penalty for exceeding psi_max
+
+train:
+  lr: 2.0e-4
+  lr_value: 1.0e-4
+  epochs: 1
+  horizon: 64
+  clip_eps: 0.2
+  out_dir: outputs/ppo_closed_loop
