@@ -26,6 +26,7 @@
 # ----------------------
 /visual/
 /assets/   # 软链接也会被忽略
+/DiffusionDriveV2/gtrs_traj/
 
 # ----------------------
 # Python / IDE 相关
