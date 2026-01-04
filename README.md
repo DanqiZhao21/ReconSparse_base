@@ -1,5 +1,6 @@
-**ReconDreamer-RL + DiffusionDriveV2 简版使用说明**
 
+
+# ReconDiff简版使用说明
 - **目标:** 统一使用本仓库，快速完成环境配置与数据下载；以 [environment.yml](environment.yml) 为准搭建统一环境（CUDA 11.8 + Python 3.10）。
 - **内容:** 克隆与环境、数据与模型下载、快速运行（缓存与评估）、常见环境变量与提示。
 
@@ -11,8 +12,8 @@
 - 克隆仓库并进入目录：
 
 ```bash
-git clone https://github.com/GigaAI-research/ReconDreamer-RL.git
-cd ReconDreamer-RL
+git clone https://github.com/DanqiZhao21/ReconDiff.git
+cd ReconDiff
 ```
 
 **配置环境（按 environment.yml）**
@@ -20,9 +21,9 @@ cd ReconDreamer-RL
 
 ```bash
 conda env create -f environment.yml
-conda activate recondreamerNew-rl
+conda activate recondiff
 ```
-
+<!-- 
 - 推荐设置 `PYTHONPATH` 以确保包可见：
 
 ```bash
@@ -33,98 +34,123 @@ export PYTHONPATH=$(pwd):$(pwd)/DiffusionDriveV2:$(pwd)/DiffusionDriveV2/navsim:
 
 ```bash
 pip install -e DiffusionDriveV2
-```
+``` -->
 
-**数据与模型下载（DiffusionDriveV2）**
-- 进入下载脚本目录：
+# 数据与模型准备
 
-```bash
-cd DiffusionDriveV2/download
-```
+本文档说明在 **Denso 服务器环境** 下，本项目所依赖的数据集、预训练模型以及仿真资产的配置方式。  
+由于相关资源已统一下载并集中存放在 `OpenDataset` 盘中，用户 **无需重复下载数据或模型**，只需按照说明确认环境变量与软连接配置即可。
 
-- 选择需要的数据分割（示例）：
-- 训练+验证：
+---
 
-```bash
-bash download_trainval.sh
-```
+## 一、navsim 数据集
 
-- 测试集：
+本项目使用的 navsim 数据集，其安装与目录组织方式参考 DiffusionDriveV2 / navsim 官方说明：
 
-```bash
-bash download_test.sh
-```
+- 官方文档：https://github.com/autonomousvision/navsim/blob/main/docs/install.md
 
-- 迷你版（快速体验）：
+在 Denso 服务器中：
 
-```bash
-bash download_mini.sh
-```
+- navsim **完整数据集与地图文件** 已全部下载完成  
+- 数据统一存放在 `OpenDataset` 盘  
+- 相关路径已通过 `bash` 环境变量提前配置完成  
 
-- 加速下载（并行）：
+请确认以下环境变量已存在（**无需修改**）：
 
 ```bash
-bash super_download.sh
+export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
+export NUPLAN_MAPS_ROOT="/OpenDataset/navsim/dataset/maps"
+export NAVSIM_EXP_ROOT="/OpenDataset/navsim/exp"
+export NAVSIM_DEVKIT_ROOT="/OpenDataset/navsim/navsim"
+export OPENSCENE_DATA_ROOT="/OpenDataset/navsim/dataset"
 ```
+在上述环境变量正确设置的情况下，即可直接使用 navsim 数据集进行训练与评测。
 
-- 可选：下载 GTRS 轨迹增强（训练模式选择器时使用）：
+## 二、DiffusionDriveV2 预训练模
+DiffusionDriveV2 依赖 GTRS 轨迹生成模型。Denso服务器上已经下载放入OpenData盘 ,请自行进行软连接，结构应如下：
 
 ```bash
-cd ../gtrs_traj
-wget https://huggingface.co/Zzxxxxxxxx/gtrs/resolve/main/navtrain_16384.pkl
+(recondreamerNew-rl)root@di-20251204200609-rw5zr:~/clone/ReconDreamer-RL# ls -l /root/clone/ReconDreamer-RL/DiffusionDriveV2/gtrs_traj
+lrwxrwxrwx 1 root root 44 Dec 26 15:38 /root/clone/ReconDreamer-RL/DiffusionDriveV2/gtrs_traj -> /OpenDataset/DiffusionDriveV2_data/gtrs_traj
 ```
 
-- 模型权重：从官方资源下载并放置到 [DiffusionDriveV2/ckpt](DiffusionDriveV2/ckpt)
-- `resnet34.a1_in1k`
-- `diffusiondrive_navsim_88p1_PDMS`
-- `diffusiondrivev2_rl.ckpt`
-- `diffusiondrivev2_sel.ckpt`
+DiffusionDriveV2的预训练模型，已经下载放入OpenData盘 ,请自行进行软连接，结构应如下：
+```bash
+(recondreamerNew-rl)root@di-20251204200609-rw5zr:~/clone/ReconDreamer-RL# ls -l /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt
+lrwxrwxrwx 1 root root 39 Dec 27 01:30 /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt -> /OpenDataset/DiffusionDriveV2_data/ckpt
+```
+## 三、Recon Simulator 的 3D 资产
 
-**快速运行**
-- 建议先进行指标与特征缓存（加速训练与评估）：
+Recon Simulator 所需的 3D 场景与资产文件同样已在 Denso 服务器中统一准备完成，并已配置好软连接。
+在项目根目录下，assets 目录指向共享数据盘中的真实资产路径：
+```bash
+(recondreamerNew-rl) root@server:~/clone/ReconDreamer-RL# ls -l assets
+lrwxrwxrwx 1 root root 35 Dec 26 15:34 assets \
+-> /OpenDataset/ReconDreamer-RL/assets
+```
+
+# 快速运行
+## 一、DiffusionDriveV2 快速测评
+
+为加快验证流程，项目提供了 **快速测评（fast）** 版本的评测脚本及其对应的 cache 生成脚本。  
+快速测评主要用于功能验证和调试，不作为最终性能报告。
+
+### 1. 生成快速测评所需的 Cache
+
+在运行快速测评前，需要先生成对应的 cache 文件：
 
 ```bash
-# 回到仓库根目录
-cd ../../
-
-# 设置实验输出目录
-export NAVSIM_EXP_ROOT=$(pwd)/DiffusionDriveV2/exp
-mkdir -p "$NAVSIM_EXP_ROOT"
-
-# 缓存评估指标（PDMS）
-python DiffusionDriveV2/navsim/planning/script/run_metric_caching.py \
-  train_test_split=navtest \
-  cache.cache_path="$NAVSIM_EXP_ROOT/metric_cache"
-
-# 可选：缓存训练所需特征
-python DiffusionDriveV2/navsim/planning/script/run_dataset_caching.py \
-  agent=diffusiondrivev2_rl_agent \
-  experiment_name=diffusiondrivev2_cache \
-  train_test_split=navtrain
+bash /root/clone/ReconDreamer-RL/tools/cache_fast.sh
 ```
-
-- 评估（快速）：
-
+该脚本仅针对 DiffusionDriveV2 单模型评测，用于生成快速测评所需的 cache 数据。
+### 2. 运行 DiffusionDriveV2 快速测评
+完成 cache 生成后，可直接运行快速测评脚本：
 ```bash
-python DiffusionDriveV2/navsim/planning/script/run_pdm_score_fast.py \
-  agent=diffusiondrivev2_sel_agent \
-  experiment_name=diffusiondrivev2_agent_eval \
-  train_test_split=navtest \
-  agent.checkpoint_path=DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt \
-  +metric_cache_path="$NAVSIM_EXP_ROOT/metric_cache/"
+bash /root/clone/ReconDreamer-RL/tools/evaluate_fast.sh
 ```
+## 二、DiffusionDriveV2 标准测评
 
-- 也可使用本仓库脚本：
-- 快速评估：[tools/evaluate_fast.sh](tools/evaluate_fast.sh)
-- 标准评估：[tools/evaluate.sh](tools/evaluate.sh)
+标准测评用于获取完整、可复现的评测结果，运行时间较长，但评测流程与指标设置更加全面。
 
-**常见环境变量与提示**
-- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（减少显存碎片）
-- `CUDA_VISIBLE_DEVICES=0,1`（选择 GPU）
-- 若遇到 `ModuleNotFoundError`：检查是否已激活 `recondreamerNew-rl` 并设置了 `PYTHONPATH`
-- 若 CUDA 版本不匹配：请保持 Conda 中的 `cudatoolkit=11.8` 与驱动兼容
+### 1. 生成标准测评所需的 Cache
 
-**参考文件与目录**
+在运行标准测评前，需要先生成完整评测流程所需的 cache 文件：
+```bash
+bash /root/clone/ReconDreamer-RL/tools/cache.sh
+```
+### 2. 运行 DiffusionDriveV2 标准测评
+完成 cache 生成后，执行标准评测脚本：
+```bash
+bash /root/clone/ReconDreamer-RL/tools/evaluate.sh
+```
+该评测流程对应 DiffusionDriveV2 的标准评测设置，推荐用于实验结果统计与对比分析.
+
+## 三、闭环训练ReconDiff（DiffusionDriveV2 + ReconDreamer 3DGS）
+本项目支持将 DiffusionDriveV2 与 ReconDreamer 的 3D Gaussian Splatting（3DGS） 结合，进行闭环训练。
+运行以下脚本即可启动闭环训练流程：
+```bash
+bash /root/clone/ReconDreamer-RL/tools/trainclosedloop.sh
+```
+该脚本集成了：
+
+- DiffusionDriveV2 的轨迹生成能力
+
+- ReconDreamer 3DGS 的环境重建与感知反馈
+
+- 闭环交互式训练流程
+
+适用于端到端的闭环强化学习与仿真训练实验。
+
+| 脚本名称 | 功能说明 |
+| --- | --- |
+| cache_fast.sh | DiffusionDriveV2 快速测评所需 cache 生成 |
+| evaluate_fast.sh | DiffusionDriveV2 快速测评 |
+| cache.sh | DiffusionDriveV2 标准测评所需 cache 生成 |
+| evaluate.sh | DiffusionDriveV2 标准测评 |
+| trainclosedloop.sh | DiffusionDriveV2 + ReconDreamer 3DGS 闭环训练 |
+
+
+# 参考文件与目录
 - 环境： [environment.yml](environment.yml)
 - DiffusionDriveV2 环境： [DiffusionDriveV2/environment.yml](DiffusionDriveV2/environment.yml)
 - 数据下载脚本： [DiffusionDriveV2/download](DiffusionDriveV2/download)
@@ -132,101 +158,3 @@ python DiffusionDriveV2/navsim/planning/script/run_pdm_score_fast.py \
 - 训练（闭环RL示例）： [script/train_closed_loop.py](script/train_closed_loop.py)
 
 以上为最小可用的安装与运行步骤。需要完整训练流程与更细致评估，请参考 DiffusionDriveV2 的文档与脚本目录。<div align="center">   
-
-# ReconDreamer-RL: Enhancing Reinforcement Learning via Diffusion-based Scene Reconstruction
-
-
-## [Project Page](https://github.com/GigaAI-research/ReconDreamer-RL) | [Paper](https://arxiv.org/html/2508.08170v1)
-</div>
-
-# Abstract 
-
-Reinforcement learning for training end-to-end autonomous driving models in closed-loop simulations is gaining growing attention. However, most simulation environments differ significantly from real-world conditions, creating a substantial simulation-to-reality (sim2real) gap. To bridge this gap, some approaches utilize scene reconstruction techniques to create photorealistic environments as a simulator. While this improves realistic sensor simulation, these methods are inherently constrained by the distribution of the training data, making it difficult to render high-quality sensor data for novel trajectories or corner case scenarios. Therefore, we propose <strong>ReconDreamer-RL</strong>, a framework designed to integrate video diffusion priors into scene reconstruction to aid reinforcement learning, thereby enhancing end-to-end autonomous driving training. Specifically, in <strong>ReconDreamer-RL</strong>, we introduce <strong>ReconSimulator</strong>, which combines the video diffusion prior for appearance modeling and incorporates a kinematic model for physical modeling, thereby reconstructing driving scenarios from real-world data. This narrows the sim2real gap for closed-loop evaluation and reinforcement learning. To cover more corner-case scenarios, we introduce the <strong>Dynamic Adversary Agent (DAA)</strong>, which adjusts the trajectories of surrounding vehicles relative to the ego vehicle, autonomously generating corner-case traffic scenarios (e.g., cut-in). Finally, the <strong>Cousin Trajectory Generator (CTG)</strong> is proposed to address the issue of training data distribution, which is often biased toward simple straight-line movements. Experiments show that <strong>ReconDreamer-RL</strong> improves end-to-end autonomous driving training, outperforming imitation learning methods with a 5× reduction in the Collision Ratio.</p>
-
-
-<img width="919" alt="abs" src="https://github.com/Nichaojun/Nichaojun.github.io/blob/main/images/pipeline6_01.png">
-
-
-# News
-- **[2025/11/1]** We provide the 3DGS reconstruction from the NuScenes dataset, along with a Gym-based environment for closed-loop simulation.
-
-
-# Getting Started
-
-**a. Create a Conda virtual environment and activate it.**
-
-```shell
-conda create -n recondreamer-rl python=3.9 -y
-conda activate recondreamer-rl
-```
-
-**b. Install required packages.**
-
-```shell
-pip install -r requirements.txt
-```
-
-**c. Download necessary assets.**
-To download the assets required for this project, execute the following command:
-
-```shell
-git clone https://huggingface.co/datasets/Ni1111/ReconDreamer-RL/tree/main/assets
-mkdir  assets/third
-
-git clone --branch v1.3.0 https://github.com/nerfstudio-project/gsplat.git assets/third/gsplat-1.3.0
-git clone --branch v0.3.0 https://github.com/NVlabs/nvdiffrast.git assets/third/nvdiffrast-0.3.0
-```
-Final Directory Structure:
-```text
-project_root/
-├── assets/
-│   ├── third/
-│   │   ├── gsplat-1.3.0/
-│   │   └── nvdiffrast-0.3.0/
-│   └── nus/
-├── policy/
-├── reconsimulator/
-├── script/
-└── requirements.txt
-```
-
-**d. Install third-party dependencies.**
-
-```shell
-pip install -e assets/third/gsplat-1.3.0
-pip install -e assets/third/nvdiffrast-0.3.0
-```
-
-**e. Start the 3DGS environment as a server.**
-
-```shell
-conda activate recondreamer-rl
-python script/eval_human_policy.py
-```
-
-**f. Launch the human policy.**
-We provide an example of how to interact with the 3DGS environment using the human policy, which controls the ego vehicle based on the dataset annotations.
-```shell
-conda activate recondreamer-rl
-python policy/human/deploy_policy.py
-```
-
-
-#  Citation
-If you find Recondreamer-RL useful in your research or applications, please consider giving us a star and citing it by the following BibTeX entry:
-
-```bibtex
-@article{Recondreamer-RL, 
-  title={Recondreamer-RL: Enhancing reinforcement learning via diffusion-based scene reconstruction},
-  author={Ni, Chaojun and Zhao, Guosheng and Wang, Xiaofeng and Zhu, Zheng and Qin, Wenkang and Chen, Xinze and Jia, Guanghong and Huang, Guan and Mei, Wenjun},
-  journal={arXiv preprint arXiv:2508.08170},
-  year={2025}
-}
-````
-
-#  Acknowledgments
-Recondreamer-RL is greatly inspired by the following outstanding works:
-* **[RAD](https://github.com/hustvl/RAD.git)**
-* [VADv2](https://github.com/priest-yang/VADv2.git)
-* [DriveStudio](https://github.com/ziyc/drivestudio.git)
-* [DriveDreamer2](https://github.com/f1yfisher/DriveDreamer2.git)
