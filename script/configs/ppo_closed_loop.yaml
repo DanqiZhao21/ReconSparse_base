@@ -39,6 +39,9 @@ train:
   horizon: 64
   clip_eps: 0.2
   out_dir: outputs/ppo_closed_loop
+  save_video: true
+  video_path: outputs/ppo_closed_loop/episode.mp4
+  fps: 10
 
 agent:
   use_ddv2: true

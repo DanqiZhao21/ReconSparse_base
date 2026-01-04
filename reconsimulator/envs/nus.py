@@ -151,7 +151,8 @@ class ReconSimulator(gym.Env):
             )
         else:
             selected_idx = ax_index * self.y_anchor + ay_index#FIXME: 之类的x y index是ageny给出的最终的Predict的结果？
-            future_x, future_y = self.plan_anchors[selected_idx][0][-1, :]
+            # future_x, future_y = self.plan_anchors[selected_idx][0][-1, :]#NOTE plan_anchors.shape (3721, 6, 2) 
+            future_x, future_y = self.plan_anchors[selected_idx][-1, :]#DEBUG 源代码似乎索引错误了
             future_yaw = self.plan_anchors_yaw[selected_idx]
             tpt = np.array([
                 [math.cos(future_yaw), -math.sin(future_yaw), 0, future_x],
