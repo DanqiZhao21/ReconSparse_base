@@ -49,6 +49,8 @@ class ReconSimulator(gym.Env):
         self.get_all_point_for_expert()
 
     # ------------------------- Private loading functions ------------------------ #
+    # ALL_CAMS_FILE   = os.path.join(DATA_ROOT, "others", "all_cams.pkl") 6 个相机的「静态相机参数模板」
+    # ALL_IMAGES_FILE = os.path.join(DATA_ROOT, "others", "all_images.pkl")
     def _load_camera_and_images(self):
         with open(cfg.ALL_CAMS_FILE, "rb") as f:
             self.all_cams = pickle.load(f)
@@ -68,7 +70,7 @@ class ReconSimulator(gym.Env):
             if os.path.exists(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/cam2ego/{i}.txt"))
         ]
 
-    def _load_expert_ego_frames(self):
+    def _load_expert_ego_frames(self):#NOTE 专家车辆轨迹（ground-truth trajectory）:世界坐标到前置相机起始坐标的相对变换
         self.all_expert_ego = []
         for i in range(0, self.final_frame + self.step_frames, self.step_frames):
             expert_world = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{i:03d}.txt"))
@@ -93,13 +95,13 @@ class ReconSimulator(gym.Env):
     # ------------------------- Observation & Info ------------------------ #
     def _get_obs(self):
         """
-        Compute observation images from all active cameras using the trainer.
+        Compute observation images from all active cameras using the trainer.根据当前相机信息生成可观察的 RGB 图像
         """
         self.now_observe_image = []
         with torch.no_grad():
             for cam in self.all_camera_now:
                 cam_info, img_info = cam
-                results = self.trainer(img_info, cam_info)
+                results = self.trainer(img_info, cam_info)#NOTE self.trainer(img_info, cam_info)：
                 rgb = results['rgb'].clamp(0, 1).cpu().numpy()
                 scaled_rgb = (rgb * 255).astype(np.uint8)
                 self.now_observe_image.append(scaled_rgb)
@@ -117,7 +119,7 @@ class ReconSimulator(gym.Env):
         return {}
 
     # ------------------------- Gym API ------------------------ #
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None, options=None):#NOTE 重置环境，重新开始一个新场景。
         self.update(seed)
         self.start_ego = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/000.txt"))
         self.start_ego = np.linalg.inv(self.camera_front_start) @ self.start_ego
@@ -139,7 +141,7 @@ class ReconSimulator(gym.Env):
 
         return self._get_obs(), self._get_info()
 
-    def step(self, action):
+    def step(self, action):#NOTE 根据动作 action 更新车辆状态（ego pose
         self.now_frame += self.step_frames
         ax_index, ay_index,flag = action
 
@@ -148,7 +150,7 @@ class ReconSimulator(gym.Env):
                 os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
             )
         else:
-            selected_idx = ax_index * self.y_anchor + ay_index
+            selected_idx = ax_index * self.y_anchor + ay_index#FIXME: 之类的x y index是ageny给出的最终的Predict的结果？
             future_x, future_y = self.plan_anchors[selected_idx][0][-1, :]
             future_yaw = self.plan_anchors_yaw[selected_idx]
             tpt = np.array([
@@ -157,12 +159,12 @@ class ReconSimulator(gym.Env):
                 [0, 0, 1, 0],
                 [0, 0, 0, 1]
             ])
-            self.start_ego = self.start_ego @ tpt
+            self.start_ego = self.start_ego @ tpt#NOTE 下一帧 ego pose
         self.start_ego[1][-1] = self.updateGroundDistance()
             
         
         w,h = 800,450
-        for i in range(6):
+        for i in range(6):#NOTE 更新相机信息
             loaded_cam_infos = copy.deepcopy(self.all_cams[i])
             loaded_cam_infos = move_to_device(loaded_cam_infos,self.device)
             loaded_cam_infos['camera_to_world'] = torch.tensor(self.start_ego @ self.cam2ego[i]).to(self.device).to(torch.float32)
@@ -248,7 +250,7 @@ class ReconSimulator(gym.Env):
         self.expert_altitude  = [matrix[:3, 3][[1]] for matrix in self.expert_world_all]
 
 
-    def updateGroundDistance(self):
+    def updateGroundDistance(self):#NOTE 用当前 x,z 找到离自己最近的 expert 点;取这个 expert 点的 y 作为地面高度
         start_ego_position = self.start_ego[:3, 3][[0, 2]]
         distances = cdist([start_ego_position], self.expert_pair, 'euclidean')[0]
         nearest_indices = np.argsort(distances)[:1] 

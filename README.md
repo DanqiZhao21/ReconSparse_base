@@ -1,4 +1,137 @@
-<div align="center">   
+**ReconDreamer-RL + DiffusionDriveV2 简版使用说明**
+
+- **目标:** 统一使用本仓库，快速完成环境配置与数据下载；以 [environment.yml](environment.yml) 为准搭建统一环境（CUDA 11.8 + Python 3.10）。
+- **内容:** 克隆与环境、数据与模型下载、快速运行（缓存与评估）、常见环境变量与提示。
+
+**前置要求**
+- NVIDIA GPU（建议 CUDA 11.8），已安装驱动
+- Conda（Miniconda/Anaconda）与 Git
+
+**获取代码**
+- 克隆仓库并进入目录：
+
+```bash
+git clone https://github.com/GigaAI-research/ReconDreamer-RL.git
+cd ReconDreamer-RL
+```
+
+**配置环境（按 environment.yml）**
+- 用根目录的环境文件创建并激活：
+
+```bash
+conda env create -f environment.yml
+conda activate recondreamerNew-rl
+```
+
+- 推荐设置 `PYTHONPATH` 以确保包可见：
+
+```bash
+export PYTHONPATH=$(pwd):$(pwd)/DiffusionDriveV2:$(pwd)/DiffusionDriveV2/navsim:$PYTHONPATH
+```
+
+- 可选：以可编辑方式注册 DiffusionDriveV2（便于开发调试）：
+
+```bash
+pip install -e DiffusionDriveV2
+```
+
+**数据与模型下载（DiffusionDriveV2）**
+- 进入下载脚本目录：
+
+```bash
+cd DiffusionDriveV2/download
+```
+
+- 选择需要的数据分割（示例）：
+- 训练+验证：
+
+```bash
+bash download_trainval.sh
+```
+
+- 测试集：
+
+```bash
+bash download_test.sh
+```
+
+- 迷你版（快速体验）：
+
+```bash
+bash download_mini.sh
+```
+
+- 加速下载（并行）：
+
+```bash
+bash super_download.sh
+```
+
+- 可选：下载 GTRS 轨迹增强（训练模式选择器时使用）：
+
+```bash
+cd ../gtrs_traj
+wget https://huggingface.co/Zzxxxxxxxx/gtrs/resolve/main/navtrain_16384.pkl
+```
+
+- 模型权重：从官方资源下载并放置到 [DiffusionDriveV2/ckpt](DiffusionDriveV2/ckpt)
+- `resnet34.a1_in1k`
+- `diffusiondrive_navsim_88p1_PDMS`
+- `diffusiondrivev2_rl.ckpt`
+- `diffusiondrivev2_sel.ckpt`
+
+**快速运行**
+- 建议先进行指标与特征缓存（加速训练与评估）：
+
+```bash
+# 回到仓库根目录
+cd ../../
+
+# 设置实验输出目录
+export NAVSIM_EXP_ROOT=$(pwd)/DiffusionDriveV2/exp
+mkdir -p "$NAVSIM_EXP_ROOT"
+
+# 缓存评估指标（PDMS）
+python DiffusionDriveV2/navsim/planning/script/run_metric_caching.py \
+  train_test_split=navtest \
+  cache.cache_path="$NAVSIM_EXP_ROOT/metric_cache"
+
+# 可选：缓存训练所需特征
+python DiffusionDriveV2/navsim/planning/script/run_dataset_caching.py \
+  agent=diffusiondrivev2_rl_agent \
+  experiment_name=diffusiondrivev2_cache \
+  train_test_split=navtrain
+```
+
+- 评估（快速）：
+
+```bash
+python DiffusionDriveV2/navsim/planning/script/run_pdm_score_fast.py \
+  agent=diffusiondrivev2_sel_agent \
+  experiment_name=diffusiondrivev2_agent_eval \
+  train_test_split=navtest \
+  agent.checkpoint_path=DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt \
+  +metric_cache_path="$NAVSIM_EXP_ROOT/metric_cache/"
+```
+
+- 也可使用本仓库脚本：
+- 快速评估：[tools/evaluate_fast.sh](tools/evaluate_fast.sh)
+- 标准评估：[tools/evaluate.sh](tools/evaluate.sh)
+
+**常见环境变量与提示**
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（减少显存碎片）
+- `CUDA_VISIBLE_DEVICES=0,1`（选择 GPU）
+- 若遇到 `ModuleNotFoundError`：检查是否已激活 `recondreamerNew-rl` 并设置了 `PYTHONPATH`
+- 若 CUDA 版本不匹配：请保持 Conda 中的 `cudatoolkit=11.8` 与驱动兼容
+
+**参考文件与目录**
+- 环境： [environment.yml](environment.yml)
+- DiffusionDriveV2 环境： [DiffusionDriveV2/environment.yml](DiffusionDriveV2/environment.yml)
+- 数据下载脚本： [DiffusionDriveV2/download](DiffusionDriveV2/download)
+- 评估脚本： [tools/evaluate_fast.sh](tools/evaluate_fast.sh), [tools/evaluate.sh](tools/evaluate.sh)
+- 训练（闭环RL示例）： [script/train_closed_loop.py](script/train_closed_loop.py)
+
+以上为最小可用的安装与运行步骤。需要完整训练流程与更细致评估，请参考 DiffusionDriveV2 的文档与脚本目录。<div align="center">   
 
 # ReconDreamer-RL: Enhancing Reinforcement Learning via Diffusion-based Scene Reconstruction
 

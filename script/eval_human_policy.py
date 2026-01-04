@@ -22,7 +22,7 @@ register(
 
 
 # --------------------------- Helper Functions ------------------------ #
-def send_observation_until_success_np(observation_dict: dict) -> dict:
+def send_observation_until_success_np(observation_dict: dict) -> dict:#NOTE 输入：observation_dict;输出：服务器返回的 JSON 解析后的字典:{"action": [ax_index, ay_index, flag]}
     while True:
         try:
             # Validate that observation_dict contains numpy arrays

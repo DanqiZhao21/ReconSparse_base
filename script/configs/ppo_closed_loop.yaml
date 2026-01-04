@@ -22,6 +22,7 @@ env:
   cuda: 0
   scene: 0
   max_steps: 200
+  debug: false
   reward:
     mode: four_component   # four_component | legacy
     dmax: 2.0              # meters, positional deviation threshold
@@ -38,3 +39,7 @@ train:
   horizon: 64
   clip_eps: 0.2
   out_dir: outputs/ppo_closed_loop
+
+agent:
+  use_ddv2: true
+  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt
