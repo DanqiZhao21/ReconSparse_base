@@ -152,9 +152,8 @@ bash /root/clone/ReconDreamer-RL/tools/trainclosedloop.sh
 
 # 参考文件与目录
 - 环境： [environment.yml](environment.yml)
-- DiffusionDriveV2 环境： [DiffusionDriveV2/environment.yml](DiffusionDriveV2/environment.yml)
-- 数据下载脚本： [DiffusionDriveV2/download](DiffusionDriveV2/download)
-- 评估脚本： [tools/evaluate_fast.sh](tools/evaluate_fast.sh), [tools/evaluate.sh](tools/evaluate.sh)
-- 训练（闭环RL示例）： [script/train_closed_loop.py](script/train_closed_loop.py)
+- DiffusionDriveV2 ： [DiffusionDriveV2](https://github.com/hustvl/DiffusionDriveV2)
+- 3DGS World Model : [ReconDreamer-RL](https://github.com/GigaAI-research/ReconDreamer-RL)
+- 数据下载脚本： [Navsim](https://github.com/autonomousvision/navsim/blob/main/docs/install.md)
 
-以上为最小可用的安装与运行步骤。需要完整训练流程与更细致评估，请参考 DiffusionDriveV2 的文档与脚本目录。<div align="center">   
+   
