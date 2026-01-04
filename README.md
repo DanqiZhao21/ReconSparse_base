@@ -155,5 +155,5 @@ bash /root/clone/ReconDreamer-RL/tools/trainclosedloop.sh
 - DiffusionDriveV2 ： [DiffusionDriveV2](https://github.com/hustvl/DiffusionDriveV2)
 - 3DGS World Model : [ReconDreamer-RL](https://github.com/GigaAI-research/ReconDreamer-RL)
 - 数据下载脚本： [Navsim](https://github.com/autonomousvision/navsim/blob/main/docs/install.md)
-
+- 关于Anchor的详细信息： [3DGSanchor](https://huggingface.co/datasets/Ni1111/ReconDreamer-RL/tree/main/assets)可以参考[RAD](https://github.com/hustvl/RAD/blob/main/data/data.md)工作中对data anchor 部分的解释。
    
