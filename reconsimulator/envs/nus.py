@@ -116,7 +116,14 @@ class ReconSimulator(gym.Env):
         }
 
     def _get_info(self):
-        return {}
+        return {
+            "exp_pos": getattr(self, "last_exp_pos", None),
+            "act_pos": getattr(self, "last_act_pos", None),
+            "exp_yaw_deg": getattr(self, "last_exp_yaw_deg", None),
+            "act_yaw_deg": getattr(self, "last_act_yaw_deg", None),
+            "xz_err_m": getattr(self, "last_xz_err_m", None),
+            "yaw_err_deg": getattr(self, "last_yaw_err_deg", None),
+        }
 
     # ------------------------- Gym API ------------------------ #
     def reset(self, seed=None, options=None):#NOTE 重置环境，重新开始一个新场景。
@@ -140,30 +147,100 @@ class ReconSimulator(gym.Env):
             self.all_camera_now.append((cam_info, img_info))
 
         return self._get_obs(), self._get_info()
-
+#ADD 修改了一下step函数的逻辑
+    
     def step(self, action):#NOTE 根据动作 action 更新车辆状态（ego pose
         self.now_frame += self.step_frames
-        ax_index, ay_index,flag = action
+        ax_index, ay_index, flag = action
 
-        if self.debug or flag:
-            self.start_ego = np.linalg.inv(self.camera_front_start) @ np.loadtxt(
-                os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
+        # --- 计算专家下一帧位姿（world→front-start 相对变换） ---
+        expert_next_ego = np.linalg.inv(self.camera_front_start) @ np.loadtxt(
+            os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
+        )
+
+        # --- 计算 action 锚点推进的“假设下一帧”位姿（用于对比或真实推进） ---
+        selected_idx = ax_index * self.y_anchor + ay_index
+        future_xy = self.plan_anchors[selected_idx][-1, :]
+        if torch.is_tensor(future_xy):
+            future_x = float(future_xy[0].item())
+            future_y = float(future_xy[1].item())
+        else:
+            future_x = float(future_xy[0])
+            future_y = float(future_xy[1])
+
+        future_yaw_v = self.plan_anchors_yaw[selected_idx]
+        if torch.is_tensor(future_yaw_v):
+            future_yaw = float(future_yaw_v.item())
+        else:
+            future_yaw = float(future_yaw_v)
+
+        tpt = np.array([
+            [math.cos(future_yaw), -math.sin(future_yaw), 0, future_x],
+            [math.sin(future_yaw),  math.cos(future_yaw), 0, future_y],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        action_next_ego = self.start_ego @ tpt
+        # 记录用于 info 的位置（x,y,z）与航向/误差
+        self.last_exp_pos = expert_next_ego[:3, 3].copy()
+        self.last_act_pos = action_next_ego[:3, 3].copy()
+        def _yaw_from_R(Rm):
+            return math.atan2(Rm[1, 0], Rm[0, 0])
+        exp_yaw = _yaw_from_R(expert_next_ego[:3, :3])
+        act_yaw = _yaw_from_R(action_next_ego[:3, :3])
+        pos_delta = self.last_act_pos - self.last_exp_pos
+        self.last_xz_err_m = float(np.linalg.norm(pos_delta[[0, 2]]))
+        self.last_yaw_err_deg = abs((act_yaw - exp_yaw) * 180.0 / math.pi)
+        self.last_exp_yaw_deg = float(exp_yaw * 180.0 / math.pi)
+        self.last_act_yaw_deg = float(act_yaw * 180.0 / math.pi)
+
+        # --- 根据 debug/flag 选择真实推进 ---
+        print(f"self.debug is {self.debug}, flag is {flag}")
+        if self.debug:
+            # Debug 模式：使用专家推进，并打印与 action 推进的差异
+            self.start_ego = expert_next_ego
+            self.start_ego[1][-1] = self.updateGroundDistance()
+
+            exp_pos = self.last_exp_pos
+            act_pos = self.last_act_pos
+            pos_delta = act_pos - exp_pos
+            pos_xz_err = self.last_xz_err_m
+            exp_yaw = self.last_exp_yaw_deg
+            act_yaw = self.last_act_yaw_deg
+            yaw_err_deg = self.last_yaw_err_deg
+
+            print(
+                f"🐅[Frame {self.now_frame:03d}] action(ax={ax_index}, ay={ay_index}, flag={flag}) | "
+                f"expert_pos=({exp_pos[0]:.3f},{exp_pos[1]:.3f},{exp_pos[2]:.3f}) yaw={exp_yaw:.2f}deg "
+                f"action_pos=({act_pos[0]:.3f},{act_pos[1]:.3f},{act_pos[2]:.3f}) yaw={act_yaw:.2f}deg "
+                f"delta=({pos_delta[0]:.3f},{pos_delta[1]:.3f},{pos_delta[2]:.3f}); "
+                f"xz_err={pos_xz_err:.3f}m, yaw_err={yaw_err_deg:.2f}deg"
             )
         else:
-            selected_idx = ax_index * self.y_anchor + ay_index#FIXME: 之类的x y index是ageny给出的最终的Predict的结果？
-            # future_x, future_y = self.plan_anchors[selected_idx][0][-1, :]#NOTE plan_anchors.shape (3721, 6, 2) 
-            future_x, future_y = self.plan_anchors[selected_idx][-1, :]#DEBUG 源代码似乎索引错误了
-            future_yaw = self.plan_anchors_yaw[selected_idx]
-            tpt = np.array([
-                [math.cos(future_yaw), -math.sin(future_yaw), 0, future_x],
-                [math.sin(future_yaw), math.cos(future_yaw), 0, future_y],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
-            self.start_ego = self.start_ego @ tpt#NOTE 下一帧 ego pose
-        self.start_ego[1][-1] = self.updateGroundDistance()
+            # 非 debug 模式：遵循原始逻辑（flag=1 走专家；否则走 action）
+            if flag:
+                self.start_ego = expert_next_ego
+            else:
+                self.start_ego = action_next_ego
             
-        
+            exp_pos = self.last_exp_pos
+            act_pos = self.last_act_pos
+            pos_delta = act_pos - exp_pos
+            pos_xz_err = self.last_xz_err_m
+            exp_yaw = self.last_exp_yaw_deg
+            act_yaw = self.last_act_yaw_deg
+            yaw_err_deg = self.last_yaw_err_deg
+
+            print(
+                f"🐅[Frame {self.now_frame:03d}] action(ax={ax_index}, ay={ay_index}, flag={flag}) | "
+                f"expert_pos=({exp_pos[0]:.3f},{exp_pos[1]:.3f},{exp_pos[2]:.3f}) yaw={exp_yaw:.2f}deg "
+                f"action_pos=({act_pos[0]:.3f},{act_pos[1]:.3f},{act_pos[2]:.3f}) yaw={act_yaw:.2f}deg "
+                f"delta=({pos_delta[0]:.3f},{pos_delta[1]:.3f},{pos_delta[2]:.3f}); "
+                f"xz_err={pos_xz_err:.3f}m, yaw_err={yaw_err_deg:.2f}deg"
+            )
+            self.start_ego[1][-1] = self.updateGroundDistance()
+            
+#ADD
         w,h = 800,450
         for i in range(6):#NOTE 更新相机信息
             loaded_cam_infos = copy.deepcopy(self.all_cams[i])
@@ -255,5 +332,5 @@ class ReconSimulator(gym.Env):
         start_ego_position = self.start_ego[:3, 3][[0, 2]]
         distances = cdist([start_ego_position], self.expert_pair, 'euclidean')[0]
         nearest_indices = np.argsort(distances)[:1] 
-        print(nearest_indices)
+        # print(nearest_indices)
         return self.expert_altitude[nearest_indices[0]]

@@ -22,7 +22,7 @@ env:
   cuda: 0
   scene: 0
   max_steps: 200
-  debug: false
+  debug: False
   reward:
     mode: four_component   # four_component | legacy
     dmax: 2.0              # meters, positional deviation threshold
@@ -42,7 +42,14 @@ train:
   save_video: true
   video_path: outputs/ppo_closed_loop/episode.mp4
   fps: 10
+  draw_traj_overlay: true
 
 agent:
   use_ddv2: true
   ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt
+
+eval:
+  save_video: true
+  video_path: outputs/ppo_closed_loop/eval_episode.mp4
+  fps: 10
+  draw_traj_overlay: true

@@ -20,12 +20,23 @@ class TransfuserBackbone(nn.Module):
 
         super().__init__()
         self.config = config
-        try:
-            self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True)
-        except Exception as e:
-            print(f"Failed to load image encoder with error: {e}")
-            self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True,
-                                                   pretrained_cfg_overlay=dict(file=config.bkb_path))
+        #DEBUG
+        # try:
+        #     self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True)
+        # except Exception as e:
+        #     print(f"Failed to load image encoder with error: {e}")
+        #     self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True,
+        #                                            pretrained_cfg_overlay=dict(file=config.bkb_path))
+        #NOTE修改了image encoder的加载方式 禁止从互联网加载预训练权重
+        self.image_encoder = timm.create_model(
+            config.image_architecture,
+            pretrained=False,          # 🔥 关键
+            features_only=True
+        )
+        state_dict = torch.load(config.bkb_path, map_location="cpu")
+        self.image_encoder.load_state_dict(state_dict, strict=False)
+        #DEBUG 
+        
         if config.use_ground_plane:
             in_channels = 2 * config.lidar_seq_len
         else:
