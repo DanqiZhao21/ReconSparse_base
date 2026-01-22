@@ -39,8 +39,8 @@ def main():
     x_anchor = getattr(env.env, "x_anchor", 61)
     y_anchor = getattr(env.env, "y_anchor", 61)
     agent_cfg = cfg.get("agent", {})
-    ckpt_path = agent_cfg.get("ckpt", "/root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt")
-    use_ddv2 = bool(agent_cfg.get("use_ddv2", True))
+    ckpt_path = agent_cfg.get("ckpt", "/root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt")
+    use_ddv2 = bool(agent_cfg.get("use_ddv2", True))#ddv2 diffusionDriveV2Policy
 
     if use_ddv2:
         agent = DiffusionDriveV2Policy(x_anchor=x_anchor, y_anchor=y_anchor, ckpt_path=ckpt_path, device=f"cuda:{cuda}")
@@ -134,14 +134,11 @@ def main():
         writer = imageio.get_writer(final_video_path, mode="I", fps=fps)
         writer.append_data(_grid_frame(obs, None))
 
-    # Evaluation loop using learned scorer (no-grad)
+    # Evaluation loop
     for t in range(max_steps):
-        if isinstance(agent, DiffusionDriveV2Policy) and hasattr(agent, "forward_test"):
-            pred = agent.forward_test(obs)
-            traj = pred["trajectory"]  # (1,8,3)
-            traj_np = traj.squeeze(0).detach().cpu().numpy()
-            x, y = float(traj_np[0, 0]), float(traj_np[0, 1])
-            action = agent.quantize_xy_to_action(x, y)
+        if isinstance(agent, DiffusionDriveV2Policy) and hasattr(agent, "step_ddv2rl"):
+            # DDV2-RL continuous action: (x, y, yaw, flag=2)
+            action, _logp = agent.step_ddv2rl(obs, eta=1.0)
         else:
             action = agent.act(obs)
             if isinstance(action, tuple):

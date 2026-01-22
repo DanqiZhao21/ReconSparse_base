@@ -21,10 +21,16 @@ model:
 env:
   cuda: 0
   scene: 0
-  max_steps: 200
+  max_steps: 64
   debug: False
+  # Use all scenes under assets/nus/data; sample scene per episode
+  use_all_scenes: true
+  scene_sampling: random  # random | sequential
   reward:
-    mode: four_component   # four_component | legacy
+    # Reward modes:
+    # - step: per-step four-component + optional jerk
+    # - episode: per-episode jerk (per-step reward=0)，阈值/碰撞仍会触发即时终止
+    mode: step
     dmax: 2.0              # meters, positional deviation threshold
     psi_max_deg: 30.0      # degrees, heading deviation threshold
     w_dynamic: 5.0         # penalty for dynamic collision
@@ -32,21 +38,91 @@ env:
     w_pos: 2.0             # penalty for exceeding dmax
     w_heading: 1.0         # penalty for exceeding psi_max
 
+    # Smoothness (jerk) terms
+    dt: 0.1
+    w_longitudinal_jerk: 0.05
+    w_yaw_jerk: 0.05
+    jerk_clip: 50.0
+
+    # Step-level reward logging to Weights & Biases
+    logging:
+      wandb:
+        enable: true
+        prefix: rl
+
+    # Optional sparse terminal penalty + early termination ("gameover") based on tracking error.
+    # If enabled and thresholds are exceeded, env will set terminated=True and include
+    # done_reason / terminal_penalty in info["episode_metrics"].
+    terminal:
+      enable: true
+      # Trigger early termination when error exceeds thresholds (if info provides xz_err_m/yaw_err_deg).
+      xz_err_m_max: 5.0
+      yaw_err_deg_max: 45.0
+      terminate_on_xz_err: true
+      terminate_on_yaw_err: true
+      terminate_on_static_collision: true
+      terminate_on_dynamic_collision: true
+      # Added to episode_reward when applied (keep single scalar reward).
+      penalty: -5.0
+      apply_on_failure: true
+      apply_on_timeout: false
+      apply_on_env_done: false
+
 train:
+  # algo options (closed-loop training on DiffusionDriveV2-RL planner):
+  # - ddv2_rl_reinforce: episode-level REINFORCE (update once per episode)
+  # - ddv2_rl_ppo: episode-level PPO (GAE + value baseline, update on a batch of episodes)
+  # Note: `ppo` (anchor-space baseline) still exists, but ddv2 training uses the two modes above.
+  algo: ddv2_rl_ppo
+  ddv2_eta: 1.0
+  # ddv2_mode_idx: 0 # Choose a fixed trajectory mode index (0-based) from DDV2's multi-modal outputs.
+  # Use -1 to auto-select trajectory mode by logp softmax (adds exploration)
+  # Recommended for learning signal diversity
+  ddv2_mode_idx: -1
+  ddv2_max_grad_norm: 0.5
+  batch_episodes: 4
+  vf_coef: 0.5
   lr: 2.0e-4
   lr_value: 1.0e-4
-  epochs: 1
+  epochs: 2
+  updates: 15
   horizon: 64
+  minibatch_size: 64
   clip_eps: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
   out_dir: outputs/ppo_closed_loop
-  save_video: true
+  save_video: false
   video_path: outputs/ppo_closed_loop/episode.mp4
   fps: 10
   draw_traj_overlay: true
+  # Training video can get huge; cap frames written.
+  max_video_frames: 64 #horizon=64 → 每个更新收集 64 步数据;最多也只写入64帧
+  # If use_ddv2=true, PPO can add a Gaussian prior centered on DDV2's suggested anchor.
+  guidance_weight: 1.0
+  guidance_sigma: 4.0
+  # Sanity check: log parameter change after each update.
+  assert_update: true
+
+  # Weights & Biases logging
+  wandb:
+    enabled: true
+    project: ReconDreamerRL
+    run_name: ddv2_ppo_closed_loop
+
+  # Periodic checkpoint saving of updated DDV2 weights
+  save:
+    every: 5
+    upload_to_wandb: false
+    upload_final_to_wandb: true
+
+  # DDV2 optimizer settings
+  ddv2_lr: 3.0e-4
+  ddv2_baseline_beta: 0.98
 
 agent:
   use_ddv2: true
-  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt
+  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt
 
 eval:
   save_video: true

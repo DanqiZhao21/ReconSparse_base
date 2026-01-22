@@ -151,28 +151,46 @@ class ReconSimulator(gym.Env):
     
     def step(self, action):#NOTE 根据动作 action 更新车辆状态（ego pose
         self.now_frame += self.step_frames
-        ax_index, ay_index, flag = action
+        # Support two action formats:
+        # - Anchor mode: (ax_index:int, ay_index:int, flag:int)
+        # - Continuous mode: (x:float, y:float, yaw:float, flag=2)
+        if isinstance(action, (tuple, list)) and len(action) == 4:
+            x_cmd, y_cmd, yaw_cmd, flag = action
+            ax_index = ay_index = None
+            x_cmd = float(x_cmd)
+            y_cmd = float(y_cmd)
+            yaw_cmd = float(yaw_cmd)
+            flag = int(flag)
+        else:
+            ax_index, ay_index, flag = action
+            ax_index = int(ax_index)
+            ay_index = int(ay_index)
+            flag = int(flag)
 
         # --- 计算专家下一帧位姿（world→front-start 相对变换） ---
         expert_next_ego = np.linalg.inv(self.camera_front_start) @ np.loadtxt(
             os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
         )
 
-        # --- 计算 action 锚点推进的“假设下一帧”位姿（用于对比或真实推进） ---
-        selected_idx = ax_index * self.y_anchor + ay_index
-        future_xy = self.plan_anchors[selected_idx][-1, :]
-        if torch.is_tensor(future_xy):
-            future_x = float(future_xy[0].item())
-            future_y = float(future_xy[1].item())
+        # --- 计算 action 推进的“假设下一帧”位姿（用于对比或真实推进） ---
+        if flag == 2:
+            # Continuous command directly provides (x,y,yaw) in ego frame.
+            future_x, future_y, future_yaw = x_cmd, y_cmd, yaw_cmd
         else:
-            future_x = float(future_xy[0])
-            future_y = float(future_xy[1])
+            selected_idx = ax_index * self.y_anchor + ay_index
+            future_xy = self.plan_anchors[selected_idx][-1, :]
+            if torch.is_tensor(future_xy):
+                future_x = float(future_xy[0].item())
+                future_y = float(future_xy[1].item())
+            else:
+                future_x = float(future_xy[0])
+                future_y = float(future_xy[1])
 
-        future_yaw_v = self.plan_anchors_yaw[selected_idx]
-        if torch.is_tensor(future_yaw_v):
-            future_yaw = float(future_yaw_v.item())
-        else:
-            future_yaw = float(future_yaw_v)
+            future_yaw_v = self.plan_anchors_yaw[selected_idx]
+            if torch.is_tensor(future_yaw_v):
+                future_yaw = float(future_yaw_v.item())
+            else:
+                future_yaw = float(future_yaw_v)
 
         tpt = np.array([
             [math.cos(future_yaw), -math.sin(future_yaw), 0, future_x],
@@ -195,7 +213,7 @@ class ReconSimulator(gym.Env):
         self.last_act_yaw_deg = float(act_yaw * 180.0 / math.pi)
 
         # --- 根据 debug/flag 选择真实推进 ---
-        print(f"self.debug is {self.debug}, flag is {flag}")
+        # print(f"self.debug is {self.debug}, flag is {flag}")
         if self.debug:
             # Debug 模式：使用专家推进，并打印与 action 推进的差异
             self.start_ego = expert_next_ego
@@ -209,13 +227,14 @@ class ReconSimulator(gym.Env):
             act_yaw = self.last_act_yaw_deg
             yaw_err_deg = self.last_yaw_err_deg
 
-            print(
-                f"🐅[Frame {self.now_frame:03d}] action(ax={ax_index}, ay={ay_index}, flag={flag}) | "
-                f"expert_pos=({exp_pos[0]:.3f},{exp_pos[1]:.3f},{exp_pos[2]:.3f}) yaw={exp_yaw:.2f}deg "
-                f"action_pos=({act_pos[0]:.3f},{act_pos[1]:.3f},{act_pos[2]:.3f}) yaw={act_yaw:.2f}deg "
-                f"delta=({pos_delta[0]:.3f},{pos_delta[1]:.3f},{pos_delta[2]:.3f}); "
-                f"xz_err={pos_xz_err:.3f}m, yaw_err={yaw_err_deg:.2f}deg"
-            )
+            a_str = f"(x={future_x:.3f}, y={future_y:.3f}, yaw={future_yaw:.3f})" if flag == 2 else f"(ax={ax_index}, ay={ay_index})"
+            # print(
+            #     f"🐅[Frame {self.now_frame:03d}] action{a_str}, flag={flag} | "
+            #     f"expert_pos=({exp_pos[0]:.3f},{exp_pos[1]:.3f},{exp_pos[2]:.3f}) yaw={exp_yaw:.2f}deg "
+            #     f"action_pos=({act_pos[0]:.3f},{act_pos[1]:.3f},{act_pos[2]:.3f}) yaw={act_yaw:.2f}deg "
+            #     f"delta=({pos_delta[0]:.3f},{pos_delta[1]:.3f},{pos_delta[2]:.3f}); "
+            #     f"xz_err={pos_xz_err:.3f}m, yaw_err={yaw_err_deg:.2f}deg"
+            # )
         else:
             # 非 debug 模式：遵循原始逻辑（flag=1 走专家；否则走 action）
             if flag:
@@ -231,13 +250,16 @@ class ReconSimulator(gym.Env):
             act_yaw = self.last_act_yaw_deg
             yaw_err_deg = self.last_yaw_err_deg
 
-            print(
-                f"🐅[Frame {self.now_frame:03d}] action(ax={ax_index}, ay={ay_index}, flag={flag}) | "
-                f"expert_pos=({exp_pos[0]:.3f},{exp_pos[1]:.3f},{exp_pos[2]:.3f}) yaw={exp_yaw:.2f}deg "
-                f"action_pos=({act_pos[0]:.3f},{act_pos[1]:.3f},{act_pos[2]:.3f}) yaw={act_yaw:.2f}deg "
-                f"delta=({pos_delta[0]:.3f},{pos_delta[1]:.3f},{pos_delta[2]:.3f}); "
-                f"xz_err={pos_xz_err:.3f}m, yaw_err={yaw_err_deg:.2f}deg"
-            )
+            a_str = f"(x={future_x:.3f}, y={future_y:.3f}, yaw={future_yaw:.3f})" if flag == 2 else f"(ax={ax_index}, ay={ay_index})"
+# #PRINT
+#             print(
+#                 f"🐅[Frame {self.now_frame:03d}] action{a_str}, flag={flag} | "
+#                 f"expert_pos=({exp_pos[0]:.3f},{exp_pos[1]:.3f},{exp_pos[2]:.3f}) yaw={exp_yaw:.2f}deg "
+#                 f"action_pos=({act_pos[0]:.3f},{act_pos[1]:.3f},{act_pos[2]:.3f}) yaw={act_yaw:.2f}deg "
+#                 f"delta=({pos_delta[0]:.3f},{pos_delta[1]:.3f},{pos_delta[2]:.3f}); "
+#                 f"xz_err={pos_xz_err:.3f}m, yaw_err={yaw_err_deg:.2f}deg"
+#             )
+#PRINT
             self.start_ego[1][-1] = self.updateGroundDistance()
             
 #ADD

@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import cv2
 
+from rl.ppo import PPOAgent, PPOBatch
+
 # Ensure DiffusionDriveV2 is importable
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DDV2_ROOT = os.path.join(REPO_ROOT, 'DiffusionDriveV2')
@@ -13,93 +15,315 @@ if DDV2_ROOT not in sys.path:
     sys.path.append(DDV2_ROOT)
 
 try:
-    from navsim.agents.diffusiondrivev2.diffusiondrivev2_sel_agent import Diffusiondrivev2_Sel_Agent
-    from navsim.agents.diffusiondrivev2.diffusiondrivev2_sel_config import TransfuserConfig
-except Exception as e:
-    Diffusiondrivev2_Sel_Agent = None
+    # RL variant only (we need diffusion log-probs for policy-gradient)
+    from navsim.agents.diffusiondrivev2.diffusiondrivev2_rl_agent import Diffusiondrivev2_Rl_Agent
+    from navsim.agents.diffusiondrivev2.diffusiondrivev2_rl_config import TransfuserConfig
+except Exception as e_rl:
+    Diffusiondrivev2_Rl_Agent = None
     TransfuserConfig = None
-    _IMPORT_ERROR = e
+    _IMPORT_ERROR = e_rl
 else:
     _IMPORT_ERROR = None
 
-
+#NOTE RL policy 封装器;调用 DiffusionDriveV2-RL 模型 (Diffusiondrivev2_Rl_Agent) 来生成轨迹动作。
 class DiffusionDriveV2Policy:
     """
-    Minimal RL policy wrapper around DiffusionDriveV2 selection agent.
-    - Loads provided checkpoint for future fine-tuning.
-    - Exposes `act(obs)` returning (ax, ay, flag) to match `RLReconEnv.step`.
-    - Currently uses a simple fallback policy for action until full feature
-      mapping (camera/lidar/status → model features) is integrated.
+        Minimal RL policy wrapper around DiffusionDriveV2-RL.
+        This wrapper is intended for policy-gradient optimization via diffusion log-probabilities
+        (REINFORCE style), producing continuous actions: (x, y, yaw, flag=2).
     """
 
-    def __init__(self, x_anchor: int = 61, y_anchor: int = 61, ckpt_path: str | None = None, device: str | None = None):
+    def __init__(
+        self,
+        x_anchor: int = 61,
+        y_anchor: int = 61,
+        ckpt_path: str | None = None,
+        device: str | None = None,
+        *,
+        rl_lr: float = 1e-5,
+        reinforce_baseline_beta: float = 0.98,
+    ):
         self.x_anchor = int(x_anchor)
         self.y_anchor = int(y_anchor)
         self.ckpt_path = ckpt_path
-        self.device = device
+        self._device_override = device
 
         self._agent = None
-        if _IMPORT_ERROR is not None:
-            print(f"[DiffusionDriveV2Policy] Import error: {_IMPORT_ERROR}. Using fallback policy.")
-        else:
+        self._rl: PPOAgent | None = None
+        self._ddv2_optimizer: torch.optim.Optimizer | None = None
+        self._baseline_beta = float(reinforce_baseline_beta)
+        self._reward_baseline: float = 0.0
+        if _IMPORT_ERROR is not None or Diffusiondrivev2_Rl_Agent is None or TransfuserConfig is None:
+            raise ImportError(
+                f"[DiffusionDriveV2Policy] DiffusionDriveV2-RL import failed: {_IMPORT_ERROR}. "
+                "This project is configured to use diffusiondrivev2-rl only (no SEL fallback)."
+            )
+
+        cfg = TransfuserConfig()
+        self._agent = Diffusiondrivev2_Rl_Agent(config=cfg, lr=rl_lr, checkpoint_path=self.ckpt_path)
+        print(f"[DiffusionDriveV2Policy] Loaded DiffusionDriveV2 RL agent from: {self.ckpt_path}")
+
+        # If we are using DDV2-RL, set up an optimizer for trainable params (mostly _trajectory_head).
+        if self._agent is not None and hasattr(self._agent, "parameters"):
+            params = [p for p in self._agent.parameters() if getattr(p, "requires_grad", False)]
+            if len(params) > 0:
+                self._ddv2_optimizer = torch.optim.Adam(params, lr=float(rl_lr))
+#NOTEPPO 接口（可选挂载） &&  REINFORCE 接口（DDV2-RL 核心训练）
+    # -------------------- RL (PPO) integration -------------------- #
+    def set_rl_agent(self, rl_agent: PPOAgent) -> None:
+        """Attach a trainable PPO policy.
+        Note: This project is configured RL-only (no SEL guidance). PPO remains supported
+        for anchor-space baselines, but it does not fine-tune DDV2-RL.
+        """
+        self._rl = rl_agent
+
+    @property
+    def device(self) -> torch.device:
+        if self._rl is not None:
+            return self._rl.device
+        if getattr(self, "_device_override", None):
             try:
-                cfg = TransfuserConfig()
-                # lr is irrelevant for inference-only; pass a small value
-                self._agent = Diffusiondrivev2_Sel_Agent(config=cfg, lr=1e-4, checkpoint_path=self.ckpt_path)
-                print(f"[DiffusionDriveV2Policy] Loaded DiffusionDriveV2 SEL agent from: {self.ckpt_path}")
-            except Exception as e:
-                print(f"[DiffusionDriveV2Policy] Failed to init agent ({e}). Using fallback policy.")
-                self._agent = None
-#ADD Start
-    def act(self, observation: Dict[str, np.ndarray]) -> Tuple[int, int, int]:
+                return torch.device(str(self._device_override))
+            except Exception:
+                pass
+        # Fallback: try model device
+        if self._agent is not None and hasattr(self._agent, "parameters"):
+            try:
+                return next(self._agent.parameters()).device
+            except Exception:
+                pass
+        return torch.device("cpu")
+
+    def value(self, observation: Dict[str, np.ndarray]) -> float:
+        if self._rl is None:
+            raise RuntimeError("No RL agent attached. Call set_rl_agent() first.")
+        return self._rl.value(observation)
+
+    def step(
+        self,
+        observation: Dict[str, np.ndarray],
+        *,
+        sample: bool = True,
+    ):
+        """Training-time step: returns (action, logp, value, entropy)."""
+        if self._rl is None:
+            raise RuntimeError("No RL agent attached. Call set_rl_agent() first.")
+        guidance = None
+        #NOTE: we intentionally do not use DDV2-SEL guidance here (user requested RL-only).
+        return self._rl.step(observation, guidance=guidance, sample=sample)
+
+    # -------------------- DDV2-RL policy-gradient (REINFORCE) -------------------- #
+    def step_ddv2rl(self, observation: Dict[str, np.ndarray], *, eta: float = 1.0):
+        """Sample a continuous (x,y,yaw) action from DiffusionDriveV2-RL and return (action, logp).
+
+        Action format: (x, y, yaw, flag=2) -> executed directly by env.
+        logp is the summed diffusion log-prob over denoising steps for the chosen trajectory.
         """
-        使用 DiffusionDriveV2 SEL agent 推理得到未来轨迹 (8,3)，
-        取第一个时间步的 (x,y)，按 61x61 离散网格（x∈[0,15.011], y∈[-0.756,0.756]）量化为 (ax, ay)。
-        返回 (ax, ay, flag=0) 供 3DGS 环境使用候选锚点推进。
-        """
-        # 若模型未正确加载，回退为随机策略
         if self._agent is None:
-            ax = np.random.randint(0, self.x_anchor)
-            ay = np.random.randint(0, self.y_anchor)
-            return int(ax), int(ay), 0
+            raise RuntimeError("Agent not initialized")
+        if not hasattr(self._agent, "_transfuser_model"):
+            raise RuntimeError("Unexpected DDV2 agent type")
 
-        # 构造 features（只使用相机，LiDAR/状态用零占位）
-        try:
-            camera_feature = self._build_camera_feature(observation)  # (1,3,256,1024)
-            lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
-            status_feature = torch.zeros((1, 8), dtype=torch.float32)  # 4(cmd)+2(vel)+2(acc)
+        camera_feature = self._build_camera_feature(observation)  # (1,3,256,1024)
+        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
+        status_feature = torch.zeros((1, 8), dtype=torch.float32)
 
-            # 对齐设备
-            model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
-            camera_feature = camera_feature.to(model_device)
-            lidar_feature = lidar_feature.to(model_device)
-            status_feature = status_feature.to(model_device)
+        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
+        features = {
+            "camera_feature": camera_feature.to(model_device),
+            "lidar_feature": lidar_feature.to(model_device),
+            "status_feature": status_feature.to(model_device),
+        }
 
-            features = {
-                "camera_feature": camera_feature,
-                "lidar_feature": lidar_feature,
-                "status_feature": status_feature,
-            }
+        # Important: do NOT wrap in no_grad; we want gradients w.r.t. DDV2 params.
+        # Use model eval branch which now returns trajectory/log_probs when targets/metric_cache are None.
+        # We need the inference branch (no targets/metric_cache) but still want gradients.
+        # .eval() toggles dropout/bn behavior; it does NOT disable autograd.
+        self._agent._transfuser_model.eval()
+        pred = self._agent._transfuser_model(
+            features,
+            targets=None,
+            eta=float(eta),
+            metric_cache=None,
+            cal_pdm=False,
+            token=None,
+        )
+        traj = pred.get("trajectory", None)
+        log_probs = pred.get("log_probs", None)
+        if traj is None or log_probs is None:
+            raise RuntimeError("DDV2-RL model did not return trajectory/log_probs")
+        print("💜traj shape:", traj.shape, "💜log_probs shape:", log_probs.shape)
+        # traj: typically (B, K=20*4=80, 8, 3) and log_probs: (B, K=20*4=80, step_num)
+        traj0 = traj[0]
+        # 按每个模式的总 logp 进行软最大采样选择模式索引
+        if log_probs.dim() == 3:
+            mode_logps = log_probs[0].sum(dim=-1)  # (N,)
+        elif log_probs.dim() == 2:
+            mode_logps = log_probs.sum(dim=-1)     # (N,)
+        else:
+            mode_logps = log_probs.reshape(-1, log_probs.shape[-1]).sum(dim=-1)
 
-            with torch.no_grad():
-                pred = self._forward_sel(features, with_grad=False)
-            traj = pred.get("trajectory", None)
-            if traj is None:
-                raise RuntimeError("No trajectory in predictions")
-            traj_np = traj.squeeze(0).detach().cpu().numpy()  # (8,3)
-            x, y = float(traj_np[0, 0]), float(traj_np[0, 1])
+        # 温度采样（默认温度 1.0）；若数值异常则退化为贪心
+        temperature = 1.0
+        probs = torch.softmax(mode_logps / max(1e-6, temperature), dim=0)
+        if torch.isfinite(probs).all() and float(probs.sum().item()) > 0:
+            mode_idx = int(torch.distributions.Categorical(probs).sample().item())
+        else:
+            mode_idx = int(torch.argmax(mode_logps).item())
 
-            # 将 (x,y) 量化到 61x61 网格
-            ax, ay = self._quantize_to_anchor(x, y)
-            return int(ax), int(ay), 0
+        x = traj0[mode_idx, 0, 0].item()
+        y = traj0[mode_idx, 0, 1].item()
+        yaw = traj0[mode_idx, 0, 2].item()
 
-        except Exception as e:
-            # 推理失败时回退（避免中断训练循环）
-            print(f"[DiffusionDriveV2Policy] Inference fallback due to: {e}")
-            ax = np.random.randint(0, self.x_anchor)
-            ay = np.random.randint(0, self.y_anchor)
-            return int(ax), int(ay), 0
+        lp = mode_logps[mode_idx]
 
+        action = (float(x), float(y), float(yaw), 2)
+        return action, lp
+
+    def sample_ddv2rl_with_replay(
+        self,
+        observation: Dict[str, np.ndarray],
+        *,
+        eta: float = 1.0,
+        mode_idx: int = 0,
+    ) -> Tuple[Tuple[float, float, float, int], torch.Tensor, Dict[str, Any]]:
+        """Like step_ddv2rl(), but also returns replay info for PPO.
+
+        The replay dict contains:
+        - camera_feature: (1,3,256,1024) float tensor (CPU)
+        - diffusion_chain: `all_diffusion_output` returned by DDV2 (CPU)
+        - mode_idx: int
+        """
+        if self._agent is None:
+            raise RuntimeError("Agent not initialized")
+
+        camera_feature = self._build_camera_feature(observation)
+        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
+        status_feature = torch.zeros((1, 8), dtype=torch.float32)
+
+        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
+        features = {
+            "camera_feature": camera_feature.to(model_device),
+            "lidar_feature": lidar_feature.to(model_device),
+            "status_feature": status_feature.to(model_device),
+        }
+
+        self._agent._transfuser_model.eval()
+        pred = self._agent._transfuser_model(
+            features,
+            targets=None,
+            eta=float(eta),
+            metric_cache=None,
+            cal_pdm=False,
+            token=None,
+        )
+        traj = pred.get("trajectory", None)
+        log_probs = pred.get("log_probs", None)
+        diffusion_chain = pred.get("all_diffusion_output", None)
+        if traj is None or log_probs is None or diffusion_chain is None:
+            raise RuntimeError("DDV2-RL model did not return trajectory/log_probs/all_diffusion_output")
+
+        traj0 = traj[0]
+        # 自动选择：若传入 mode_idx<0，则按总 logp 进行温度采样；否则裁剪到合法范围
+        if log_probs.dim() == 3:
+            mode_logps = log_probs[0].sum(dim=-1)  # (N,)
+        elif log_probs.dim() == 2:
+            mode_logps = log_probs.sum(dim=-1)     # (N,)
+        else:
+            mode_logps = log_probs.reshape(-1, log_probs.shape[-1]).sum(dim=-1)
+
+        if int(mode_idx) < 0:
+            temperature = 1.0
+            probs = torch.softmax(mode_logps / max(1e-6, temperature), dim=0)
+            if torch.isfinite(probs).all() and float(probs.sum().item()) > 0:
+                mi = int(torch.distributions.Categorical(probs).sample().item())
+            else:
+                mi = int(torch.argmax(mode_logps).item())
+        else:
+            mi = int(mode_idx)
+            mi = max(0, min(mi, int(traj0.shape[0]) - 1))
+
+        x = traj0[mi, 0, 0].item()
+        y = traj0[mi, 0, 1].item()
+        yaw = traj0[mi, 0, 2].item()
+
+        lp = mode_logps[mi]
+
+        action = (float(x), float(y), float(yaw), 2)
+        replay = {
+            "camera_feature": camera_feature.detach().cpu(),
+            "diffusion_chain": diffusion_chain.detach().cpu(),
+            "mode_idx": mi,
+        }
+        return action, lp, replay
+
+    def logp_from_replay(self, replay: Dict[str, Any], *, eta: float = 1.0) -> torch.Tensor:
+        """Recompute logp for the stored diffusion chain under current params."""
+        if self._agent is None:
+            raise RuntimeError("Agent not initialized")
+        if not hasattr(self._agent, "_transfuser_model"):
+            raise RuntimeError("Unexpected DDV2 agent type")
+        if not hasattr(self._agent._transfuser_model, "compute_log_probs_from_diffusion_chain"):
+            raise RuntimeError("DDV2 model does not expose compute_log_probs_from_diffusion_chain")
+
+        camera_feature = replay["camera_feature"]
+        diffusion_chain = replay["diffusion_chain"]
+        mode_idx = int(replay.get("mode_idx", 0))
+
+        lidar_feature = torch.zeros((camera_feature.shape[0], 1, 256, 256), dtype=torch.float32)
+        status_feature = torch.zeros((camera_feature.shape[0], 8), dtype=torch.float32)
+
+        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
+        features = {
+            "camera_feature": camera_feature.to(model_device),
+            "lidar_feature": lidar_feature.to(model_device),
+            "status_feature": status_feature.to(model_device),
+        }
+
+        chain = diffusion_chain.to(model_device)
+        self._agent._transfuser_model.eval()
+        all_log_probs = self._agent._transfuser_model.compute_log_probs_from_diffusion_chain(
+            features,
+            chain,
+            eta=float(eta),
+        )
+        # all_log_probs: (B, N, step_num)
+        lp = all_log_probs[0, mode_idx].sum()
+        return lp
+
+    def reinforce_update(self, logp: torch.Tensor, reward: float) -> Dict[str, float]:
+        """One-step REINFORCE update for DDV2-RL."""
+        if self._ddv2_optimizer is None:
+            raise RuntimeError("DDV2 optimizer not initialized (no trainable params?)")
+        r = float(reward)
+        # EMA baseline to reduce variance
+        self._reward_baseline = self._baseline_beta * self._reward_baseline + (1.0 - self._baseline_beta) * r
+        adv = r - self._reward_baseline
+        #NOTE reinforce损失计算  L=−A_t​ * log π_θ​(a_t​∣s_t​)
+        loss = -(float(adv) * logp)
+        self._ddv2_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        # grad_norm_sq = 0.0 #无需计算梯度范数
+        # for p in self._ddv2_optimizer.param_groups[0]["params"]:
+        #     if p.grad is None:
+        #         continue
+        #     grad_norm_sq += float(p.grad.detach().pow(2).sum().cpu().item())
+        # grad_norm = float(grad_norm_sq ** 0.5)
+
+        self._ddv2_optimizer.step()
+
+        return {
+            "loss_reinforce": float(loss.detach().cpu().item()),
+            "baseline": float(self._reward_baseline),
+            "adv": float(adv),
+            # "grad_norm": grad_norm,
+        }
+
+    def update(self, batch: PPOBatch) -> Dict[str, float]:
+        if self._rl is None:
+            raise RuntimeError("No RL agent attached. Call set_rl_agent() first.")
+        return self._rl.update(batch)
     def _build_camera_feature(self, observation: Dict[str, np.ndarray]) -> torch.Tensor:
         """
         将三路前向相机(front_left, front, front_right)裁剪并横向拼接，后缩放至 (256,1024)，再转为 (1,3,256,1024) tensor。
@@ -152,142 +376,3 @@ class DiffusionDriveV2Policy:
         stitched = cv2.resize(stitched, (1024, 256), interpolation=cv2.INTER_LINEAR)
         tensor = torch.from_numpy(stitched.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
         return tensor
-
-    def _quantize_to_anchor(self, x: float, y: float) -> Tuple[int, int]:
-        """
-        将物理坐标 (x,y)（米）映射到 61x61 的离散索引。
-        x ∈ [0, 15.011], y ∈ [-0.756, 0.756]。
-        """
-        x_min, x_max = 0.0, 15.011
-        y_min, y_max = -0.756, 0.756
-        # 归一化到 [0,1]
-        x_norm = (x - x_min) / (x_max - x_min) if x_max > x_min else 0.0
-        y_norm = (y - y_min) / (y_max - y_min) if y_max > y_min else 0.5
-        x_norm = float(np.clip(x_norm, 0.0, 1.0))
-        y_norm = float(np.clip(y_norm, 0.0, 1.0))
-
-        ax = int(round(x_norm * (self.x_anchor - 1)))
-        ay = int(round(y_norm * (self.y_anchor - 1)))
-        ax = int(np.clip(ax, 0, self.x_anchor - 1))
-        ay = int(np.clip(ay, 0, self.y_anchor - 1))
-        return ax, ay
-
-    def quantize_xy_to_action(self, x: float, y: float) -> torch.Tensor:
-        """
-        公共量化接口：将 (x,y) 转为环境动作为 [ax, ay, flag]。
-        flag 固定为 0（与 3DGS 环境候选锚点推进一致）。
-        """
-        ax, ay = self._quantize_to_anchor(x, y)
-        return torch.tensor([int(ax), int(ay), 0])
-    
-    def forward_test(self, observation: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        """
-        统一推理接口（测试/交互）：
-        - 使用 learned scorer 选优轨迹，不计算 PDM（cal_pdm=False），不需要 metric_cache。
-        - 在 no_grad 下运行，返回 {"trajectory": (1,8,3)}。
-        """
-        if self._agent is None:
-            raise RuntimeError("Agent not initialized")
-
-        camera_feature = self._build_camera_feature(observation)  # (1,3,256,1024)
-        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
-        status_feature = torch.zeros((1, 8), dtype=torch.float32)
-
-        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
-        features = {
-            "camera_feature": camera_feature.to(model_device),
-            "lidar_feature": lidar_feature.to(model_device),
-            "status_feature": status_feature.to(model_device),
-        }
-        with torch.no_grad():
-            pred = self._forward_sel(features, with_grad=False)
-        traj = pred.get("trajectory", None)
-        if traj is None:
-            raise RuntimeError("No trajectory in predictions")
-        return {"trajectory": traj}
-
-    def forward_train(self, observation: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        """
-        统一推理接口（训练）：
-        - 使用 learned scorer 选优轨迹，不计算 PDM（cal_pdm=False），不需要 metric_cache。
-        - 保留梯度，返回 {"trajectory": (1,8,3)} 以便参与 RL/WM 损失反传。
-        """
-        if self._agent is None:
-            raise RuntimeError("Agent not initialized")
-
-        camera_feature = self._build_camera_feature(observation)  # (1,3,256,1024)
-        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
-        status_feature = torch.zeros((1, 8), dtype=torch.float32)
-
-        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
-        features = {
-            "camera_feature": camera_feature.to(model_device),
-            "lidar_feature": lidar_feature.to(model_device),
-            "status_feature": status_feature.to(model_device),
-        }
-        pred = self._forward_sel(features, with_grad=True)
-        traj = pred.get("trajectory", None)
-        if traj is None:
-            raise RuntimeError("No trajectory in predictions")
-        return {"trajectory": traj}
-    
-    def _forward_sel(self, features: Dict[str, torch.Tensor], with_grad: bool = False):
-        """
-        统一封装 SEL 模型前向：不计算 PDM（cal_pdm=False），走 learned scorer 路径。
-        - with_grad=False：用于 act()，开启 no_grad 推理。
-        - with_grad=True：用于训练阶段的前向，保留梯度（不进入 no_grad），但仍使用 forward_test_rl 分支。
-        """
-        if hasattr(self._agent, "_transfuser_model"):
-            # 通过将模型置为 eval，触发 forward_test_rl（不依赖 metric_cache）；eval 不影响 autograd。
-            self._agent._transfuser_model.eval()
-            if with_grad:
-                return self._agent._transfuser_model(
-                    features,
-                    targets=None,
-                    eta=0.0,
-                    metric_cache=None,
-                    cal_pdm=False,
-                )
-            else:
-                with torch.no_grad():
-                    return self._agent._transfuser_model(
-                        features,
-                        targets=None,
-                        eta=0.0,
-                        metric_cache=None,
-                        cal_pdm=False,
-                    )
-        # Fallback：调用代理封装
-        if with_grad:
-            return self._agent.forward(features)
-        else:
-            with torch.no_grad():
-                return self._agent.forward(features)
-
-    def plan_best_trajectory(self, observation: Dict[str, np.ndarray]) -> torch.Tensor:
-        """
-        训练阶段使用：保留梯度的前向，返回最佳轨迹 tensor (1,8,3)。
-        - 不依赖 PDM cache，使用已学习的 scorer 选择轨迹。
-        """
-        if self._agent is None:
-            raise RuntimeError("Agent not initialized")
-
-        camera_feature = self._build_camera_feature(observation)  # (1,3,256,1024)
-        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
-        status_feature = torch.zeros((1, 8), dtype=torch.float32)
-
-        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
-        features = {
-            "camera_feature": camera_feature.to(model_device),
-            "lidar_feature": lidar_feature.to(model_device),
-            "status_feature": status_feature.to(model_device),
-        }
-        pred = self._forward_sel(features, with_grad=True)
-        traj = pred.get("trajectory", None)
-        if traj is None:
-            raise RuntimeError("No trajectory in predictions")
-        return traj  # (1,8,3)
-#ADD END
-    def update(self, batch: Dict[str, Any]) -> Dict[str, float]:
-        #TODO: Placeholder: return empty metrics.
-        return {"loss_pi": 0.0, "loss_v": 0.0}

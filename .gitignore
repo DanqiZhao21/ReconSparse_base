@@ -39,3 +39,4 @@ __pycache__/
 *.swo
 *.idea/
 *.vscode/
+nuscenes-devkit/

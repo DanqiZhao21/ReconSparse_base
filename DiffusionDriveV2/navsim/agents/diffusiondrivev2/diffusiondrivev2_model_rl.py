@@ -76,7 +76,7 @@ def _pairwise_scores(scorer) -> np.ndarray:
     """
     使用 scorer 在 batch 模式下缓存的中间结果，
     重新计算“GT (索引0) vs 每条候选”的得分。
-    返回 shape = (N-1,)  float32。
+    返回 shape = (N-1,)  float32。缓存的指标就是metric cache缓存一次可以终生受用
     """
     # --- 取中间量 ---------------------------------------------------
     mm   = scorer._multi_metrics            # (M_mul, N)
@@ -237,7 +237,7 @@ class V2TransfuserModel(nn.Module):
 
         keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
         keyval += self._keyval_embedding.weight[None, ...]
-
+        #NOTE 🟩keyval → 给 Transformer 解码器用;;🟦concat_cross_bev → 给高分辨率 BEV feature 融合用
         concat_cross_bev = keyval[:,:-1].permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
         # upsample to the same shape as bev_feature_upscale
 
@@ -255,12 +255,38 @@ class V2TransfuserModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
+        # --- Closed-loop / custom RL inference ---
+        # In our RL closed-loop environment we do not have GT `targets` nor `metric_cache`.
+        # In that case, do not run the training-only `old_pred` / reward-copy logic.
+        # We only need the sampled trajectory and its diffusion log-probabilities.
+        if targets is None or metric_cache is None or not cal_pdm:
+            pred = self._trajectory_head(
+                trajectory_query,
+                agents_query,
+                cross_bev_feature,
+                bev_spatial_shape,
+                status_encoding[:, None],
+                status_feature,
+                camera_feature,
+                targets=None,
+                global_img=None,
+                eta=eta,
+                old_pred=None,
+                metric_cache=None,
+                cal_pdm=False,
+                token=token,
+            )
+            output.update(pred)
+            agents = self._agent_head(agents_query)
+            output.update(agents)
+            return output
+
         with torch.no_grad():
             old_pred = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],status_feature,camera_feature,targets=targets,global_img=None,eta=eta, old_pred=None,metric_cache=metric_cache, cal_pdm=cal_pdm,token=token)
         pred = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],status_feature,camera_feature,targets=targets,global_img=None,eta=eta, old_pred=old_pred,metric_cache=metric_cache, cal_pdm=cal_pdm)
-        if 'reward' not in pred:
+        if 'reward' not in pred and isinstance(old_pred, dict) and 'reward' in old_pred:
             pred['reward'] = old_pred['reward']
-        if 'sub_rewards' not in pred:
+        if 'sub_rewards' not in pred and isinstance(old_pred, dict) and 'sub_rewards' in old_pred:
             pred['sub_rewards'] = old_pred['sub_rewards']
         output.update(pred)
 
@@ -268,6 +294,69 @@ class V2TransfuserModel(nn.Module):
         output.update(agents)
 
         return output
+
+    def compute_log_probs_from_diffusion_chain(
+        self,
+        features: Dict[str, torch.Tensor],
+        diffusion_chain: torch.Tensor,
+        *,
+        eta: float = 1.0,
+    ) -> torch.Tensor:
+        """Recompute diffusion log-probabilities for a fixed denoising chain.
+        This is intended for PPO-style updates where we need log π_θ(a|s) under
+        the *current* parameters, but for the *same sampled trajectory* from rollout.
+
+        Args:
+            features: same dict as forward() expects.
+            diffusion_chain: Tensor shaped like `all_diffusion_output` returned by `forward_test_rl`.
+            eta: stochasticity parameter used during sampling.
+
+        Returns:
+            log_probs: Tensor of shape (B, N, step_num) where N is number of trajectory modes.
+        """
+        camera_feature: torch.Tensor = features["camera_feature"]
+        lidar_feature: torch.Tensor = features["lidar_feature"]
+        status_feature: torch.Tensor = features["status_feature"]
+
+        batch_size = status_feature.shape[0]
+
+        bev_feature_upscale, bev_feature, _ = self._backbone(camera_feature, lidar_feature)
+        cross_bev_feature = bev_feature_upscale
+        bev_spatial_shape = bev_feature_upscale.shape[2:]
+        concat_cross_bev_shape = bev_feature.shape[2:]
+        bev_feature = self._bev_downscale(bev_feature).flatten(-2, -1)
+        bev_feature = bev_feature.permute(0, 2, 1)
+        status_encoding = self._status_encoding(status_feature)
+
+        keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
+        keyval += self._keyval_embedding.weight[None, ...]
+
+        concat_cross_bev = keyval[:, :-1].permute(0, 2, 1).contiguous().view(
+            batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1]
+        )
+        concat_cross_bev = F.interpolate(concat_cross_bev, size=bev_spatial_shape, mode="bilinear", align_corners=False)
+        cross_bev_feature = torch.cat([concat_cross_bev, cross_bev_feature], dim=1)
+
+        cross_bev_feature = self.bev_proj(cross_bev_feature.flatten(-2, -1).permute(0, 2, 1))
+        cross_bev_feature = cross_bev_feature.permute(0, 2, 1).contiguous().view(
+            batch_size, -1, bev_spatial_shape[0], bev_spatial_shape[1]
+        )
+
+        query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
+        query_out = self._tf_decoder(query, keyval)
+        trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
+
+        return self._trajectory_head.compute_log_probs_from_chain(
+            trajectory_query,
+            agents_query,
+            cross_bev_feature,
+            bev_spatial_shape,
+            status_encoding[:, None],
+            status_feature,
+            camera_feature,
+            diffusion_chain,
+            eta=float(eta),
+        )
 
 class AgentHead(nn.Module):
     """Bounding box prediction head."""
@@ -737,20 +826,35 @@ class TrajectoryHead(nn.Module):
         self.targets = [] 
         self.num_draw = 0
         self._score_buf = []
-        # pdm score
-        pdm_cfg = OmegaConf.load('/root/clone/ReconDreamer-RL/DiffusionDriveV2/navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml')
+
+        # PDM scoring is heavy (spawns process pools, loads configs) and is not needed for
+        # closed-loop RL training where reward comes from the environment.
+        # We therefore lazily initialize PDM resources only if/when cal_pdm=True is used.
+        self._pdm_initialized = False
+        self._pdm_pool = None
+        self.metric_caches = {}
+        self.simulator_cfg = None
+        self.scorer_cfg = None
+        self.simulator = None
+        self.scorer = None
+
+    def _ensure_pdm(self) -> None:
+        if self._pdm_initialized:
+            return
+        pdm_cfg = OmegaConf.load(
+            '/root/clone/ReconDreamer-RL/DiffusionDriveV2/navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml'
+        )
         self.simulator_cfg = pdm_cfg.simulator
         self.scorer_cfg = pdm_cfg.scorer
-
         self._pdm_pool = cf.ProcessPoolExecutor(
             max_workers=16,
             mp_context=mp.get_context("spawn"),
             initializer=_init_pool,
             initargs=(self.simulator_cfg, self.scorer_cfg),
         )
-        self.metric_caches = {}
-        self.simulator: PDMSimulator = instantiate(self.simulator_cfg)
-        self.scorer: PDMScorer = instantiate(self.scorer_cfg)
+        self.simulator = instantiate(self.simulator_cfg)
+        self.scorer = instantiate(self.scorer_cfg)
+        self._pdm_initialized = True
 
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
@@ -780,9 +884,98 @@ class TrajectoryHead(nn.Module):
             else:
                 return self.forward_train_rl(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature,targets,global_img,eta,metric_cache,cal_pdm=cal_pdm,token=token)
         else:
-            return self.forward_test_rl(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature,targets,global_img,metric_cache,eta=0.0)
+            return self.forward_test_rl(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature,targets,global_img,metric_cache,eta=eta)#NOTE : eval mode, no pdm score；但是依然有eta
+
+    def compute_log_probs_from_chain(
+        self,
+        ego_query,
+        agents_query,
+        bev_feature,
+        bev_spatial_shape,
+        status_encoding,
+        status_feature,
+        camera_feature,
+        diffusion_chain: torch.Tensor,
+        *,
+        eta: float = 1.0,
+    ) -> torch.Tensor:
+        """Compute diffusion log-probabilities for a fixed denoising chain.
+
+        Args:
+            diffusion_chain: Tensor shaped like `all_diffusion_output` returned by forward_test_rl,
+                i.e. (B, N, 8, 2, step_num+1).
+
+        Returns:
+            log_probs: (B, N, step_num)
+        """
+        if diffusion_chain.dim() != 5:
+            raise ValueError(f"diffusion_chain must be rank-5 (B,N,8,2,S), got shape={tuple(diffusion_chain.shape)}")
+
+        step_num = int(diffusion_chain.shape[-1] - 1)
+        if step_num <= 0:
+            raise ValueError(f"diffusion_chain last dim must be >=2, got {tuple(diffusion_chain.shape)}")
+
+        bs = diffusion_chain.shape[0]
+        device = diffusion_chain.device
+
+        self.diffusionrl_scheduler.set_timesteps(1000, device)
+        step_ratio = 20 / float(step_num)
+        roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
+        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+
+        chains = diffusion_chain[..., :-1]
+        chains_prev = diffusion_chain[..., 1:]
+
+        all_log_probs = []
+        for i, k in enumerate(roll_timesteps[:]):
+            diffusion_output = chains[..., i]
+            ego_fut_mode = diffusion_output.shape[1]
+            x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
+            noisy_traj_points = self.denorm_odo(x_boxes)
+
+            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+            traj_pos_embed = traj_pos_embed.flatten(-2)
+            traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+            traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
+
+            timesteps = k
+            if not torch.is_tensor(timesteps):
+                timesteps = torch.tensor([timesteps], dtype=torch.long, device=diffusion_output.device)
+            elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+                timesteps = timesteps[None].to(diffusion_output.device)
+
+            timesteps = timesteps.expand(diffusion_output.shape[0])
+            time_embed = self.time_mlp(timesteps)
+            time_embed = time_embed.view(bs, 1, -1)
+
+            poses_reg_list, poses_cls_list = self.diff_decoder(
+                traj_feature,
+                noisy_traj_points,
+                bev_feature,
+                bev_spatial_shape,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                None,
+            )
+            poses_reg = poses_reg_list[-1]
+            x_start = poses_reg[..., :2]
+            x_start = self.norm_odo(x_start)
+            _, log_prob, _ = self.diffusionrl_scheduler.step(
+                model_output=x_start,
+                timestep=k,
+                sample=diffusion_output,
+                eta=eta,
+                prev_sample=chains_prev[..., i],
+            )
+            all_log_probs.append(log_prob)
+
+        all_log_probs = torch.stack(all_log_probs, dim=-1)
+        return all_log_probs
 
     def get_pdm_score_para(self, trajectory, metric_cache_path):
+        self._ensure_pdm()
         B, G = trajectory.shape[:2]
         traj_np = trajectory.detach().cpu().numpy()
         futures = [
@@ -867,6 +1060,7 @@ class TrajectoryHead(nn.Module):
         target_traj = targets['trajectory'].unsqueeze(1)
         diffusion_output_with_gt = torch.cat((diffusion_output,target_traj),dim=1)
         if cal_pdm:
+            self._ensure_pdm()
             reward_group, metric_cache, sub_rewards_group = self.get_pdm_score_para(diffusion_output_with_gt, metric_cache)      # (B,G)
             reward_gt = reward_group[:,-1:]
             reward_gt = reward_gt.unsqueeze(-1)
@@ -994,7 +1188,7 @@ class TrajectoryHead(nn.Module):
                 model_output=x_start,
                 timestep=k,
                 sample=diffusion_output,
-                eta=0.0,
+                eta=eta,
             )
             all_diffusion_output.append(diffusion_output)
             all_log_probs.append(log_prob)
@@ -1005,6 +1199,16 @@ class TrajectoryHead(nn.Module):
 
         all_diffusion_output = torch.stack(all_diffusion_output, dim=-1) # BG N step_num
         all_log_probs = torch.stack(all_log_probs, dim=-1) # BG N step_num
+
+        # --- Closed-loop / inference support ---
+        # In many downstream uses (e.g., custom RL environments), we don't have PDM metric_cache or GT targets.
+        # In that case, expose the sampled trajectories and their diffusion log-probabilities.
+        if targets is None or metric_cache is None:
+            return {
+                "trajectory": diffusion_output,
+                "log_probs": all_log_probs,
+                "all_diffusion_output": all_diffusion_output,
+            }
 
 
         reward_group, metric_cache, sub_rewards_group = self.get_pdm_score_para(diffusion_output, metric_cache)
