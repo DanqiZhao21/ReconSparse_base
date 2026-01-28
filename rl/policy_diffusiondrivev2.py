@@ -1,12 +1,12 @@
 import os
 import sys
 from typing import Dict, Tuple, Any
+from typing import List
 
 import numpy as np
 import torch
 import cv2
-
-from rl.ppo import PPOAgent, PPOBatch
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Ensure DiffusionDriveV2 is importable
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -49,7 +49,6 @@ class DiffusionDriveV2Policy:
         self._device_override = device
 
         self._agent = None
-        self._rl: PPOAgent | None = None
         self._ddv2_optimizer: torch.optim.Optimizer | None = None
         self._baseline_beta = float(reinforce_baseline_beta)
         self._reward_baseline: float = 0.0
@@ -63,24 +62,141 @@ class DiffusionDriveV2Policy:
         self._agent = Diffusiondrivev2_Rl_Agent(config=cfg, lr=rl_lr, checkpoint_path=self.ckpt_path)
         print(f"[DiffusionDriveV2Policy] Loaded DiffusionDriveV2 RL agent from: {self.ckpt_path}")
 
+        # Ensure the underlying model lives on the requested device.
+        # Some upstream agent constructors keep modules on CPU by default.
+        try:
+            self.to(self.device)
+        except Exception:
+            pass
+
         # If we are using DDV2-RL, set up an optimizer for trainable params (mostly _trajectory_head).
         if self._agent is not None and hasattr(self._agent, "parameters"):
             params = [p for p in self._agent.parameters() if getattr(p, "requires_grad", False)]
             if len(params) > 0:
                 self._ddv2_optimizer = torch.optim.Adam(params, lr=float(rl_lr))
-#NOTEPPO 接口（可选挂载） &&  REINFORCE 接口（DDV2-RL 核心训练）
-    # -------------------- RL (PPO) integration -------------------- #
-    def set_rl_agent(self, rl_agent: PPOAgent) -> None:
-        """Attach a trainable PPO policy.
-        Note: This project is configured RL-only (no SEL guidance). PPO remains supported
-        for anchor-space baselines, but it does not fine-tune DDV2-RL.
-        """
-        self._rl = rl_agent
 
+        self._ddp_enabled: bool = False
+
+    def wrap_ddp(
+        self,
+        *,
+        device_id: int,
+        process_group: Any | None = None,
+        find_unused_parameters: bool = True,
+        rl_lr: float | None = None,
+    ) -> None:
+        """Wrap the internal DDV2 transfuser model with DDP and rebuild optimizer.
+
+        This is required for multi-GPU fine-tuning (ddv2_rl_reinforce / ddv2_rl_ppo).
+        Safe to call multiple times.
+        """
+        if self._agent is None or not hasattr(self._agent, "_transfuser_model"):
+            raise RuntimeError("DDV2 agent is not initialized")
+        m = self._agent._transfuser_model
+        if isinstance(m, DDP):
+            self._ddp_enabled = True
+            return
+
+        # DDP requires parameters to already be on the target device.
+        target_device = torch.device(f"cuda:{int(device_id)}") if torch.cuda.is_available() else torch.device("cpu")
+        try:
+            self.to(target_device)
+        except Exception:
+            try:
+                m.to(target_device)
+            except Exception:
+                pass
+
+        self._agent._transfuser_model = DDP(
+            m,
+            device_ids=[int(device_id)],
+            output_device=int(device_id),
+            process_group=process_group,
+            find_unused_parameters=bool(find_unused_parameters),
+        )
+        self._ddp_enabled = True
+
+        # Rebuild optimizer to make sure it references the right params
+        lr = float(rl_lr) if rl_lr is not None else float(self._ddv2_optimizer.param_groups[0].get("lr", 1e-5) if self._ddv2_optimizer else 1e-5)
+        core = self._agent._transfuser_model.module
+        params = [p for p in core.parameters() if getattr(p, "requires_grad", False)]
+        if len(params) == 0:
+            raise RuntimeError("DDV2 DDP wrap found no trainable parameters")
+        self._ddv2_optimizer = torch.optim.Adam(params, lr=lr)
+
+    def to(self, device: str | torch.device) -> "DiffusionDriveV2Policy":
+        """Move the internal transfuser model to device (best-effort)."""
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        self._device_override = str(dev)
+        if self._agent is None:
+            return self
+
+        # Move known internal model.
+        try:
+            if hasattr(self._agent, "_transfuser_model"):
+                m = self._agent._transfuser_model
+                if isinstance(m, DDP):
+                    m.module.to(dev)
+                else:
+                    m.to(dev)
+        except Exception:
+            pass
+
+        # Some agents implement .to() / .cuda().
+        try:
+            if hasattr(self._agent, "to"):
+                self._agent.to(dev)
+        except Exception:
+            pass
+
+        return self
+
+    # -------------------- Checkpoint IO (actor-learner) -------------------- #
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return the underlying transfuser model state_dict."""
+        if self._agent is None or not hasattr(self._agent, "_transfuser_model"):
+            raise RuntimeError("DDV2 agent is not initialized")
+        m = self._agent._transfuser_model
+        core = m.module if isinstance(m, DDP) else m
+        return core.state_dict()
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save weights in the same format used by train_closed_loop.py."""
+        sd = self.state_dict()
+        sd_pref = {f"agent.{k}": v.detach().cpu() for k, v in sd.items()}
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        torch.save({"state_dict": sd_pref}, path)
+
+    def load_from_checkpoint(self, path: str, *, strict: bool = False) -> None:
+        """Load a checkpoint produced by save_checkpoint/train_closed_loop.
+
+        Accepts either:
+        - {"state_dict": {"agent.xxx": tensor, ...}}
+        - raw state_dict
+        """
+        if self._agent is None or not hasattr(self._agent, "_transfuser_model"):
+            raise RuntimeError("DDV2 agent is not initialized")
+
+        map_location = self.device
+        ckpt = torch.load(path, map_location=map_location)
+        sd = ckpt.get("state_dict", ckpt)
+        if not isinstance(sd, dict):
+            raise ValueError("Checkpoint does not contain a state_dict")
+
+        # Strip optional prefix.
+        sd2: Dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            kk = str(k)
+            if kk.startswith("agent."):
+                kk = kk[len("agent.") :]
+            if torch.is_tensor(v):
+                sd2[kk] = v
+
+        m = self._agent._transfuser_model
+        core = m.module if isinstance(m, DDP) else m
+        core.load_state_dict(sd2, strict=bool(strict))
     @property
     def device(self) -> torch.device:
-        if self._rl is not None:
-            return self._rl.device
         if getattr(self, "_device_override", None):
             try:
                 return torch.device(str(self._device_override))
@@ -93,24 +209,6 @@ class DiffusionDriveV2Policy:
             except Exception:
                 pass
         return torch.device("cpu")
-
-    def value(self, observation: Dict[str, np.ndarray]) -> float:
-        if self._rl is None:
-            raise RuntimeError("No RL agent attached. Call set_rl_agent() first.")
-        return self._rl.value(observation)
-
-    def step(
-        self,
-        observation: Dict[str, np.ndarray],
-        *,
-        sample: bool = True,
-    ):
-        """Training-time step: returns (action, logp, value, entropy)."""
-        if self._rl is None:
-            raise RuntimeError("No RL agent attached. Call set_rl_agent() first.")
-        guidance = None
-        #NOTE: we intentionally do not use DDV2-SEL guidance here (user requested RL-only).
-        return self._rl.step(observation, guidance=guidance, sample=sample)
 
     # -------------------- DDV2-RL policy-gradient (REINFORCE) -------------------- #
     def step_ddv2rl(self, observation: Dict[str, np.ndarray], *, eta: float = 1.0):
@@ -186,6 +284,7 @@ class DiffusionDriveV2Policy:
         *,
         eta: float = 1.0,
         mode_idx: int = 0,
+        mode_select: str = "sample",
     ) -> Tuple[Tuple[float, float, float, int], torch.Tensor, Dict[str, Any]]:
         """Like step_ddv2rl(), but also returns replay info for PPO.
 
@@ -193,6 +292,7 @@ class DiffusionDriveV2Policy:
         - camera_feature: (1,3,256,1024) float tensor (CPU)
         - diffusion_chain: `all_diffusion_output` returned by DDV2 (CPU)
         - mode_idx: int
+        - mode_select: str (default "sample")
         """
         if self._agent is None:
             raise RuntimeError("Agent not initialized")
@@ -209,22 +309,27 @@ class DiffusionDriveV2Policy:
         }
 
         self._agent._transfuser_model.eval()
-        pred = self._agent._transfuser_model(
-            features,
-            targets=None,
-            eta=float(eta),
-            metric_cache=None,
-            cal_pdm=False,
-            token=None,
-        )
+        # PPO collection does not need autograd; avoid building graphs for speed/memory.
+        with torch.inference_mode():
+            pred = self._agent._transfuser_model(
+                features,
+                targets=None,
+                eta=float(eta),
+                metric_cache=None,
+                cal_pdm=False,
+                token=None,
+            )
         traj = pred.get("trajectory", None)
         log_probs = pred.get("log_probs", None)
         diffusion_chain = pred.get("all_diffusion_output", None)
         if traj is None or log_probs is None or diffusion_chain is None:
             raise RuntimeError("DDV2-RL model did not return trajectory/log_probs/all_diffusion_output")
 
-        traj0 = traj[0]
-        # 自动选择：若传入 mode_idx<0，则按总 logp 进行温度采样；否则裁剪到合法范围
+        traj0 = traj[0]#（B=1，batch size）是为了和ddv2对齐
+        # 自动选择：若传入 mode_idx<0，则按 mode_select 执行：
+        # - sample: softmax(mode_logps) 采样（带探索，默认）
+        # - greedy: argmax(mode_logps)（更稳定，适合 debug）
+        # 否则（mode_idx>=0）裁剪到合法范围
         if log_probs.dim() == 3:
             mode_logps = log_probs[0].sum(dim=-1)  # (N,)
         elif log_probs.dim() == 2:
@@ -233,12 +338,16 @@ class DiffusionDriveV2Policy:
             mode_logps = log_probs.reshape(-1, log_probs.shape[-1]).sum(dim=-1)
 
         if int(mode_idx) < 0:
-            temperature = 1.0
-            probs = torch.softmax(mode_logps / max(1e-6, temperature), dim=0)
-            if torch.isfinite(probs).all() and float(probs.sum().item()) > 0:
-                mi = int(torch.distributions.Categorical(probs).sample().item())
-            else:
+            sel = str(mode_select).strip().lower()
+            if sel in {"greedy", "max", "argmax"}:
                 mi = int(torch.argmax(mode_logps).item())
+            else:
+                temperature = 1.0
+                probs = torch.softmax(mode_logps / max(1e-6, temperature), dim=0)
+                if torch.isfinite(probs).all() and float(probs.sum().item()) > 0:
+                    mi = int(torch.distributions.Categorical(probs).sample().item())
+                else:
+                    mi = int(torch.argmax(mode_logps).item())
         else:
             mi = int(mode_idx)
             mi = max(0, min(mi, int(traj0.shape[0]) - 1))
@@ -256,6 +365,107 @@ class DiffusionDriveV2Policy:
             "mode_idx": mi,
         }
         return action, lp, replay
+
+    def sample_ddv2rl_with_replay_batch(
+        self,
+        observations: List[Dict[str, np.ndarray]],
+        *,
+        eta: float = 1.0,
+        mode_idx: int = 0,
+        mode_select: str = "sample",
+    ) -> Tuple[List[Tuple[float, float, float, int]], List[torch.Tensor], List[Dict[str, Any]]]:
+        """Batched variant of sample_ddv2rl_with_replay() for vectorized env rollout.
+
+        Returns:
+        - actions: list[(x,y,yaw,flag=2)]
+        - logps: list[Tensor scalar] (summed over diffusion steps for chosen mode)
+        - replays: list[dict] per-sample, compatible with PPO update code
+        """
+        if self._agent is None:
+            raise RuntimeError("Agent not initialized")
+        if len(observations) == 0:
+            return [], [], []
+
+        # Build camera features (CPU) then batch on device.
+        cams = [self._build_camera_feature(obs) for obs in observations]  # each: (1,3,256,1024)
+        camera_feature = torch.cat(cams, dim=0)
+        bsz = int(camera_feature.shape[0])
+
+        lidar_feature = torch.zeros((bsz, 1, 256, 256), dtype=torch.float32)
+        status_feature = torch.zeros((bsz, 8), dtype=torch.float32)
+
+        model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
+        features = {
+            "camera_feature": camera_feature.to(model_device),
+            "lidar_feature": lidar_feature.to(model_device),
+            "status_feature": status_feature.to(model_device),
+        }
+
+        self._agent._transfuser_model.eval()
+        with torch.inference_mode():
+            pred = self._agent._transfuser_model(
+                features,
+                targets=None,
+                eta=float(eta),
+                metric_cache=None,
+                cal_pdm=False,
+                token=None,
+            )
+        traj = pred.get("trajectory", None)
+        log_probs = pred.get("log_probs", None)
+        diffusion_chain = pred.get("all_diffusion_output", None)
+        if traj is None or log_probs is None or diffusion_chain is None:
+            raise RuntimeError("DDV2-RL model did not return trajectory/log_probs/all_diffusion_output")
+
+        # mode_logps: (B, N)
+        if log_probs.dim() == 3:
+            mode_logps = log_probs.sum(dim=-1)
+        elif log_probs.dim() == 2:
+            mode_logps = log_probs
+        else:
+            mode_logps = log_probs.reshape(log_probs.shape[0], -1, log_probs.shape[-1]).sum(dim=-1)
+
+        # Select per-sample mode index
+        sel = str(mode_select).strip().lower()
+        mode_idx_list: List[int] = []
+        if int(mode_idx) < 0:
+            if sel in {"greedy", "max", "argmax"}:
+                mode_idx_list = [int(torch.argmax(mode_logps[b]).item()) for b in range(bsz)]
+            else:
+                temperature = 1.0
+                for b in range(bsz):
+                    probs = torch.softmax(mode_logps[b] / max(1e-6, temperature), dim=0)
+                    if torch.isfinite(probs).all() and float(probs.sum().item()) > 0:
+                        mode_idx_list.append(int(torch.distributions.Categorical(probs).sample().item()))
+                    else:
+                        mode_idx_list.append(int(torch.argmax(mode_logps[b]).item()))
+        else:
+            # Clamp fixed mode_idx
+            n_modes = int(traj.shape[1])
+            mi = max(0, min(int(mode_idx), n_modes - 1))
+            mode_idx_list = [int(mi) for _ in range(bsz)]
+
+        actions: List[Tuple[float, float, float, int]] = []
+        logps: List[torch.Tensor] = []
+        replays: List[Dict[str, Any]] = []
+
+        for b in range(bsz):
+            mi = int(mode_idx_list[b])
+            x = traj[b, mi, 0, 0].item()
+            y = traj[b, mi, 0, 1].item()
+            yaw = traj[b, mi, 0, 2].item()
+            lp = mode_logps[b, mi]
+            actions.append((float(x), float(y), float(yaw), 2))
+            logps.append(lp)
+            replays.append(
+                {
+                    "camera_feature": camera_feature[b : b + 1].detach().cpu(),
+                    "diffusion_chain": diffusion_chain[b : b + 1].detach().cpu(),
+                    "mode_idx": mi,
+                }
+            )
+
+        return actions, logps, replays
 
     def logp_from_replay(self, replay: Dict[str, Any], *, eta: float = 1.0) -> torch.Tensor:
         """Recompute logp for the stored diffusion chain under current params."""
@@ -319,11 +529,6 @@ class DiffusionDriveV2Policy:
             "adv": float(adv),
             # "grad_norm": grad_norm,
         }
-
-    def update(self, batch: PPOBatch) -> Dict[str, float]:
-        if self._rl is None:
-            raise RuntimeError("No RL agent attached. Call set_rl_agent() first.")
-        return self._rl.update(batch)
     def _build_camera_feature(self, observation: Dict[str, np.ndarray]) -> torch.Tensor:
         """
         将三路前向相机(front_left, front, front_right)裁剪并横向拼接，后缩放至 (256,1024)，再转为 (1,3,256,1024) tensor。

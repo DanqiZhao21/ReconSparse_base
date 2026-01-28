@@ -17,6 +17,20 @@ from reconsimulator.render.utils.misc import import_str
 from reconsimulator.envs import nus_config as cfg
 
 
+# ----------------------------- In-process trainer cache ----------------------------- #
+# GPU renderer/model initialization is expensive and can easily dominate rollout time.
+# In single-process vectorization (SerialVecEnv), multiple env instances may request
+# the same (device, scene) trainer; cache it to avoid duplicate loads.
+_SPLAT_CACHE: dict[tuple[str, int], tuple[object, int]] = {}
+_SPLAT_CACHE_ORDER: list[tuple[str, int]] = []
+_SPLAT_CACHE_MAX = 2
+
+
+def clear_splat_cache() -> None:
+    _SPLAT_CACHE.clear()
+    _SPLAT_CACHE_ORDER.clear()
+
+
 # ----------------------------- 路径工具 ----------------------------- #
 def _ckpt_path(scene: int) -> str:
     return os.path.join(cfg.BASE_DATA_DIR, f"{scene:03d}", "3DGS_without_prior", "checkpoint_final.pth")
@@ -30,10 +44,21 @@ def _trainer_config_path() -> str:
     return fallback
 
 
-def get_splat(device: str, scene: int):
+def get_splat(device: str, scene: int, *, use_cache: bool = True):
     """
     加载重建 trainer 与时间步（统一路径风格 + 健壮性处理）
     """
+    key = (str(device), int(scene))
+    if bool(use_cache) and key in _SPLAT_CACHE:
+        # Refresh LRU order
+        try:
+            _SPLAT_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+        _SPLAT_CACHE_ORDER.append(key)
+        trainer, num_timesteps = _SPLAT_CACHE[key]
+        return trainer, int(num_timesteps)
+
     ckpt_name = _ckpt_path(scene)
     if not os.path.exists(ckpt_name):
         raise FileNotFoundError(f"[get_splat] checkpoint not found: {ckpt_name}")
@@ -67,6 +92,22 @@ def get_splat(device: str, scene: int):
 
     num_timesteps = (num_timesteps - 1) // 6 * 6
     recon_trainer.resume_from_checkpoint(ckpt_path=ckpt_name, load_only_model=True)
+
+    if bool(use_cache):
+        _SPLAT_CACHE[key] = (recon_trainer, int(num_timesteps))
+        try:
+            _SPLAT_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+        _SPLAT_CACHE_ORDER.append(key)
+        # Evict oldest
+        while len(_SPLAT_CACHE_ORDER) > int(_SPLAT_CACHE_MAX):
+            old = _SPLAT_CACHE_ORDER.pop(0)
+            try:
+                _SPLAT_CACHE.pop(old, None)
+            except Exception:
+                pass
+
     return recon_trainer, num_timesteps
 
 

@@ -11,14 +11,16 @@ from reconsimulator.envs import nus_config as cfg
 from scipy.spatial.transform import Slerp, Rotation as R
 from scipy.spatial.distance import cdist
 
-TRANSFORM_MATRIX = torch.eye(4, dtype=torch.float32).cuda()
+# NOTE: keep on CPU by default; move to the env's target device at runtime.
+TRANSFORM_MATRIX = torch.eye(4, dtype=torch.float32)
 
 class ReconSimulator(gym.Env):
-    def __init__(self, cuda=0, scene=0, debug=True):
+    def __init__(self, cuda=0, scene=0, debug=True, *, render_w: int = 800, render_h: int = 450):
         self.device = f"cuda:{cuda}"
         self.debug = debug
         self.scene = scene
-        self.w, self.h = 800, 450
+        self.w, self.h = int(render_w), int(render_h)
+        self._transform_matrix = TRANSFORM_MATRIX.to(self.device)
 
         # Observation space: 6 camera RGB views
         self.observation_space = gym.spaces.Dict({
@@ -34,7 +36,8 @@ class ReconSimulator(gym.Env):
         self.trainer.eval()
 
         # Frame control
-        self.step_frames = 1
+        #NOTE 更新一下环境的步长
+        self.step_frames = 5
         self.final_frame = 186
         self.now_frame = 0
 
@@ -127,16 +130,30 @@ class ReconSimulator(gym.Env):
 
     # ------------------------- Gym API ------------------------ #
     def reset(self, seed=None, options=None):#NOTE 重置环境，重新开始一个新场景。
-        self.update(seed)
-        self.start_ego = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/000.txt"))
-        self.start_ego = np.linalg.inv(self.camera_front_start) @ self.start_ego
+        start_frame = None
+        step_frames = None
+        try:
+            if isinstance(options, dict):
+                if options.get("start_frame") is not None:
+                    start_frame = int(options.get("start_frame"))
+                if options.get("step_frames") is not None:
+                    step_frames = int(options.get("step_frames"))
+        except Exception:
+            start_frame = None
+            step_frames = None
+
+        self.update(seed, step_frames=step_frames, start_frame=start_frame)
+
+        # Initialize ego pose at the chosen start frame.
+        start_pose = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt"))
+        self.start_ego = np.linalg.inv(self.camera_front_start) @ start_pose
 
         self.all_camera_now = []
         for i in range(6):
             cam_info = copy.deepcopy(self.all_cams[i])
             cam_info = move_to_device(cam_info, self.device)
             cam_info['camera_to_world'] = torch.tensor(self.start_ego @ self.cam2ego[i], device=self.device, dtype=torch.float32)
-            cam_info['camera_to_world'] = cam_info['camera_to_world'] @ TRANSFORM_MATRIX
+            cam_info['camera_to_world'] = cam_info['camera_to_world'] @ self._transform_matrix
 
             img_info = copy.deepcopy(self.all_images[i])
             img_info = move_to_device(img_info, self.device)
@@ -192,23 +209,34 @@ class ReconSimulator(gym.Env):
             else:
                 future_yaw = float(future_yaw_v)
 
+        # NOTE: this simulator uses x-z as the horizontal plane (y is up).
+        # Therefore, the planar SE(2) motion should be applied in (x,z) with
+        # a yaw rotation about the +y axis.
         tpt = np.array([
-            [math.cos(future_yaw), -math.sin(future_yaw), 0, future_x],
-            [math.sin(future_yaw),  math.cos(future_yaw), 0, future_y],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
+            [math.cos(future_yaw), 0.0, -math.sin(future_yaw), future_x],
+            [0.0,                 1.0,  0.0,                 0.0],
+            [math.sin(future_yaw), 0.0,  math.cos(future_yaw), future_y],
+            [0.0,                 0.0,  0.0,                 1.0]
+        ], dtype=np.float64)
         action_next_ego = self.start_ego @ tpt
         # 记录用于 info 的位置（x,y,z）与航向/误差
         self.last_exp_pos = expert_next_ego[:3, 3].copy()
         self.last_act_pos = action_next_ego[:3, 3].copy()
-        def _yaw_from_R(Rm):
-            return math.atan2(Rm[1, 0], Rm[0, 0])
-        exp_yaw = _yaw_from_R(expert_next_ego[:3, :3])
-        act_yaw = _yaw_from_R(action_next_ego[:3, :3])
+        def _yaw_from_R_xz(Rm) -> float:
+            # Heading is the local +x axis expressed in world coords; project to x-z plane.
+            return float(math.atan2(float(Rm[2, 0]), float(Rm[0, 0])))
+
+        def _wrap_angle_rad(a: float) -> float:
+            # Minimal signed angular difference in (-pi, pi].
+            return float(math.atan2(math.sin(float(a)), math.cos(float(a))))
+
+        exp_yaw = _yaw_from_R_xz(expert_next_ego[:3, :3])
+        act_yaw = _yaw_from_R_xz(action_next_ego[:3, :3])
+
         pos_delta = self.last_act_pos - self.last_exp_pos
         self.last_xz_err_m = float(np.linalg.norm(pos_delta[[0, 2]]))
-        self.last_yaw_err_deg = abs((act_yaw - exp_yaw) * 180.0 / math.pi)
+        dyaw = _wrap_angle_rad(act_yaw - exp_yaw)
+        self.last_yaw_err_deg = abs(float(dyaw) * 180.0 / math.pi)
         self.last_exp_yaw_deg = float(exp_yaw * 180.0 / math.pi)
         self.last_act_yaw_deg = float(act_yaw * 180.0 / math.pi)
 
@@ -263,12 +291,12 @@ class ReconSimulator(gym.Env):
             self.start_ego[1][-1] = self.updateGroundDistance()
             
 #ADD
-        w,h = 800,450
+        w, h = int(self.w), int(self.h)
         for i in range(6):#NOTE 更新相机信息
             loaded_cam_infos = copy.deepcopy(self.all_cams[i])
             loaded_cam_infos = move_to_device(loaded_cam_infos,self.device)
             loaded_cam_infos['camera_to_world'] = torch.tensor(self.start_ego @ self.cam2ego[i]).to(self.device).to(torch.float32)
-            loaded_cam_infos['camera_to_world'] = loaded_cam_infos['camera_to_world'] @ TRANSFORM_MATRIX
+            loaded_cam_infos['camera_to_world'] = loaded_cam_infos['camera_to_world'] @ self._transform_matrix
             loaded_img_infos = copy.deepcopy(self.all_images[i])
             loaded_img_infos = move_to_device(loaded_img_infos,self.device)
             loaded_img_infos['origins'],\
@@ -296,11 +324,28 @@ class ReconSimulator(gym.Env):
     def check_coliision(self):
         return False
     
-    def update(self, scene: int, *, step_frames: int = None):
+    def update(self, scene: int, *, step_frames: int = None, start_frame: int = None):
         self.scene = int(scene)
         if step_frames is not None:
             self.step_frames = int(step_frames)        
-        self.now_frame = 0
+        # Choose starting frame (aligned to step_frames)
+        sf = 0
+        try:
+            if start_frame is not None:
+                sf = int(start_frame)
+        except Exception:
+            sf = 0
+        try:
+            sf = max(0, min(int(sf), int(self.final_frame) - 1))
+        except Exception:
+            sf = max(0, int(sf))
+        try:
+            if int(self.step_frames) > 1:
+                sf = (sf // int(self.step_frames)) * int(self.step_frames)
+        except Exception:
+            pass
+
+        self.now_frame = int(sf)
         self.all_camera_now = []
         self.save = None
 
@@ -313,10 +358,10 @@ class ReconSimulator(gym.Env):
             self.all_images = pickle.load(f)
 
         cam2ego_0 = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/cam2ego/0.txt"))
-        ego2world_0 = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/000.txt"))
-        self.camera_front_start = ego2world_0 @ cam2ego_0
+        ego2world_sf = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt"))
+        self.camera_front_start = ego2world_sf @ cam2ego_0
 
-        self.start_ego = np.linalg.inv(self.camera_front_start) @ ego2world_0
+        self.start_ego = np.linalg.inv(self.camera_front_start) @ ego2world_sf
 
         self.cam2ego = []
         for i in range(6):

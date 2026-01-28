@@ -16,9 +16,21 @@ class RLReconEnv:
     - Keeps env unmodified; all compatibility handled here.
     """
 
-    def __init__(self, cuda: int = 0, scene: int = 0, reward_cfg: Dict[str, Any] | None = None, debug: bool = False):
+    def __init__(
+        self,
+        cuda: int = 0,
+        scene: int = 0,
+        reward_cfg: Dict[str, Any] | None = None,
+        debug: bool = False,
+        *,
+        render_w: int | None = None,
+        render_h: int | None = None,
+    ):
         # debug=False → 使用候选锚点规划；debug=True/flag=True → 使用专家轨迹
-        self.env = ReconSimulator(cuda=cuda, scene=scene, debug=bool(debug))
+        if render_w is None or render_h is None:
+            self.env = ReconSimulator(cuda=cuda, scene=scene, debug=bool(debug))
+        else:
+            self.env = ReconSimulator(cuda=cuda, scene=scene, debug=bool(debug), render_w=int(render_w), render_h=int(render_h))
         self.reward_cfg = reward_cfg or {}
 
         # Step index for aligning with NuScenes keyframes (2Hz → every 5 steps at 10Hz)
@@ -55,10 +67,25 @@ class RLReconEnv:
         # Episode termination reason (for sparse terminal penalties)
         self._ep_done_reason: str | None = None
 
-    def reset(self, scene: int | None = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        # Debounce counters for threshold-based termination
+        self._yaw_exceed_count: int = 0
+        self._xz_exceed_count: int = 0
+
+    def reset(
+        self,
+        scene: int | None = None,
+        *,
+        start_frame: int | None = None,
+        step_frames: int | None = None,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         # `ReconSimulator.reset(seed)` internally uses `update(seed)` → seed acts as scene id.
         seed = scene if scene is not None else self.env.scene
-        obs, info = self.env.reset(seed=seed)
+        options: Dict[str, Any] = {}
+        if start_frame is not None:
+            options["start_frame"] = int(start_frame)
+        if step_frames is not None:
+            options["step_frames"] = int(step_frames)
+        obs, info = self.env.reset(seed=seed, options=options if len(options) else None)
 
         # Reset reward history
         self._last_xz = None
@@ -74,14 +101,23 @@ class RLReconEnv:
         self._ep_xz_err_m = []
         self._ep_yaw_err_deg = []
         self._ep_done_reason = None
+
+        # Reset debounce counters
+        self._yaw_exceed_count = 0
+        self._xz_exceed_count = 0
         # Reset episode compliance/collision aggregates
         self._ep_drivable_sum = 0.0
         self._ep_direction_sum = 0.0
         self._ep_metrics_count = 0
         self._ep_static_collision_any = False
         self._ep_dynamic_collision_any = False
-        # Reset step counter
-        self._step_idx = 0
+        # Reset step counter: track the underlying simulator's frame index.
+        # This makes metrics-cache alignment correct for both step_frames=1 (10Hz)
+        # and step_frames=5 (2Hz keyframes).
+        try:
+            self._step_idx = int(getattr(self.env, "now_frame"))
+        except Exception:
+            self._step_idx = int(start_frame) if start_frame is not None else 0
         # Reset metrics cache
         self._last_metrics = {
             "drivable_compliance": 1.0,
@@ -109,17 +145,38 @@ class RLReconEnv:
             raise ValueError(f"Unsupported action format (len={len(action)}): {action}")
 
         obs, terminated, truncated, info = self.env.step(env_action)
-        # Update step counter
+
+        # Normalize simulator-provided yaw error to a wrapped, minimal angular difference.
+        # This avoids false positives near the wrap boundary (e.g., 179° vs -179°).
         try:
-            self._step_idx += 1
+            if isinstance(info, dict):
+                exp_yaw_deg = info.get("exp_yaw_deg", None)
+                act_yaw_deg = info.get("act_yaw_deg", None)
+                if (exp_yaw_deg is not None) and (act_yaw_deg is not None):
+                    dy = float(act_yaw_deg) - float(exp_yaw_deg)
+                    dy_wrap = ((dy + 180.0) % 360.0) - 180.0
+                    yaw_err_wrapped = abs(float(dy_wrap))
+                    if info.get("yaw_err_deg") is not None and info.get("yaw_err_deg_raw") is None:
+                        info["yaw_err_deg_raw"] = info.get("yaw_err_deg")
+                    info["yaw_err_deg"] = float(yaw_err_wrapped)
+                    info["yaw_err_deg_signed"] = float(dy_wrap)
         except Exception:
-            self._step_idx = 1
+            pass
+        # Update step counter: always follow simulator frame index if available.
+        try:
+            self._step_idx = int(getattr(self.env, "now_frame"))
+        except Exception:
+            try:
+                self._step_idx += 1
+            except Exception:
+                self._step_idx = 1
 
         # Record episode kinematics for episode-level rewards
         try:#NOTE 记录 episode 运动状态
             ego_xz = self.env.start_ego[:3, 3][[0, 2]].astype(np.float32)
             R = self.env.start_ego[:3, :3]
-            yaw = float(math.atan2(R[1, 0], R[0, 0]))
+            # Yaw in x-z plane; local forward is +x; yaw rotates about +y.
+            yaw = float(math.atan2(float(R[2, 0]), float(R[0, 0])))
             self._ep_xz.append(ego_xz)
             self._ep_yaw.append(yaw)
         except Exception:
@@ -161,14 +218,43 @@ class RLReconEnv:
                 xz_err = info.get("xz_err_m", None)
                 yaw_err = info.get("yaw_err_deg", None)
 
-            reasons: list[str] = []
+            # Debounce / robustness:
+            # - require N consecutive steps above threshold before terminating
+            # - default N=1 keeps the previous behavior
+            try:
+                yaw_patience = int(term_cfg.get("yaw_err_patience_steps", 1))
+            except Exception:
+                yaw_patience = 1
+            try:
+                xz_patience = int(term_cfg.get("xz_err_patience_steps", 1))
+            except Exception:
+                xz_patience = 1
+            yaw_patience = max(1, yaw_patience)
+            xz_patience = max(1, xz_patience)
+
+            try:
+                if terminate_on_yaw and yaw_thr is not None and yaw_err is not None and float(yaw_err) > float(yaw_thr):
+                    self._yaw_exceed_count += 1
+                else:
+                    self._yaw_exceed_count = 0
+            except Exception:
+                self._yaw_exceed_count = 0
             try:
                 if terminate_on_xz and xz_thr is not None and xz_err is not None and float(xz_err) > float(xz_thr):
+                    self._xz_exceed_count += 1
+                else:
+                    self._xz_exceed_count = 0
+            except Exception:
+                self._xz_exceed_count = 0
+
+            reasons: list[str] = []
+            try:
+                if terminate_on_xz and xz_thr is not None and xz_err is not None and self._xz_exceed_count >= int(xz_patience):
                     reasons.append("xz_err")
             except Exception:
                 pass
             try:
-                if terminate_on_yaw and yaw_thr is not None and yaw_err is not None and float(yaw_err) > float(yaw_thr):
+                if terminate_on_yaw and yaw_thr is not None and yaw_err is not None and self._yaw_exceed_count >= int(yaw_patience):
                     reasons.append("yaw_err")
             except Exception:
                 pass
@@ -196,6 +282,13 @@ class RLReconEnv:
                         info["xz_err_m_max"] = float(xz_thr)
                     if yaw_thr is not None:
                         info["yaw_err_deg_max"] = float(yaw_thr)
+
+            # Always expose current debounce counters for debugging.
+            if isinstance(info, dict):
+                info["yaw_err_exceed_count"] = int(self._yaw_exceed_count)
+                info["xz_err_exceed_count"] = int(self._xz_exceed_count)
+                info["yaw_err_patience_steps"] = int(yaw_patience)
+                info["xz_err_patience_steps"] = int(xz_patience)
 
         # Record a best-effort termination reason for metrics/logging.
         if done and self._ep_done_reason is None:
@@ -306,7 +399,7 @@ class RLReconEnv:
         mode_raw = str(cfg.get("mode", "step")).lower()
         episode_mode = mode_raw.startswith("episode") or (mode_raw == "episode")
         step_mode = not episode_mode
-        dt = float(cfg.get("dt", 0.1))
+        dt = float(cfg.get("dt", 0.5))
         dt = max(1e-6, dt)
 
         dmax = float(cfg.get("dmax", 2.0))
@@ -355,22 +448,29 @@ class RLReconEnv:
             pos_dev = min(distances)
 
         # --- Heading deviation vs expert yaw ---
-        # Extract yaw from current 3x3 rotation
+        # Extract yaw from current 3x3 rotation (x-z plane)
         R = self.env.start_ego[:3, :3]
-        yaw = math.atan2(R[1, 0], R[0, 0])  # z-yaw assuming standard frame
+        yaw = math.atan2(float(R[0, 0]), float(R[2, 0]))
 
-        # Approximate expert yaw by local tangent between nearest two points
-        if len(expert_xz_list) >= 2:
-            # Find nearest index
-            nearest_idx = int(np.argmin([float(np.linalg.norm(ego_xz - ref)) for ref in expert_xz_list]))
-            j = max(0, min(nearest_idx + 1, len(expert_xz_list) - 1))
-            p0 = expert_xz_list[nearest_idx]
-            p1 = expert_xz_list[j]
-            vec = p1 - p0
-            ref_yaw = math.atan2(float(vec[1]), float(vec[0]))
-            yaw_err = abs(_wrap_angle(yaw - ref_yaw))
-        else:
-            yaw_err = 0.0
+        # Use simulator-provided tracking yaw error (act_yaw vs exp_yaw), in degrees.
+        # If missing, best-effort compute from exp_yaw_deg/act_yaw_deg.
+        def _wrap_angle_deg(a: float) -> float:
+            return float(math.degrees(math.atan2(math.sin(math.radians(float(a))), math.cos(math.radians(float(a))))))
+
+        env_yaw_err_deg = None
+        try:
+            if isinstance(info, dict) and info.get("yaw_err_deg") is not None:
+                env_yaw_err_deg = float(info.get("yaw_err_deg"))
+        except Exception:
+            env_yaw_err_deg = None
+        if env_yaw_err_deg is None:
+            try:
+                if isinstance(info, dict) and (info.get("exp_yaw_deg") is not None) and (info.get("act_yaw_deg") is not None):
+                    env_yaw_err_deg = abs(_wrap_angle_deg(float(info.get("act_yaw_deg")) - float(info.get("exp_yaw_deg"))))
+            except Exception:
+                env_yaw_err_deg = None
+        if env_yaw_err_deg is None:
+            env_yaw_err_deg = 0.0
 #FIXME:
         # --- Collisions (from last computed map metrics) ---
         lm = self._last_metrics or {}
@@ -414,9 +514,8 @@ class RLReconEnv:
             jerk = float(np.clip(jerk, -jerk_clip, jerk_clip))
             yaw_jerk = float(np.clip(yaw_jerk, -jerk_clip, jerk_clip))
         # Penalize only when exceeding thresholds (paper's four components)
-        yaw_err_deg = float(math.degrees(yaw_err))
         rpd = w_pos * max(0.0, float(pos_dev) - dmax)
-        rhd = w_heading * max(0.0, float(yaw_err_deg) - psi_max_deg)
+        rhd = w_heading * max(0.0, float(env_yaw_err_deg) - psi_max_deg)
         rsc = w_static if static_collision_flag else 0.0
         rdc = w_dynamic if dynamic_collision_flag else 0.0
         # Optional smoothness
@@ -435,17 +534,19 @@ class RLReconEnv:
             "jerk_pen": float(jerk_pen),
             "yaw_jerk_pen": float(yaw_jerk_pen),
             "pos_dev": float(pos_dev),
-            "yaw_err_deg": float(yaw_err_deg),
+            "yaw_err_deg": float(env_yaw_err_deg),
             "static_collision": bool(static_collision_flag),
             "dynamic_collision": bool(dynamic_collision_flag),
         }
         if info is None:
             info = {}
+
         info.update(
             {
                 "reward_mode": "step",
                 "pos_dev": float(pos_dev),
-                "yaw_err_deg": float(yaw_err_deg),
+                # Keep/propagate env yaw_err_deg (act vs exp). This is the only yaw error we use.
+                "yaw_err_deg": float(env_yaw_err_deg),
                 "longitudinal_jerk": float(jerk),
                 "yaw_jerk": float(yaw_jerk),
                 "reward": float(reward),
