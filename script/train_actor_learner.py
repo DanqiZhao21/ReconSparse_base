@@ -27,7 +27,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from reconsimulator.envs.rl_wrapper import RLReconEnv
-from reconsimulator.envs.subproc_vec_env import make_scene_sampling_env, SceneSamplingEnv
+from reconsimulator.envs.subproc_vec_env import (
+    make_scene_sampling_env,
+    SceneSamplingEnv,
+    SerialVecEnv,
+    SubprocVecEnv,
+)
 from rl.policy_diffusiondrivev2 import DiffusionDriveV2Policy
 from rl.ppo import _obs_to_tensor as obs_to_tensor
 from rl.actor_learner_io import (
@@ -171,7 +176,7 @@ def discover_scene_ids(base_dir: str, *, require_ckpt: bool) -> List[int]:
     return ids
 
 
-def build_actor_env(cfg: Dict[str, Any], *, cuda: int, actor_id: int) -> SceneSamplingEnv:
+def build_actor_env(cfg: Dict[str, Any], *, cuda: int, actor_id: int, worker_id: Optional[int] = None) -> SceneSamplingEnv:
     env_cfg = cfg.get("env", {}) or {}
     reward_cfg = env_cfg.get("reward", {}) or {}
 
@@ -201,6 +206,8 @@ def build_actor_env(cfg: Dict[str, Any], *, cuda: int, actor_id: int) -> SceneSa
     ddp_seed = int(((cfg.get("train", {}) or {}).get("ddp", {}) or {}).get("seed", 0))
     rank = int(os.environ.get("RANK", "0"))
 
+    wid = int(worker_id) if worker_id is not None else int(actor_id)
+
     return make_scene_sampling_env(
         cuda=int(cuda),
         reward_cfg=reward_cfg,
@@ -209,7 +216,7 @@ def build_actor_env(cfg: Dict[str, Any], *, cuda: int, actor_id: int) -> SceneSa
         scene_sampling=str(scene_sampling),
         ddp_seed=int(ddp_seed),
         rank=int(rank),
-        worker_id=int(actor_id),
+        worker_id=int(wid),
         start_mode=str(start_mode),
         allow_short_tail=bool(allow_short_tail),
         start_min=int(start_min),
@@ -235,6 +242,13 @@ def actor_main(cfg: Dict[str, Any], *, actor_id: int) -> None:
     max_inflight = int(al_cfg.get("max_inflight_per_actor", 2))#最多允许几个未被 learner 消费的 shard
     poll_s = float(al_cfg.get("poll_interval_s", 0.2))
 
+    # Vectorized rollout within one actor process to improve GPU utilization.
+    # - num_envs_per_actor: how many env instances to run on this GPU
+    # - vec_env_mode: serial (default; safe with CUDA) or subproc (higher isolation; may be fragile)
+    num_envs_per_actor = int(al_cfg.get("num_envs_per_actor", 1))
+    vec_env_mode = str(al_cfg.get("vec_env_mode", "serial")).strip().lower()
+    num_envs_per_actor = max(1, int(num_envs_per_actor))
+
     # ---- wandb init (optional) ----
     wb_enabled = _wandb_init_if_enabled(cfg, role="actor", ddp_enabled=False, rank=0, actor_id=int(actor_id))
     actor_global_step = 0
@@ -253,17 +267,34 @@ def actor_main(cfg: Dict[str, Any], *, actor_id: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # Build env
-    '''
-    Actor使用 SceneSamplingEnv，根据配置采样场景。
-    支持：
-        固定 / 随机起始帧
-        最大步数
-        是否只使用有 checkpoint 的场景
-    作用：提供与环境交互的接口 env.step(action)。
-    '''
-    env = build_actor_env(cfg, cuda=int(cuda if cuda >= 0 else 0), actor_id=int(actor_id))
-    obs, info = env.reset()
+    # Build env(s)
+    # Actor can run multiple env instances on one GPU and batch DDV2 inference.
+    if num_envs_per_actor == 1:
+        env = build_actor_env(cfg, cuda=int(cuda if cuda >= 0 else 0), actor_id=int(actor_id))
+        obs, info = env.reset()
+        vec_env = None
+        obs_list: List[Dict[str, Any]] = []
+    else:
+        def _make_env_fn(eidx: int):
+            # Ensure distinct per-env sampling streams.
+            wid = int(actor_id) * 1000 + int(eidx)
+            return lambda: build_actor_env(
+                cfg,
+                cuda=int(cuda if cuda >= 0 else 0),
+                actor_id=int(actor_id),
+                worker_id=int(wid),
+            )
+
+        env_fns = [_make_env_fn(i) for i in range(int(num_envs_per_actor))]
+        if vec_env_mode.startswith("sub"):
+            vec_env = SubprocVecEnv(env_fns)
+        else:
+            vec_env = SerialVecEnv(env_fns)
+
+        obs_list, _info_list = vec_env.reset()
+        # for compatibility with existing codepaths
+        obs = obs_list[0]
+        info = _info_list[0] if len(_info_list) else {}
 
     # Build policy (eval only)
     agent_cfg = cfg.get("agent", {}) or {}
@@ -303,13 +334,15 @@ def actor_main(cfg: Dict[str, Any], *, actor_id: int) -> None:
     ddv2_mode_select = str(train_cfg.get("ddv2_mode_select", "sample")).strip().lower()
 
     shard_idx = 0
+    shard_idx_per_env = [0 for _ in range(int(num_envs_per_actor))]
     while True:
         if stop_requested(paths):
             stage(f"[actor{actor_id}] stop requested; exiting")
             break
 
         # Backpressure: avoid unbounded disk growth
-        while count_inflight(paths, actor_id=str(actor_id)) >= max_inflight:
+        reserve = max(1, int(num_envs_per_actor))
+        while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
             if stop_requested(paths):
                 stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
                 return
@@ -325,102 +358,215 @@ def actor_main(cfg: Dict[str, Any], *, actor_id: int) -> None:
             except Exception as e:
                 stage(f"[actor{actor_id}] weight reload failed: {e}")
 
-        # Collect fixed-horizon rollout (continue across episode boundaries)
-        obs_buf: List[torch.Tensor] = []
-        old_logp_buf: List[torch.Tensor] = []
-        rew_buf: List[float] = []
-        done_buf: List[float] = []
-        replay_buf: List[Dict[str, Any]] = []
+        if num_envs_per_actor == 1:
+            # ---------------- Single-env rollout (legacy path) ----------------
+            obs_buf: List[torch.Tensor] = []
+            old_logp_buf: List[torch.Tensor] = []
+            rew_buf: List[float] = []
+            done_buf: List[float] = []
+            replay_buf: List[Dict[str, Any]] = []
 
-        steps = 0
-        while steps < horizon:
-            obs_t = obs_to_tensor(obs, device=torch.device("cpu"))  # store CPU; learner will move to GPU
+            steps = 0
+            while steps < horizon:
+                obs_t = obs_to_tensor(obs, device=torch.device("cpu"))
 
-            action, logp, replay = agent.sample_ddv2rl_with_replay(
-                obs,
-                eta=ddv2_eta,
-                mode_idx=ddv2_mode_idx,
-                mode_select=ddv2_mode_select,
-            )
+                action, logp, replay = agent.sample_ddv2rl_with_replay(
+                    obs,
+                    eta=ddv2_eta,
+                    mode_idx=ddv2_mode_idx,
+                    mode_select=ddv2_mode_select,
+                )
 
-            obs_buf.append(obs_t.squeeze(0).detach().cpu())
-            old_logp_buf.append(logp.detach().cpu().float())
-            replay_buf.append(replay)
+                obs_buf.append(obs_t.squeeze(0).detach().cpu())
+                old_logp_buf.append(logp.detach().cpu().float())
+                replay_buf.append(replay)
 
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = bool(terminated or truncated)
-            rew_buf.append(float(reward))
-            done_buf.append(1.0 if done else 0.0)
-            steps += 1
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = bool(terminated or truncated)
+                rew_buf.append(float(reward))
+                done_buf.append(1.0 if done else 0.0)
+                steps += 1
+
+                if wb_enabled:
+                    try:
+                        if (int(actor_global_step) % max(1, int(wandb_log_every_steps))) == 0:
+                            inflight = count_inflight(paths, actor_id=str(actor_id))
+                            wandb.log(
+                                {
+                                    "actor/global_step": int(actor_global_step),
+                                    "actor/weights_version": int(local_ver),
+                                    "actor/inflight": int(inflight),
+                                }
+                            )
+                    except Exception:
+                        pass
+                actor_global_step += 1
+
+                if done:
+                    obs, info = env.reset()
+
+            try:
+                next_obs_t = obs_to_tensor(obs, device=torch.device("cpu")).squeeze(0).detach().cpu()
+            except Exception:
+                next_obs_t = torch.zeros((18, 64, 64), dtype=torch.float32)
+            done_last = float(done_buf[-1]) if len(done_buf) > 0 else 1.0
+
+            shard = {
+                "obs": torch.stack(obs_buf, dim=0),
+                "old_logp": torch.stack(old_logp_buf, dim=0).view(-1),
+                "reward": torch.tensor(rew_buf, dtype=torch.float32),
+                "done": torch.tensor(done_buf, dtype=torch.float32),
+                "next_obs": next_obs_t,
+                "done_last": torch.tensor(done_last, dtype=torch.float32),
+                "replay": replay_buf,
+                "meta": {
+                    "actor_id": int(actor_id),
+                    "env_id": 0,
+                    "horizon": int(horizon),
+                    "weights_version": int(local_ver),
+                    "time": float(time.time()),
+                    "shard_idx": int(shard_idx),
+                },
+            }
+
+            name = f"actor{actor_id}_e0_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
+            out_path = os.path.join(paths.shards_dir, name)
+            stage(f"[actor{actor_id}] SingelEnv wrote shard {shard_idx} horizon={horizon} ver={local_ver}")
+            atomic_torch_save(shard, out_path)
 
             if wb_enabled:
                 try:
-                    if (int(actor_global_step) % max(1, int(wandb_log_every_steps))) == 0:
-                        inflight = count_inflight(paths, actor_id=str(actor_id))
-                        wandb.log(
-                            {
-                                "actor/global_step": int(actor_global_step),
-                                "actor/weights_version": int(local_ver),
-                                "actor/inflight": int(inflight),
-                            }
-                        )
+                    inflight = count_inflight(paths, actor_id=str(actor_id))
+                    rew_t = shard["reward"].float()
+                    done_t = shard["done"].float()
+                    wandb.log(
+                        {
+                            "actor/shard_idx": int(shard_idx),
+                            "actor/weights_version": int(local_ver),
+                            "actor/inflight": int(inflight),
+                            "actor/shard_reward_sum": float(rew_t.sum().item()),
+                            "actor/shard_reward_mean": float(rew_t.mean().item()) if rew_t.numel() else 0.0,
+                            "actor/shard_done_rate": float(done_t.mean().item()) if done_t.numel() else 0.0,
+                        }
+                    )
                 except Exception:
                     pass
-            actor_global_step += 1
+            shard_idx += 1
+        else:
+            # ---------------- Multi-env rollout + batched DDV2 inference ----------------
+            assert vec_env is not None
 
-            if done:
-                obs, info = env.reset()
+            # Per-env buffers
+            obs_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
+            old_logp_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
+            rew_bufs: List[List[float]] = [[] for _ in range(int(num_envs_per_actor))]
+            done_bufs: List[List[float]] = [[] for _ in range(int(num_envs_per_actor))]
+            replay_bufs: List[List[Dict[str, Any]]] = [[] for _ in range(int(num_envs_per_actor))]
+            scene_per_env: List[Optional[int]] = [None for _ in range(int(num_envs_per_actor))]
+            mode_idx_per_env: List[Optional[int]] = [None for _ in range(int(num_envs_per_actor))]
 
-        # Bootstrap info for truncated horizon:
-        # - next_obs is the observation after the last transition (already in `obs`)
-        # - done_last indicates whether the last transition ended an episode
-        try:
-            next_obs_t = obs_to_tensor(obs, device=torch.device("cpu")).squeeze(0).detach().cpu()
-        except Exception:
-            # Fallback: use zeros if obs tensorization fails (should be rare)
-            next_obs_t = torch.zeros((18, 64, 64), dtype=torch.float32)
-        done_last = float(done_buf[-1]) if len(done_buf) > 0 else 1.0
+            steps = 0
+            while steps < horizon:
+                # Store CPU observation tensors (one per env)
+                obs_t_list: List[torch.Tensor] = []
+                for o in obs_list:
+                    ot = obs_to_tensor(o, device=torch.device("cpu"))
+                    obs_t_list.append(ot.squeeze(0).detach().cpu())
 
-        shard = {
-            "obs": torch.stack(obs_buf, dim=0),  # (T,18,64,64)
-            "old_logp": torch.stack(old_logp_buf, dim=0).view(-1),
-            "reward": torch.tensor(rew_buf, dtype=torch.float32),
-            "done": torch.tensor(done_buf, dtype=torch.float32),
-            "next_obs": next_obs_t,  # (18,64,64)
-            "done_last": torch.tensor(done_last, dtype=torch.float32),
-            "replay": replay_buf,
-            "meta": {
-                "actor_id": int(actor_id),
-                "horizon": int(horizon),
-                "weights_version": int(local_ver),
-                "time": float(time.time()),
-                "shard_idx": int(shard_idx),
-            },
-        }
-
-        name = f"actor{actor_id}_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
-        out_path = os.path.join(paths.shards_dir, name)
-        stage(f"[actor{actor_id}] wrote shard {shard_idx} horizon={horizon} ver={local_ver}")
-        atomic_torch_save(shard, out_path)
-
-        if wb_enabled:
-            try:
-                inflight = count_inflight(paths, actor_id=str(actor_id))
-                rew_t = shard["reward"].float()
-                done_t = shard["done"].float()
-                wandb.log(
-                    {
-                        "actor/shard_idx": int(shard_idx),
-                        "actor/weights_version": int(local_ver),
-                        "actor/inflight": int(inflight),
-                        "actor/shard_reward_sum": float(rew_t.sum().item()),
-                        "actor/shard_reward_mean": float(rew_t.mean().item()) if rew_t.numel() else 0.0,
-                        "actor/shard_done_rate": float(done_t.mean().item()) if done_t.numel() else 0.0,
-                    }
+                actions, logps, replays = agent.sample_ddv2rl_with_replay_batch(
+                    obs_list,
+                    eta=ddv2_eta,
+                    mode_idx=ddv2_mode_idx,
+                    mode_select=ddv2_mode_select,
                 )
-            except Exception:
-                pass
-        shard_idx += 1
+
+                next_obs_list, reward_list, term_list, trunc_list, info_list = vec_env.step(actions)
+
+                for i in range(int(num_envs_per_actor)):
+                    obs_bufs[i].append(obs_t_list[i])
+                    old_logp_bufs[i].append(logps[i].detach().cpu().float())
+                    replay_bufs[i].append(replays[i])
+
+                    try:
+                        if isinstance(info_list[i], dict) and info_list[i].get("scene") is not None:
+                            scene_per_env[i] = int(info_list[i].get("scene"))
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(replays[i], dict) and replays[i].get("mode_idx") is not None:
+                            mode_idx_per_env[i] = int(replays[i].get("mode_idx"))
+                    except Exception:
+                        pass
+
+                    done = bool(term_list[i] or trunc_list[i])
+                    rew_bufs[i].append(float(reward_list[i]))
+                    done_bufs[i].append(1.0 if done else 0.0)
+
+                    if done:
+                        o2, _info2 = vec_env.reset_one(i)
+                        next_obs_list[i] = o2
+
+                obs_list = next_obs_list
+                obs = obs_list[0]
+
+                if wb_enabled:
+                    try:
+                        if (int(actor_global_step) % max(1, int(wandb_log_every_steps))) == 0:
+                            inflight = count_inflight(paths, actor_id=str(actor_id))
+                            wandb.log(
+                                {
+                                    "actor/global_step": int(actor_global_step),
+                                    "actor/weights_version": int(local_ver),
+                                    "actor/inflight": int(inflight),
+                                }
+                            )
+                    except Exception:
+                        pass
+
+                actor_global_step += int(num_envs_per_actor)
+                steps += 1
+
+            # Write one shard per env instance
+            for i in range(int(num_envs_per_actor)):
+                try:
+                    next_obs_t = obs_to_tensor(obs_list[i], device=torch.device("cpu")).squeeze(0).detach().cpu()
+                except Exception:
+                    next_obs_t = torch.zeros((18, 64, 64), dtype=torch.float32)
+
+                done_last = float(done_bufs[i][-1]) if len(done_bufs[i]) > 0 else 1.0
+
+                shard = {
+                    "obs": torch.stack(obs_bufs[i], dim=0),
+                    "old_logp": torch.stack(old_logp_bufs[i], dim=0).view(-1),
+                    "reward": torch.tensor(rew_bufs[i], dtype=torch.float32),
+                    "done": torch.tensor(done_bufs[i], dtype=torch.float32),
+                    "next_obs": next_obs_t,
+                    "done_last": torch.tensor(done_last, dtype=torch.float32),
+                    "replay": replay_bufs[i],
+                    "meta": {
+                        "actor_id": int(actor_id),
+                        "env_id": int(i),
+                        "horizon": int(horizon),
+                        "weights_version": int(local_ver),
+                        "time": float(time.time()),
+                        "shard_idx": int(shard_idx_per_env[i]),
+                        "scene": (int(scene_per_env[i]) if scene_per_env[i] is not None else None),
+                        "mode_idx": (int(mode_idx_per_env[i]) if mode_idx_per_env[i] is not None else None),
+                    },
+                }
+
+                name = f"actor{actor_id}_e{i}_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
+                out_path = os.path.join(paths.shards_dir, name)
+                scene_str = str(scene_per_env[i]) if scene_per_env[i] is not None else "?"
+                mode_str = str(mode_idx_per_env[i]) if mode_idx_per_env[i] is not None else "?"
+                stage(
+                    f"[actor{actor_id}] MultiEnv wrote shard env={i} scene={scene_str} mode={mode_str} "
+                    f"idx={shard_idx_per_env[i]} horizon={horizon} ver={local_ver}"
+                )
+                atomic_torch_save(shard, out_path)
+
+                shard_idx_per_env[i] += 1
+                shard_idx += 1
 
         if mode in {"sync", "mini_sync", "mini-batch", "minisync"}:
             # Wait for learner to advance version before continuing
