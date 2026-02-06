@@ -1,0 +1,122 @@
+# Reinforce++ closed-loop config (critic-free)
+# Key idea from Reinforce++: Global Advantage Normalization (normalize across the global batch)
+# This config reuses the same actor-learner data pipeline; learner update is switched via train.algo.
+
+env:
+  scene: 0
+  max_steps: 60
+  step_frames: 5
+  debug: False
+  render_w: 800
+  render_h: 450
+  start_frame:
+    mode: random
+    allow_short_tail: false
+    min: 0
+  use_all_scenes: true
+  require_ckpt: true
+  scene_sampling: random
+  reward:
+    mode: step
+    dmax: 2.0
+    psi_max_deg: 30.0
+    w_dynamic: 5.0
+    w_static: 5.0
+    w_pos: 2.0
+    w_heading: 1.0
+    dt: 0.5
+    w_longitudinal_jerk: 0.05
+    w_yaw_jerk: 0.05
+    jerk_clip: 50.0
+    logging:
+      wandb:
+        enable: true
+        prefix: rl
+    terminal:
+      enable: true
+      xz_err_m_max: 5.0
+      yaw_err_deg_max: 45.0
+      terminate_on_xz_err: true
+      terminate_on_yaw_err: true
+      terminate_on_static_collision: true
+      terminate_on_dynamic_collision: true
+      penalty: -5.0
+      apply_on_failure: true
+      apply_on_timeout: false
+      apply_on_env_done: false
+      yaw_err_patience_steps: 5
+      xy_err_patience_steps: 1
+
+train:
+  algo: reinforcepp
+
+  updates: 50
+  ddv2_eta: 1.0
+  ddv2_mode_idx: -1
+  ddv2_mode_select: greedy
+  ddv2_max_grad_norm: 0.5
+  seed: 42
+
+  actor_learner:
+    # Use sync to avoid long waits and ensure steady updates.
+    mode: async
+    buffer_dir: outputs/actor_learner
+    num_actors: 2
+    # Reinforce++ in this repo uses reward-to-go returns without critic bootstrap.
+    # Strongly recommended: set actor_horizon close to env.max_steps to reduce truncation bias.
+    actor_horizon: 60
+    # Keep moderate parallelism; adjust if GPU memory constrains.
+    num_envs_per_actor: 8 #16
+    vec_env_mode: serial
+    # Lower threshold so learner updates promptly (was 192).
+    shards_per_update: 32 #192
+    max_inflight_per_actor: 2048
+    poll_interval_s: 0.2
+    max_updates: 50
+    wandb_actors: true
+    wandb_log_every_steps: 1
+
+  # Shared
+  minibatch_size: 64
+  gamma: 0.99
+
+  # PPO-only keys (ignored by reinforcepp)
+  vf_coef: 0.5
+  lr_value: 1.0e-4
+  epochs: 2
+  clip_eps: 0.2
+  gae_lambda: 0.95
+
+  ddp:
+    grad_accum_steps: 1
+    seed: 42
+    # Reduce collective timeout to fail fast if coordination stalls.
+    timeout_s: 900
+
+  replay:
+    compute_dtype:
+      camera_feature: fp32
+      diffusion_chain: fp32
+
+  wandb:
+    enabled: true
+    project: ReconDreamerRL
+    run_name: ddv2_actor_learner_reinforcepp
+
+  save:
+    upload_to_wandb: false
+
+  ddv2_lr: 3.0e-4
+  ddv2_baseline_beta: 0.98
+
+  reinforcepp:
+    norm_eps: 1.0e-8
+    # KL regularization to a fixed reference policy (agent.ckpt by default)
+    kl_coef: 0.0
+    # ref_ckpt: /abs/path/to/reference.ckpt
+    epochs: 1
+    # Optional baseline variant (adapted): subtract per-scene mean return before global normalization
+    group_baseline: none
+
+agent:
+  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt

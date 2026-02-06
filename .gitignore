@@ -40,3 +40,6 @@ __pycache__/
 *.idea/
 *.vscode/
 nuscenes-devkit/
+
+outputs/
+wandb/

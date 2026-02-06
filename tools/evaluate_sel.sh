@@ -14,6 +14,6 @@ python /root/clone/ReconDreamer-RL/DiffusionDriveV2/navsim/planning/script/run_p
         train_test_split=navtest \
         agent=diffusiondrivev2_sel_agent \
         worker=sequential \
-        agent.checkpoint_path=/root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_sel.ckpt \
+        agent.checkpoint_path=/root/clone/ReconDreamer-RL/outputs/weight/20260129_ppo_ver27_latest.ckpt \
         experiment_name=diffusiondrivev2_agent_eval 
         # metric_cache_path="${NAVSIM_EXP_ROOT}/metric_cache/" 

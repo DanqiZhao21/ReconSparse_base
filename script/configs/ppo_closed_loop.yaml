@@ -45,6 +45,8 @@ env:
       yaw_err_patience_steps: 5  # number of consecutive steps exceeding yaw_err_deg_max before termination
       xy_err_patience_steps: 1
 train:
+  # Algorithm switch: ppo | reinforcepp
+  algo: ppo
   # Actor-Learner reads only a subset of keys under train.*
   # Total learner update count (i.e., weights_version bump次数). Used as fallback if actor_learner.max_updates is not set.
   updates: 50
@@ -60,18 +62,20 @@ train:
     num_actors: 2
     # Each step is ~0.5s (step_frames=5). 8 steps ≈ 4s rollout per shard.
     actor_horizon: 24 #8 每一条轨迹是24步 24*0.5=12s
+    #Buffer size 4320steps  4608/24=192条轨迹
+    #192/16/2=6  每个actor采样6个shard
     # Multi-env per actor (same GPU) to improve DDV2 inference throughput.
     # Warning: each env instance may consume significant GPU memory.
     num_envs_per_actor: 16 #8
     # serial: in-process (recommended with CUDA); subproc: separate processes (may be fragile)
     vec_env_mode: serial
     # shards_per_update: 24
-    shards_per_update: 32 #1024  64  32*16=512条轨迹
+    shards_per_update: 192 #1024  64  32*16=512条轨迹
     max_inflight_per_actor: 2048 #515
     poll_interval_s: 0.2
     # Stop condition: run this many learner updates (weights_version bumps) then exit and signal actors.
     # Set <=0 to disable (infinite). 最多更新的次数
-    max_updates: 24
+    max_updates: 50
     wandb_actors: true
     wandb_log_every_steps: 1
 
@@ -103,6 +107,21 @@ train:
 
   ddv2_lr: 3.0e-4
   ddv2_baseline_beta: 0.98
+
+  # Reinforce++ (critic-free) settings (only used when train.algo: reinforcepp)
+  reinforcepp:
+    # Global Advantage Normalization epsilon
+    norm_eps: 1.0e-8
+    # KL regularization to a fixed reference policy (0 disables and avoids loading ref policy)
+    kl_coef: 0.0
+    # Optional explicit reference checkpoint; default is agent.ckpt
+    # ref_ckpt: /path/to/reference.ckpt
+    # Extra epochs over the same data are usually not recommended for REINFORCE-style updates.
+    epochs: 1
+    # Baseline variant inspired by Reinforce++w/ Baseline:
+    # - none: no group baseline
+    # - scene: subtract per-scene mean return before global std normalization
+    group_baseline: none
 
 agent:
   ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt

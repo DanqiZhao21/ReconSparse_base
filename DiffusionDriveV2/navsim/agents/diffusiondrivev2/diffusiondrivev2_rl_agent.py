@@ -98,7 +98,73 @@ class Diffusiondrivev2_Rl_Agent(AbstractAgent):
             state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
                 "state_dict"
             ]
-        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()})
+        # Evaluation should be tolerant to extra keys (model definition drifts across commits).
+        # Otherwise Ray workers crash with "Unexpected key(s)".
+        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()}, strict=False)
+
+    def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
+        """Override default compute_trajectory.
+
+        The base AbstractAgent implementation assumes a single trajectory of shape (B,T,3).
+        Our RL model returns multi-modal trajectories (e.g. (B,M,T,3)). For PDM evaluation we
+        must pick ONE mode and return a Trajectory with poses shape (T,3).
+        """
+        self.eval()
+
+        features: Dict[str, torch.Tensor] = {}
+        for builder in self.get_feature_builders():
+            features.update(builder.compute_features(agent_input))
+
+        # add batch dimension
+        features = {k: v.unsqueeze(0) for k, v in features.items()}
+
+        with torch.no_grad():
+            predictions = self.forward(features)
+            if predictions is None or (isinstance(predictions, dict) and predictions.get("trajectory", None) is None):
+                raise RuntimeError("Agent forward did not return trajectory")
+
+            traj_t = predictions["trajectory"]
+            if not torch.is_tensor(traj_t):
+                raise RuntimeError(f"trajectory must be a torch.Tensor, got {type(traj_t)!r}")
+            traj_t = traj_t.detach().cpu()
+
+            # Flatten any multi-modal structure into (B, M, T, 3)
+            if traj_t.ndim == 2:
+                # (T,3)
+                poses_t = traj_t
+            elif traj_t.ndim == 3:
+                # (B,T,3) or (M,T,3)
+                if int(traj_t.shape[-1]) != 3:
+                    raise RuntimeError(f"trajectory last dim must be 3, got {tuple(traj_t.shape)}")
+                if int(traj_t.shape[0]) == 1:
+                    poses_t = traj_t[0]
+                else:
+                    # treat as (M,T,3) and pick mode 0
+                    poses_t = traj_t[0]
+            else:
+                # (B, ..., T, 3) -> (B, M, T, 3)
+                if int(traj_t.shape[-1]) != 3:
+                    raise RuntimeError(f"trajectory last dim must be 3, got {tuple(traj_t.shape)}")
+                B = int(traj_t.shape[0])
+                T = int(traj_t.shape[-2])
+                modes_t = traj_t.view(B, -1, T, 3)
+
+                # Choose best mode by summed diffusion log-prob if provided.
+                print("💗Multiple trajectory modes detected, selecting best mode based on log-prob.")
+                best_idx = 0
+                logp = predictions.get("log_probs", None) if isinstance(predictions, dict) else None
+                if torch.is_tensor(logp):
+                    logp_t = logp.detach().cpu()
+                    if logp_t.ndim >= 3 and int(logp_t.shape[0]) == B:
+                        lp_flat = logp_t.view(B, -1, int(logp_t.shape[-1]))
+                        scores = lp_flat.sum(dim=-1)  # (B, M)
+                        best_idx = int(torch.argmax(scores[0]).item())
+
+                poses_t = modes_t[0, best_idx]
+
+            poses = poses_t.numpy().astype(np.float32)
+
+        return Trajectory(poses)
 
 
     def get_sensor_config(self) -> SensorConfig:

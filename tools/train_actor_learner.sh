@@ -36,7 +36,22 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export PYTHONPATH=/root/clone/ReconDreamer-RL:/root/clone/ReconDreamer-RL/DiffusionDriveV2:/root/clone/ReconDreamer-RL/DiffusionDriveV2/navsim:${PYTHONPATH:-}
 
-CONFIG=${CONFIG:-"/root/clone/ReconDreamer-RL/script/configs/ppo_closed_loop.yaml"}
+# Choose algorithm/config.
+# - Recommended: set CONFIG explicitly.
+#   e.g. CONFIG=.../reinforcepp_closed_loop.yaml bash tools/train_actor_learner.sh
+# - Convenience: set ALGO=reinforcepp to switch the default CONFIG.
+ALGO=${ALGO:-"reinforcepp"}
+
+if [[ -z "${CONFIG+x}" ]]; then
+	if [[ "${ALGO}" == "reinforcepp" || "${ALGO}" == "reinforce++" || "${ALGO}" == "reinforce_pp" ]]; then
+		CONFIG="/root/clone/ReconDreamer-RL/script/configs/reinforcepp_closed_loop.yaml"
+		printf "💗[train_actor_learner.sh] Using default CONFIG for ALGO=%s: %s\n" "${ALGO}" "${CONFIG}" >&2
+	else
+		CONFIG="/root/clone/ReconDreamer-RL/script/configs/ppo_closed_loop.yaml"
+		printf "💗[train_actor_learner.sh] Using default CONFIG for ALGO=%s: %s\n" "${ALGO}" "${CONFIG}" >&2
+	fi
+fi
+
 LOG_DIR=${LOG_DIR:-"."}
 
 # Start learners (GPU0-1)

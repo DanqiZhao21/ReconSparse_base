@@ -4,6 +4,7 @@ import time
 import uuid
 import argparse
 import random
+import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
@@ -48,7 +49,13 @@ from rl.actor_learner_io import (
     stop_requested,
 )
 from reconsimulator.envs import nus_config as nus_cfg
-from rl.ppo_ddv2_core import compute_gae, normalize_advantages, ddv2_ppo_update
+from rl.ppo_ddv2_core import compute_gae, normalize_advantages as ppo_normalize_advantages, ddv2_ppo_update
+from rl.reinforcepp_core import (
+    compute_returns,
+    normalize_advantages as reinforcepp_normalize_advantages,
+    ddv2_reinforcepp_update,
+    _apply_group_mean_baseline_inplace,
+)
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -576,7 +583,7 @@ def actor_main(cfg: Dict[str, Any], *, actor_id: int) -> None:
                 break
 
 
-def learner_init_dist() -> Tuple[int, int, int]:
+def learner_init_dist(*, timeout_s: Optional[int] = None) -> Tuple[int, int, int]:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -584,7 +591,17 @@ def learner_init_dist() -> Tuple[int, int, int]:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=backend, init_method="env://")
+        # NOTE: rank0 may wait a long time for enough shards to arrive before
+        # broadcasting the selected shard list. If timeout is too small, rank1+
+        # can hit NCCL collective timeouts while blocked on that broadcast.
+        if timeout_s is None:
+            # Default to a conservative 2h.
+            timeout_s = 2 * 60 * 60
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=datetime.timedelta(seconds=int(timeout_s)),
+        )
     return rank, world_size, local_rank
 
 
@@ -592,7 +609,15 @@ def learner_main(cfg: Dict[str, Any]) -> None:
     train_cfg = cfg.get("train", {}) or {}
     al_cfg = train_cfg.get("actor_learner", {}) or {}
 
-    rank, world_size, local_rank = learner_init_dist()
+    algo = str(train_cfg.get("algo", "ppo")).strip().lower()  # ppo | reinforcepp
+    if algo not in {"ppo", "reinforcepp", "reinforce++", "reinforce_pp"}:
+        raise ValueError(f"Unknown train.algo={algo!r} (expected ppo|reinforcepp)")
+    if algo in {"reinforce++", "reinforce_pp"}:
+        algo = "reinforcepp"
+
+    ddp_cfg = (train_cfg.get("ddp", {}) or {})
+    ddp_timeout_s = ddp_cfg.get("timeout_s", None)
+    rank, world_size, local_rank = learner_init_dist(timeout_s=(int(ddp_timeout_s) if ddp_timeout_s is not None else None))
     ddp_enabled = world_size > 1
 
     # ---- wandb init (optional; only learner rank0 in DDP) ----
@@ -632,14 +657,23 @@ def learner_main(cfg: Dict[str, Any]) -> None:
     replay_compute_camera_dtype = _parse_torch_dtype(replay_compute_dtype_cfg.get("camera_feature", "fp32"))
     replay_compute_chain_dtype = _parse_torch_dtype(replay_compute_dtype_cfg.get("diffusion_chain", "fp32"))
 
-    # PPO hyperparams PPO的超参数
-    clip_eps = float(train_cfg.get("clip_eps", 0.2))
-    ppo_epochs = int(train_cfg.get("epochs", 1))
+    # Shared hyperparams
     minibatch_size = int(train_cfg.get("minibatch_size", 16))
     gamma = float(train_cfg.get("gamma", 0.99))
     gae_lambda = float(train_cfg.get("gae_lambda", 0.95))
-    vf_coef = float(train_cfg.get("vf_coef", 0.5))
     max_grad_norm = float(train_cfg.get("ddv2_max_grad_norm", 0.5))
+
+    # PPO hyperparams
+    clip_eps = float(train_cfg.get("clip_eps", 0.2))
+    ppo_epochs = int(train_cfg.get("epochs", 1))
+    vf_coef = float(train_cfg.get("vf_coef", 0.5))
+
+    # Reinforce++ hyperparams
+    rpp_cfg = (train_cfg.get("reinforcepp", {}) or {})
+    rpp_epochs = int(rpp_cfg.get("epochs", 1))
+    rpp_kl_coef = float(rpp_cfg.get("kl_coef", 0.0))
+    rpp_norm_eps = float(rpp_cfg.get("norm_eps", 1e-8))
+    rpp_group_baseline = str(rpp_cfg.get("group_baseline", "none")).strip().lower()  # none | scene
 
     ddv2_eta = float(train_cfg.get("ddv2_eta", 1.0))
     ddv2_mode_idx = int(train_cfg.get("ddv2_mode_idx", -1))
@@ -669,12 +703,34 @@ def learner_main(cfg: Dict[str, Any]) -> None:
     if ddp_enabled and torch.cuda.is_available():
         agent.wrap_ddp(device_id=local_rank, process_group=dist.group.WORLD)
 
-    value_net = ValueNet().to(device)
-    if ddp_enabled and torch.cuda.is_available():
-        value_net = nn.parallel.DistributedDataParallel(value_net, device_ids=[local_rank], output_device=local_rank)
+    value_net: Optional[nn.Module] = None
+    value_optim: Optional[torch.optim.Optimizer] = None
+    if algo == "ppo":
+        value_net = ValueNet().to(device)
+        if ddp_enabled and torch.cuda.is_available():
+            value_net = nn.parallel.DistributedDataParallel(value_net, device_ids=[local_rank], output_device=local_rank)
 
-    value_lr = float(train_cfg.get("lr_value", 1e-4))
-    value_optim = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        value_lr = float(train_cfg.get("lr_value", 1e-4))
+        value_optim = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+
+    # Reference policy for Reinforce++ KL regularization (optional)
+    ref_agent = None
+    if algo == "reinforcepp" and float(rpp_kl_coef) > 0.0:
+        ref_ckpt = str(rpp_cfg.get("ref_ckpt", ckpt_path))
+        ref_agent = DiffusionDriveV2Policy(
+            x_anchor=x_anchor,
+            y_anchor=y_anchor,
+            ckpt_path=str(ref_ckpt),
+            device=str(device),
+            rl_lr=float(train_cfg.get("ddv2_lr", 1e-5)),
+            reinforce_baseline_beta=float(train_cfg.get("ddv2_baseline_beta", 0.98)),
+        )
+        # Ensure reference does not accidentally get updated.
+        try:
+            for p in ref_agent._agent.parameters():
+                p.requires_grad_(False)
+        except Exception:
+            pass
 
     # Initialize weights version
     if rank == 0:
@@ -692,7 +748,7 @@ def learner_main(cfg: Dict[str, Any]) -> None:
     start_version = read_int(paths.version_file, default=0)
     if rank == 0:
         stage(
-            f"💜[learner] start weights_version={start_version} max_updates={max_updates if max_updates > 0 else 'inf'}"
+            f"💜[learner] algo={algo} start weights_version={start_version} max_updates={max_updates if max_updates > 0 else 'inf'}"
         )
 
     update_idx = 0
@@ -772,12 +828,14 @@ def learner_main(cfg: Dict[str, Any]) -> None:
             break
 
         # Load shards locally (avoid dist object transfer)
-        # Compute per-shard GAE with bootstrap to make fixed-horizon math equivalent.
+        # PPO: compute per-shard GAE with bootstrap.
+        # Reinforce++: compute reward-to-go returns and globally normalize advantages.
         obs_all: List[torch.Tensor] = []
         old_logp_all: List[torch.Tensor] = []
         adv_all: List[torch.Tensor] = []
         ret_all: List[torch.Tensor] = []
         replay_all: List[Dict[str, Any]] = []
+        group_ids_all: List[Optional[int]] = []
 
         reward_sum = 0.0
         reward_cnt = 0
@@ -786,66 +844,126 @@ def learner_main(cfg: Dict[str, Any]) -> None:
 
         t_load0 = time.time()
 
-        value_net.eval()
-        with torch.inference_mode():
-            for fp in selected:
-                shard = torch.load(fp, map_location="cpu")
-                obs_i = shard["obs"].to(device=device, dtype=torch.float32)  # (T,18,64,64)
-                old_logp_i = shard["old_logp"].to(device=device, dtype=torch.float32).view(-1)
-                rewards_i = shard["reward"].to(device=device, dtype=torch.float32).view(-1)
-                dones_i = shard["done"].to(device=device, dtype=torch.float32).view(-1)
-                replay_i = list(shard.get("replay", []))
+        if algo == "ppo":
+            assert value_net is not None
+            value_net.eval()
+            with torch.inference_mode():
+                for fp in selected:
+                    shard = torch.load(fp, map_location="cpu")
+                    obs_i = shard["obs"].to(device=device, dtype=torch.float32)  # (T,18,64,64)
+                    old_logp_i = shard["old_logp"].to(device=device, dtype=torch.float32).view(-1)
+                    rewards_i = shard["reward"].to(device=device, dtype=torch.float32).view(-1)
+                    dones_i = shard["done"].to(device=device, dtype=torch.float32).view(-1)
+                    replay_i = list(shard.get("replay", []))
 
-                # Stats for logging (computed during load; no extra disk IO)
-                reward_sum += float(rewards_i.detach().sum().cpu().item())
-                reward_cnt += int(rewards_i.numel())
-                done_sum += float(dones_i.detach().sum().cpu().item())
-                done_cnt += int(dones_i.numel())
+                    # Stats for logging (computed during load; no extra disk IO)
+                    reward_sum += float(rewards_i.detach().sum().cpu().item())
+                    reward_cnt += int(rewards_i.numel())
+                    done_sum += float(dones_i.detach().sum().cpu().item())
+                    done_cnt += int(dones_i.numel())
 
-                # Bootstrap value for last transition
-                done_last = float(shard.get("done_last", float(dones_i[-1].item() if dones_i.numel() else 1.0)))
-                next_obs = shard.get("next_obs", None)
-                if next_obs is None:
-                    # best-effort fallback: use the last obs (not ideal but avoids crash)
-                    next_obs_t = obs_i[-1]
-                else:
-                    next_obs_t = next_obs.to(device=device, dtype=torch.float32)
+                    # Bootstrap value for last transition
+                    done_last = float(shard.get("done_last", float(dones_i[-1].item() if dones_i.numel() else 1.0)))
+                    next_obs = shard.get("next_obs", None)
+                    if next_obs is None:
+                        # best-effort fallback: use the last obs (not ideal but avoids crash)
+                        next_obs_t = obs_i[-1]
+                    else:
+                        next_obs_t = next_obs.to(device=device, dtype=torch.float32)
 
-                values_i = value_net(obs_i).detach().view(-1)
-                if done_last >= 0.5:
-                    last_value = torch.tensor(0.0, device=device, dtype=values_i.dtype)
-                else:
-                    last_value = value_net(next_obs_t.unsqueeze(0)).detach().view(-1)[0]
+                    values_i = value_net(obs_i).detach().view(-1)
+                    if done_last >= 0.5:
+                        last_value = torch.tensor(0.0, device=device, dtype=values_i.dtype)
+                    else:
+                        last_value = value_net(next_obs_t.unsqueeze(0)).detach().view(-1)[0]
 
-                adv_i, ret_i = compute_gae(
-                    rewards=rewards_i,
-                    dones=dones_i,
-                    values=values_i,
-                    last_value=last_value,
-                    gamma=float(gamma),
-                    gae_lambda=float(gae_lambda),
-                )
+                    adv_i, ret_i = compute_gae(
+                        rewards=rewards_i,
+                        dones=dones_i,
+                        values=values_i,
+                        last_value=last_value,
+                        gamma=float(gamma),
+                        gae_lambda=float(gae_lambda),
+                    )
 
-                # Accumulate
-                obs_all.append(obs_i)
-                old_logp_all.append(old_logp_i)
-                adv_all.append(adv_i)
-                ret_all.append(ret_i)
-                replay_all.extend(replay_i)
+                    # Accumulate
+                    obs_all.append(obs_i)
+                    old_logp_all.append(old_logp_i)
+                    adv_all.append(adv_i)
+                    ret_all.append(ret_i)
+                    replay_all.extend(replay_i)
+        else:
+            with torch.inference_mode():
+                for fp in selected:
+                    shard = torch.load(fp, map_location="cpu")
+                    rewards_i = shard["reward"].to(device=device, dtype=torch.float32).view(-1)
+                    dones_i = shard["done"].to(device=device, dtype=torch.float32).view(-1)
+                    replay_i = list(shard.get("replay", []))
+                    T = int(rewards_i.shape[0])
 
-        obs_batch = torch.cat(obs_all, dim=0)
-        old_logp = torch.cat(old_logp_all, dim=0)
-        adv = torch.cat(adv_all, dim=0)
-        ret = torch.cat(ret_all, dim=0)
+                    reward_sum += float(rewards_i.detach().sum().cpu().item())
+                    reward_cnt += int(rewards_i.numel())
+                    done_sum += float(dones_i.detach().sum().cpu().item())
+                    done_cnt += int(dones_i.numel())
+
+                    # Critic-free advantage: use discounted returns (reward-to-go)
+                    ret_i = compute_returns(rewards=rewards_i, dones=dones_i, gamma=float(gamma))
+                    adv_i = ret_i
+
+                    # Optional group baseline: subtract per-scene mean (adaptation of R++ w/ baseline)
+                    gid: Optional[int] = None
+                    if rpp_group_baseline in {"scene", "scene_id"}:
+                        try:
+                            meta = shard.get("meta", {}) or {}
+                            if meta.get("scene") is not None:
+                                gid = int(meta.get("scene"))
+                        except Exception:
+                            gid = None
+                    group_ids_all.extend([gid for _ in range(T)])
+
+                    adv_all.append(adv_i)
+                    ret_all.append(ret_i)
+                    replay_all.extend(replay_i)
+
+        # Note:
+        # - PPO needs obs_batch + old_logp.
+        # - Reinforce++ does NOT use obs_batch; it uses (adv, ret, replay).
+        obs_batch = torch.cat(obs_all, dim=0) if len(obs_all) else torch.empty((0, 18, 64, 64), device=device)
+        old_logp = torch.cat(old_logp_all, dim=0) if len(old_logp_all) else torch.empty((0,), device=device)
+        adv = torch.cat(adv_all, dim=0) if len(adv_all) else torch.empty((0,), device=device)
+        ret = torch.cat(ret_all, dim=0) if len(ret_all) else torch.empty((0,), device=device)
 
         load_shards_s = time.time() - t_load0
 
-        if len(replay_all) != int(obs_batch.shape[0]):
-            raise RuntimeError(f"replay_all length mismatch: len={len(replay_all)} n={int(obs_batch.shape[0])}")
+        # Consistency checks
+        n = int(adv.shape[0])
+        if int(ret.shape[0]) != n:
+            raise RuntimeError(f"ret length mismatch: ret={int(ret.shape[0])} adv={n}")
 
-        adv = normalize_advantages(adv, ddp_enabled=ddp_enabled, dist_module=dist, device=device)
+        if algo == "ppo":
+            if int(obs_batch.shape[0]) != n:
+                raise RuntimeError(f"obs_batch length mismatch: obs={int(obs_batch.shape[0])} adv={n}")
+            if int(old_logp.shape[0]) != n:
+                raise RuntimeError(f"old_logp length mismatch: old_logp={int(old_logp.shape[0])} adv={n}")
 
-        n = int(obs_batch.shape[0])
+        if len(replay_all) != n:
+            raise RuntimeError(f"replay_all length mismatch: len={len(replay_all)} n={n}")
+
+        if algo == "ppo":
+            adv = ppo_normalize_advantages(adv, ddp_enabled=ddp_enabled, dist_module=dist, device=device)
+        else:
+            if rpp_group_baseline in {"scene", "scene_id"}:
+                _apply_group_mean_baseline_inplace(adv, group_ids_all)
+            adv = reinforcepp_normalize_advantages(
+                adv,
+                ddp_enabled=ddp_enabled,
+                dist_module=dist,
+                device=device,
+                eps=float(rpp_norm_eps),
+            )
+
+        # For PPO, n == obs_batch.shape[0]. For Reinforce++, n == adv.shape[0].
+        n = int(n)
 
         grad_accum_steps = int(((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))
 
@@ -858,40 +976,71 @@ def learner_main(cfg: Dict[str, Any]) -> None:
 
         t_opt0 = time.time()
 
-        res = ddv2_ppo_update(
-            agent=agent,
-            value_net=value_net,
-            value_optim=value_optim,
-            obs_batch=obs_batch,
-            old_logp=old_logp,
-            adv=adv,
-            ret=ret,
-            replay=replay_all,
-            device=device,
-            ddv2_eta=float(ddv2_eta),
-            ddv2_mode_idx_default=int(ddv2_mode_idx),
-            clip_eps=float(clip_eps),
-            vf_coef=float(vf_coef),
-            ppo_epochs=int(ppo_epochs),
-            minibatch_size=int(minibatch_size),
-            max_grad_norm=float(max_grad_norm),
-            grad_accum_steps=int(grad_accum_steps),
-            ddp_enabled=bool(ddp_enabled),
-            world_size=int(world_size),
-            rank=int(rank),
-            ddp_seed=int(((train_cfg.get("ddp", {}) or {}).get("seed", 0))),
-            update_seed=int(update_idx),
-            replay_compute_camera_dtype=replay_compute_camera_dtype,
-            replay_compute_chain_dtype=replay_compute_chain_dtype,
-            # Here all learner ranks see the same shards; partition indices to avoid duplicate compute.
-            use_distributed_sampler=bool(ddp_enabled),
-        )
+        if algo == "ppo":
+            assert value_net is not None and value_optim is not None
+            res = ddv2_ppo_update(
+                agent=agent,
+                value_net=value_net,
+                value_optim=value_optim,
+                obs_batch=obs_batch,
+                old_logp=old_logp,
+                adv=adv,
+                ret=ret,
+                replay=replay_all,
+                device=device,
+                ddv2_eta=float(ddv2_eta),
+                ddv2_mode_idx_default=int(ddv2_mode_idx),
+                clip_eps=float(clip_eps),
+                vf_coef=float(vf_coef),
+                ppo_epochs=int(ppo_epochs),
+                minibatch_size=int(minibatch_size),
+                max_grad_norm=float(max_grad_norm),
+                grad_accum_steps=int(grad_accum_steps),
+                ddp_enabled=bool(ddp_enabled),
+                world_size=int(world_size),
+                rank=int(rank),
+                ddp_seed=int(((train_cfg.get("ddp", {}) or {}).get("seed", 0))),
+                update_seed=int(update_idx),
+                replay_compute_camera_dtype=replay_compute_camera_dtype,
+                replay_compute_chain_dtype=replay_compute_chain_dtype,
+                # Here all learner ranks see the same shards; partition indices to avoid duplicate compute.
+                use_distributed_sampler=bool(ddp_enabled),
+            )
+            last_loss_pi = float(res.loss_pi)
+            last_loss_v = float(res.loss_v)
+            last_approx_kl = float(res.approx_kl)
+            ratio_mean = float(getattr(res, "ratio_mean", 0.0))
+            adv_mean = float(getattr(res, "adv_mean", 0.0))
+        else:
+            rpp_res = ddv2_reinforcepp_update(
+                agent=agent,
+                ref_agent=ref_agent,
+                adv=adv,
+                replay=replay_all,
+                device=device,
+                ddv2_eta=float(ddv2_eta),
+                ddv2_mode_idx_default=int(ddv2_mode_idx),
+                kl_coef=float(rpp_kl_coef),
+                epochs=int(rpp_epochs),
+                minibatch_size=int(minibatch_size),
+                max_grad_norm=float(max_grad_norm),
+                grad_accum_steps=int(grad_accum_steps),
+                ddp_enabled=bool(ddp_enabled),
+                world_size=int(world_size),
+                rank=int(rank),
+                ddp_seed=int(((train_cfg.get("ddp", {}) or {}).get("seed", 0))),
+                update_seed=int(update_idx),
+                replay_compute_camera_dtype=replay_compute_camera_dtype,
+                replay_compute_chain_dtype=replay_compute_chain_dtype,
+                use_distributed_sampler=bool(ddp_enabled),
+            )
+            last_loss_pi = float(rpp_res.loss_pi)
+            last_loss_v = 0.0
+            last_approx_kl = float(rpp_res.approx_kl)
+            ratio_mean = 0.0
+            adv_mean = float(rpp_res.adv_mean)
 
         opt_time_s = time.time() - t_opt0
-
-        last_loss_pi = float(res.loss_pi)
-        last_loss_v = float(res.loss_v)
-        last_approx_kl = float(res.approx_kl)
 
         if ddp_enabled:
             dist.barrier()
@@ -965,8 +1114,8 @@ def learner_main(cfg: Dict[str, Any]) -> None:
                             "loss_pi": float(last_loss_pi),
                             "loss_v": float(last_loss_v),
                             "approx_kl": float(last_approx_kl),
-                            "ratio_mean": float(getattr(res, "ratio_mean", 0.0)),
-                            "adv_mean": float(getattr(res, "adv_mean", 0.0)),
+                            "ratio_mean": float(ratio_mean),
+                            "adv_mean": float(adv_mean),
                             "reward_sum": float(reward_sum),
                             "reward_mean": float(reward_mean),
                             "done_rate": float(done_rate),
