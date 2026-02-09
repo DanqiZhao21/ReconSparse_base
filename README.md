@@ -2,7 +2,7 @@
 
 本仓库用于训练与评测“ReconDiff”闭环策略：将 DiffusionDriveV2（轨迹扩散策略）与 ReconDreamer 3D Gaussian Splatting（3DGS）仿真环境结合，通过 Actor-Learner 框架进行 PPO / Reinforce++ 强化学习。
 
-## 近期大改动（需要注意）
+## 近期改动
 
 - **统一到 framework/**：训练/评测/可视化脚本统一从 `framework.*` 导入；历史 `rl/*` 命名空间已收敛。
 - **Actor-Learner v2 入口**：统一使用 [script/train_actor_learner_v2.py](script/train_actor_learner_v2.py)。
@@ -11,7 +11,7 @@
 - **buffer 磁盘卫生**：learner 消费过的 shard 会自动移动/清理，避免长期堆积占满磁盘。
 - **视频生成工具**：新增 [tools/smalltool/visualize/generate_video.py](tools/smalltool/visualize/generate_video.py) + [tools/smalltool/visualize/generate_video.sh](tools/smalltool/visualize/generate_video.sh)，可按“秒”控制 rollout 时长（必须是 0.5s 的整数倍，或更一般地是 `step_frames*frame_dt` 的整数倍）。
 
-## 代码结构（从哪里开始读/改）
+## 代码结构
 
 - **Env 封装**：`framework/env_wrapper/`（ReconSimulator + gymnasium 封装，vec-env 适配等）
 - **Agent/Policy**：`framework/agent/`（DDV2 RL 适配器/采样 + logp 接口）
@@ -31,7 +31,7 @@ conda activate recondreamerNew-rl
 
 ## 数据与模型准备（Denso/OpenDataset 场景）
 
-如果你在 Denso 服务器环境，数据/模型通常已经在 `OpenDataset` 盘中准备好；你只需要确认环境变量 + 软连接。
+如果使用Denso 服务器环境，数据/模型通常已经在 `OpenDataset` 盘中准备好；需要确认环境变量 + 软连接。
 
 ### 1) navsim 数据集
 
@@ -109,15 +109,15 @@ LOG_DIR=./logs CONFIG=script/configs/ppo_closed_loop.yaml bash tools/train_actor
 - 宏动作：`train.actor_learner.commit_steps=K`（一次采样 plan 后连续执行 K 步，再写 1 条宏 transition）
 - `actor_horizon` 语义：引入 `commit_steps` 后，`actor_horizon` 是“宏决策次数”，而不是原始 env.step 数。
 
-## 闭环训练（单进程/多 GPU，偏调试用途）
+<!-- ## 闭环训练（单进程/多 GPU，偏调试用途）
 
 如果你想用“每 GPU 一个进程”的方式跑闭环训练（更像旧版脚本行为），可用 [tools/trainclosedloop.sh](tools/trainclosedloop.sh)：
 
 ```bash
 LOG_DIR=./logs GPUS="0 1 2 3" bash tools/trainclosedloop.sh
-```
+``` -->
 
-## 生成 rollout 视频（强烈推荐用 .sh wrapper 跑）
+## 生成 rollout 视频
 
 新增工具：
 
