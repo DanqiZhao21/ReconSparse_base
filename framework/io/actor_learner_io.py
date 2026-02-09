@@ -5,7 +5,7 @@ import time
 import uuid
 import shutil
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, List
 
 import torch
 
@@ -67,7 +67,6 @@ class BufferPaths:
 
     @property
     def stop_file(self) -> str:
-        # Presence of this file indicates all processes should terminate.
         return os.path.join(self.root, "STOP")
 
 
@@ -105,12 +104,86 @@ def move_to_consumed(paths: BufferPaths, shard_path: str) -> None:
     try:
         os.replace(shard_path, dst)
     except Exception:
-        # Fallback: copy then remove
         try:
             shutil.copy2(shard_path, dst)
             os.remove(shard_path)
         except Exception:
             pass
+
+
+def prune_consumed(
+    paths: BufferPaths,
+    *,
+    keep_basenames: set[str] | None = None,
+    keep_last: int | None = None,
+    suffix: str = ".pt",
+) -> int:
+    """Delete old files under consumed/ to prevent unbounded growth.
+
+    Typical usage in learner (after moving selected shards):
+    - keep only the shards consumed in the latest update: keep_basenames={...}
+    - or keep only the newest N consumed shards: keep_last=N
+
+    Returns number of deleted files (best-effort).
+    """
+    ensure_buffer_layout(paths)
+    deleted = 0
+
+    try:
+        names = [n for n in os.listdir(paths.consumed_dir) if n.endswith(str(suffix))]
+    except Exception:
+        return 0
+
+    # Strategy A: keep exact set of basenames.
+    if keep_basenames is not None:
+        keep = set(str(n) for n in keep_basenames)
+        for name in names:
+            if name in keep:
+                continue
+            p = os.path.join(paths.consumed_dir, name)
+            try:
+                if os.path.isfile(p) or os.path.islink(p):
+                    os.remove(p)
+                    deleted += 1
+            except Exception:
+                pass
+        return int(deleted)
+
+    # Strategy B: keep newest N by mtime.
+    if keep_last is None:
+        return 0
+    keep_n = max(0, int(keep_last))
+    if keep_n <= 0:
+        # Delete all
+        for name in names:
+            p = os.path.join(paths.consumed_dir, name)
+            try:
+                if os.path.isfile(p) or os.path.islink(p):
+                    os.remove(p)
+                    deleted += 1
+            except Exception:
+                pass
+        return int(deleted)
+
+    files: List[tuple[float, str]] = []
+    for name in names:
+        p = os.path.join(paths.consumed_dir, name)
+        try:
+            mt = os.path.getmtime(p)
+        except Exception:
+            mt = 0.0
+        files.append((float(mt), name))
+    files.sort(key=lambda x: x[0], reverse=True)
+
+    for _, name in files[keep_n:]:
+        p = os.path.join(paths.consumed_dir, name)
+        try:
+            if os.path.isfile(p) or os.path.islink(p):
+                os.remove(p)
+                deleted += 1
+        except Exception:
+            pass
+    return int(deleted)
 
 
 def count_inflight(paths: BufferPaths, *, actor_id: str) -> int:
@@ -143,3 +216,18 @@ def wait_for_version(
         if timeout_s is not None and (time.time() - t0) > float(timeout_s):
             return int(v)
         time.sleep(float(poll_s))
+
+
+__all__ = [
+    "BufferPaths",
+    "atomic_torch_save",
+    "ensure_buffer_layout",
+    "list_shards",
+    "move_to_consumed",
+    "prune_consumed",
+    "read_int",
+    "write_int",
+    "wait_for_version",
+    "count_inflight",
+    "stop_requested",
+]

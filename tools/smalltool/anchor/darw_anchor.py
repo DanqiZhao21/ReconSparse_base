@@ -6,7 +6,7 @@
 # first element: [0. 0.]
 # =============================================
 # import numpy as np
-# path = "/root/clone/ReconDreamer-RL/assets/nus/anchor/traj_anchor_05s_3721.npy"
+# path = "$REPO_ROOT/assets/nus/anchor/traj_anchor_05s_3721.npy"
 # arr = np.load(path, allow_pickle=True)
 # print("arr shape:", arr.shape)
 # print("first element shape:", arr[0, 0].shape)
@@ -19,7 +19,7 @@
 # first element: False
 # =============================================
 # import numpy as np
-# path = "/root/clone/ReconDreamer-RL/assets/nus/anchor/traj_anchor_05s_3721_mask.npy"
+# path = "$REPO_ROOT/assets/nus/anchor/traj_anchor_05s_3721_mask.npy"
 # arr = np.load(path, allow_pickle=True)
 # print("arr shape:", arr.shape)
 # print("first element shape:", arr[0, 0].shape)
@@ -30,7 +30,7 @@
 # import matplotlib.pyplot as plt
 
 # # === 路径 ===
-# path = "/root/clone/ReconDreamer-RL/assets/nus/anchor/traj_anchor_05s_3721.npy"
+# path = "$REPO_ROOT/assets/nus/anchor/traj_anchor_05s_3721.npy"
 
 # # === 加载数据 ===
 # traj = np.load(path)   # (3721, 6, 2)
@@ -69,11 +69,13 @@
 #NOTE SAMPLE 200 TRAJ
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 # ===============================
 # 配置
 # ===============================
-path = "/root/clone/ReconDreamer-RL/assets/nus/anchor/traj_anchor_05s_3721.npy"
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+path = os.path.join(_REPO_ROOT, "assets", "nus", "anchor", "traj_anchor_05s_3721.npy")
 num_sample = 200
 seed = 0  # 固定随机种子，方便复现（可删）
 

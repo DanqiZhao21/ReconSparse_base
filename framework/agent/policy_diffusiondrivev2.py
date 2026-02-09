@@ -1,12 +1,13 @@
 import os
 import sys
-from typing import Dict, Tuple, Any
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 import cv2
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from .base import Agent
 
 # Ensure DiffusionDriveV2 is importable
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -26,7 +27,7 @@ else:
     _IMPORT_ERROR = None
 
 #NOTE RL policy 封装器;调用 DiffusionDriveV2-RL 模型 (Diffusiondrivev2_Rl_Agent) 来生成轨迹动作。
-class DiffusionDriveV2Policy:
+class DiffusionDriveV2Policy(Agent):
     """
         Minimal RL policy wrapper around DiffusionDriveV2-RL.
         This wrapper is intended for policy-gradient optimization via diffusion log-probabilities
@@ -76,6 +77,48 @@ class DiffusionDriveV2Policy:
                 self._ddv2_optimizer = torch.optim.Adam(params, lr=float(rl_lr))
 
         self._ddp_enabled: bool = False
+
+    # -------------------- Agent interface -------------------- #
+    def initialize(self) -> None:
+        return
+
+    def act(
+        self,
+        observation: Dict[str, Any],
+        *,
+        eta: float = 1.0,
+        mode_idx: int = -1,
+        mode_select: str = "sample",
+    ) -> Tuple[Tuple[float, float, float, int], torch.Tensor, Dict[str, Any]]:
+        return self.sample_ddv2rl_with_replay(
+            observation,
+            eta=float(eta),
+            mode_idx=int(mode_idx),
+            mode_select=str(mode_select),
+        )
+
+    def act_batch(
+        self,
+        observations: List[Dict[str, Any]],
+        *,
+        eta: float = 1.0,
+        mode_idx: int = -1,
+        mode_select: str = "sample",
+    ) -> Tuple[List[Tuple[float, float, float, int]], List[torch.Tensor], List[Dict[str, Any]]]:
+        return self.sample_ddv2rl_with_replay_batch(
+            observations,
+            eta=float(eta),
+            mode_idx=int(mode_idx),
+            mode_select=str(mode_select),
+        )
+
+    def load_checkpoint(self, path: str, *, strict: bool = False) -> None:
+        self.load_from_checkpoint(path, strict=bool(strict))
+
+    def parameters(self):
+        if self._agent is None or not hasattr(self._agent, "parameters"):
+            return []
+        return self._agent.parameters()
 
     def wrap_ddp(
         self,
@@ -223,8 +266,8 @@ class DiffusionDriveV2Policy:
             raise RuntimeError("Unexpected DDV2 agent type")
 
         camera_feature = self._build_camera_feature(observation)  # (1,3,256,1024)
-        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)
-        status_feature = torch.zeros((1, 8), dtype=torch.float32)
+        lidar_feature = torch.zeros((1, 1, 256, 256), dtype=torch.float32)#占位符
+        status_feature = torch.zeros((1, 8), dtype=torch.float32)#占位符
 
         model_device = next(self._agent.parameters()).device if hasattr(self._agent, 'parameters') else torch.device('cpu')
         features = {
@@ -363,6 +406,9 @@ class DiffusionDriveV2Policy:
             "camera_feature": camera_feature.detach().cpu(),
             "diffusion_chain": diffusion_chain.detach().cpu(),
             "mode_idx": mi,
+            # Selected trajectory points (for commit/closed-loop execution on actor side).
+            # Shape: (H, 3) where H is DDV2 trajectory horizon (typically 8).
+            "traj_xyyaw": traj0[mi].detach().cpu(),
         }
         return action, lp, replay
 
@@ -462,6 +508,8 @@ class DiffusionDriveV2Policy:
                     "camera_feature": camera_feature[b : b + 1].detach().cpu(),
                     "diffusion_chain": diffusion_chain[b : b + 1].detach().cpu(),
                     "mode_idx": mi,
+                    # Shape: (H, 3)
+                    "traj_xyyaw": traj[b, mi].detach().cpu(),
                 }
             )
 

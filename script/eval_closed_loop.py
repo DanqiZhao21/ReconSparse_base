@@ -13,14 +13,23 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from reconsimulator.envs.rl_wrapper import RLReconEnv
-from rl.ppo import PPOAgent
-from rl.policy_diffusiondrivev2 import DiffusionDriveV2Policy
+from framework.env_wrapper import RLReconEnv
+from framework.algorithms import PPOAgent
+from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _resolve_repo_path(p: str) -> str:
+    if p is None:
+        return p
+    s = str(p)
+    if os.path.isabs(s):
+        return s
+    return os.path.join(_REPO_ROOT, s)
 
 
 def main():
@@ -39,7 +48,11 @@ def main():
     x_anchor = getattr(env.env, "x_anchor", 61)
     y_anchor = getattr(env.env, "y_anchor", 61)
     agent_cfg = cfg.get("agent", {})
-    ckpt_path = agent_cfg.get("ckpt", "/root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt")
+    ckpt_path = agent_cfg.get(
+        "ckpt",
+        os.path.join(_REPO_ROOT, "DiffusionDriveV2", "ckpt", "diffusiondrivev2_rl.ckpt"),
+    )
+    ckpt_path = _resolve_repo_path(ckpt_path)
     use_ddv2 = bool(agent_cfg.get("use_ddv2", True))#ddv2 diffusionDriveV2Policy
 
     if use_ddv2:

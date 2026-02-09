@@ -44,7 +44,10 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Python 路径（确保本仓库与 DiffusionDriveV2 可见）
-export PYTHONPATH=/root/clone/ReconDreamer-RL:/root/clone/ReconDreamer-RL/DiffusionDriveV2:/root/clone/ReconDreamer-RL/DiffusionDriveV2/navsim:${PYTHONPATH:-}
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DDV2_ROOT="$REPO_ROOT/DiffusionDriveV2"
+NAVSIM_ROOT="$DDV2_ROOT/navsim"
+export PYTHONPATH="$REPO_ROOT:$DDV2_ROOT:$NAVSIM_ROOT:${PYTHONPATH:-}"
 
 # Multi-GPU launcher: run one training per GPU (default 0 1 2 3)
 GPUS=${GPUS:-"0 1 2 3"}
@@ -55,7 +58,7 @@ for gid in ${GPUS}; do
 	(
 		export CUDA_VISIBLE_DEVICES=${gid}
 		export RUN_SUFFIX="${suffix}"
-		python -u /root/clone/ReconDreamer-RL/script/train_closed_loop.py \
+		python -u "$REPO_ROOT/script/train_closed_loop.py" \
 			2>&1 | tee "${LOG_DIR}/train_closed_loop_${suffix}.log"
 	) &
 	pids+=("$!")

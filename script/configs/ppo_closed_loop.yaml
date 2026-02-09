@@ -1,6 +1,7 @@
 env:
   scene: 0
-  max_steps: 60
+  # 18s max at dt=0.5s (step_frames=5) => 36 env.steps per episode
+  max_steps: 36
   # NuScenes keyframe spacing: 10Hz base -> step_frames=5 means 0.5s per env.step
   step_frames: 5
   debug: False
@@ -60,14 +61,17 @@ train:
     buffer_dir: outputs/actor_learner
     # num_actors: 2
     num_actors: 2
-    # Each step is ~0.5s (step_frames=5). 8 steps ≈ 4s rollout per shard.
-    actor_horizon: 24 #8 每一条轨迹是24步 24*0.5=12s
-    #Buffer size 4320steps  4608/24=192条轨迹
+    # NOTE(actor_horizon): after introducing commit_steps, actor_horizon counts *macro decisions*.
+    # Effective env steps per shard ≈ actor_horizon * commit_steps (within an episode, capped by env.max_steps).
+    # With dt=0.5s, max_steps=36 => 18s per episode. With commit_steps=4, set actor_horizon<=9 to fit one episode.
+    actor_horizon: 9 # macro steps; 9*4=36 env.steps (~18s)
+    # Buffer size note: the stored samples are macro transitions (one per sampled plan), not raw env steps.
     #192/16/2=6  每个actor采样6个shard
     # Multi-env per actor (same GPU) to improve DDV2 inference throughput.
     # Warning: each env instance may consume significant GPU memory.
     num_envs_per_actor: 16 #8
     # serial: in-process (recommended with CUDA); subproc: separate processes (may be fragile)
+    commit_steps: 4 #K：每次采样一条DDV2轨迹(plan)后，连续执行其前K个点(=K次env.step)，期间不重新采样；然后将这K步聚合成1条macro transition写入buffer。建议K<=DDV2轨迹点数H(通常8)。
     vec_env_mode: serial
     # shards_per_update: 24
     shards_per_update: 192 #1024  64  32*16=512条轨迹
@@ -108,7 +112,7 @@ train:
   ddv2_lr: 3.0e-4
   ddv2_baseline_beta: 0.98
 
-  # Reinforce++ (critic-free) settings (only used when train.algo: reinforcepp)
+  #NOTE Reinforce++ (critic-free) settings (only used when train.algo: reinforcepp)
   reinforcepp:
     # Global Advantage Normalization epsilon
     norm_eps: 1.0e-8
@@ -118,10 +122,11 @@ train:
     # ref_ckpt: /path/to/reference.ckpt
     # Extra epochs over the same data are usually not recommended for REINFORCE-style updates.
     epochs: 1
+    #对同一 batch 数据做多少轮更新——REINFORCE 是 高方差策略梯度，重复使用同一数据容易导致方差爆炸;
     # Baseline variant inspired by Reinforce++w/ Baseline:
     # - none: no group baseline
     # - scene: subtract per-scene mean return before global std normalization
-    group_baseline: none
+    group_baseline: none #分组基线（baseline）——减少训练方差，提高稳定性
 
 agent:
-  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt
+  ckpt: DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt

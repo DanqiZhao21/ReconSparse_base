@@ -1,7 +1,11 @@
 import numpy as np
 
+import os
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
 # plan_anchors 文件路径
-file_path = "/root/clone/ReconDreamer-RL/assets/nus/anchor/traj_anchor_05s_3721.npy"
+file_path = os.path.join(_REPO_ROOT, "assets", "nus", "anchor", "traj_anchor_05s_3721.npy")
 
 # 尝试加载文件
 try:

@@ -4,7 +4,8 @@
 
 env:
   scene: 0
-  max_steps: 60
+  # 18s max at dt=0.5s (step_frames=5) => 36 env.steps per episode
+  max_steps: 36
   step_frames: 5
   debug: False
   render_w: 800
@@ -62,14 +63,18 @@ train:
     mode: async
     buffer_dir: outputs/actor_learner
     num_actors: 2
-    # Reinforce++ in this repo uses reward-to-go returns without critic bootstrap.
-    # Strongly recommended: set actor_horizon close to env.max_steps to reduce truncation bias.
-    actor_horizon: 60
+    # Commit steps per sampled trajectory (same semantics as PPO actor): sample one DDV2 plan, execute first K env.steps.
+    # Recommend K <= DDV2 trajectory horizon H (typically 8).
+    commit_steps: 4
+    # NOTE(actor_horizon): counts *macro decisions* (one per sampled plan).
+    # Effective env steps per shard ≈ actor_horizon * commit_steps (within an episode, capped by env.max_steps).
+    # With max_steps=36 and commit_steps=4, set actor_horizon<=9 to fit one episode and avoid spanning resets.
+    actor_horizon: 9
     # Keep moderate parallelism; adjust if GPU memory constrains.
-    num_envs_per_actor: 8 #16
+    num_envs_per_actor: 16 #16
     vec_env_mode: serial
     # Lower threshold so learner updates promptly (was 192).
-    shards_per_update: 32 #192
+    shards_per_update: 192 #192
     max_inflight_per_actor: 2048
     poll_interval_s: 0.2
     max_updates: 50
@@ -119,4 +124,4 @@ train:
     group_baseline: none
 
 agent:
-  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt
+  ckpt: DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt

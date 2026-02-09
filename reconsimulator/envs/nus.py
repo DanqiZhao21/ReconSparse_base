@@ -6,7 +6,10 @@ import pickle
 import torch
 import numpy as np
 import gymnasium as gym
-from reconsimulator.envs.tool import get_splat,get_sky_view,move_to_device,slerp
+# NOTE: Import helpers from the concrete module to avoid a circular import:
+# - framework.env_wrapper.__init__ imports RLReconEnv -> imports ReconSimulator (this file)
+# - importing from framework.env_wrapper here would re-enter __init__ while it's initializing
+from framework.env_wrapper.tool import get_splat, get_sky_view, move_to_device, slerp
 from reconsimulator.envs import nus_config as cfg
 from scipy.spatial.transform import Slerp, Rotation as R
 from scipy.spatial.distance import cdist

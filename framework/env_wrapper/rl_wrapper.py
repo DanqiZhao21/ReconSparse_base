@@ -4,9 +4,9 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
-from .nus import ReconSimulator
-from .metrics import oriented_box, EGO_LENGTH, EGO_WIDTH
-from .metrics_cache import load_scene_env_cache
+from reconsimulator.envs.nus import ReconSimulator
+from reconsimulator.envs.metrics import oriented_box, EGO_LENGTH, EGO_WIDTH
+from reconsimulator.envs.metrics_cache import load_scene_env_cache
 from shapely.geometry import Polygon
 
 

@@ -2,8 +2,10 @@ import os
 import numpy as np
 from scipy.spatial import cKDTree
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
 # 使用项目里的默认路径（nus_config.py 指向）
-DEFAULT_PATH = "/root/clone/ReconDreamer-RL/assets/nus/anchor/traj_anchor_05s_3721.npy"
+DEFAULT_PATH = os.path.join(_REPO_ROOT, "assets", "nus", "anchor", "traj_anchor_05s_3721.npy")
 
 def main(path: str = DEFAULT_PATH):
     anchors = np.load(path)

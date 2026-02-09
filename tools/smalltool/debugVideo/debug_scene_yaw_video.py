@@ -14,8 +14,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from reconsimulator.envs.rl_wrapper import RLReconEnv
-from rl.policy_diffusiondrivev2 import DiffusionDriveV2Policy
+from framework.env_wrapper import RLReconEnv
+from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:

@@ -55,7 +55,6 @@ def _apply_group_mean_baseline_inplace(adv: torch.Tensor, group_ids: Sequence[Op
     if len(group_ids) != int(adv.shape[0]):
         raise ValueError("group_ids length mismatch")
 
-    # Build tensors for entries that have a group id.
     idx = [i for i, g in enumerate(group_ids) if g is not None]
     if len(idx) == 0:
         return adv
@@ -210,7 +209,7 @@ def ddv2_reinforcepp_update(
             new_logp_vec = sel.sum(dim=-1).to(dtype=torch.float32)
 
             mb_idx_t = torch.tensor(mb_idx, dtype=torch.long, device=device)
-            adv_mb = adv[mb_idx_t].detach()  # do not backprop through advantage
+            adv_mb = adv[mb_idx_t].detach()
 
             loss_pi = -(adv_mb * new_logp_vec).mean()
 
@@ -227,7 +226,6 @@ def ddv2_reinforcepp_update(
                     ref_sel = ref_all_logps[torch.arange(bsz, device=device), mb_mode_idx, :]
                     ref_logp_vec = ref_sel.sum(dim=-1).to(dtype=torch.float32)
 
-                # single-sample KL estimator: E_{a~pi}[logpi(a)-logpref(a)]
                 approx_kl = (new_logp_vec - ref_logp_vec).mean().detach()
                 loss_pi = loss_pi + float(kl_coef) * (new_logp_vec - ref_logp_vec).mean()
 
@@ -266,3 +264,12 @@ def ddv2_reinforcepp_update(
         approx_kl=float(last_approx_kl),
         adv_mean=float(last_adv_mean),
     )
+
+
+__all__ = [
+    "ReinforcePPUpdateResult",
+    "compute_returns",
+    "_apply_group_mean_baseline_inplace",
+    "normalize_advantages",
+    "ddv2_reinforcepp_update",
+]

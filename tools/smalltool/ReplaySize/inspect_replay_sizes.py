@@ -12,7 +12,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from rl.policy_diffusiondrivev2 import DiffusionDriveV2Policy
+from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -239,7 +239,7 @@ def main() -> None:
             else:
                 if obs is None:
                     # Lazy-import RL env only if needed (renderer may trigger nvdiffrast build).
-                    from reconsimulator.envs.rl_wrapper import RLReconEnv
+                    from framework.env_wrapper import RLReconEnv
                     env = RLReconEnv(cuda=cuda, scene=scene, reward_cfg=env_cfg.get("reward", {}), debug=bool(env_cfg.get("debug", False)))
                     obs, info = env.reset(scene=scene, start_frame=start_frame)
                     try:

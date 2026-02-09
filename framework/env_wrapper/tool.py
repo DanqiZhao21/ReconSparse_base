@@ -1,10 +1,13 @@
 import sys
 import os
 
-current_dir = os.getcwd()
-target_path = os.path.join(current_dir, "reconsimulator", "render")
-sys.path.append(current_dir)
-sys.path.append(target_path)
+# Make repo-local imports robust regardless of CWD.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_RENDER_ROOT = os.path.join(_REPO_ROOT, "reconsimulator", "render")
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
+if _RENDER_ROOT not in sys.path:
+    sys.path.append(_RENDER_ROOT)
 
 import copy
 import torch
@@ -16,7 +19,9 @@ from scipy.spatial.transform import Rotation as R
 from reconsimulator.render.utils.misc import import_str
 from reconsimulator.envs import nus_config as cfg
 
-
+'''
+定位 3DGS trainer 加载、渲染状态提取、几何工具。
+'''
 # ----------------------------- In-process trainer cache ----------------------------- #
 # GPU renderer/model initialization is expensive and can easily dominate rollout time.
 # In single-process vectorization (SerialVecEnv), multiple env instances may request

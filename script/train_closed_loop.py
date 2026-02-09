@@ -42,17 +42,26 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from reconsimulator.envs.rl_wrapper import RLReconEnv
-from reconsimulator.envs.subproc_vec_env import SubprocVecEnv, SerialVecEnv, make_scene_sampling_env
-from rl.policy_diffusiondrivev2 import DiffusionDriveV2Policy
-from rl.ppo import _obs_to_tensor as obs_to_tensor
-from rl.ppo_ddv2_core import compute_gae, normalize_advantages, ddv2_ppo_update
+from framework.env_wrapper import RLReconEnv, SubprocVecEnv, SerialVecEnv, make_scene_sampling_env
+from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy
+from framework.utils.obs import obs_to_tensor
+from framework.algorithms.ppo_ddv2_core import compute_gae, normalize_advantages, ddv2_ppo_update
 from reconsimulator.envs import nus_config as nus_cfg
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _resolve_repo_path(p: str) -> str:
+    """Resolve a path relative to repo root (keeps absolute paths unchanged)."""
+    if p is None:
+        return p
+    s = str(p)
+    if os.path.isabs(s):
+        return s
+    return os.path.join(_REPO_ROOT, s)
 
 
 def main():
@@ -466,7 +475,11 @@ def main():
     x_anchor = getattr(env.env, "x_anchor", 61)
     y_anchor = getattr(env.env, "y_anchor", 61)
     agent_cfg = cfg.get("agent", {})
-    ckpt_path = agent_cfg.get("ckpt", "/root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt")
+    ckpt_path = agent_cfg.get(
+        "ckpt",
+        os.path.join(_REPO_ROOT, "DiffusionDriveV2", "ckpt", "diffusiondrivev2_rl.ckpt"),
+    )
+    ckpt_path = _resolve_repo_path(ckpt_path)
     use_ddv2 = bool(agent_cfg.get("use_ddv2", True))
     ddv2 = None
     if use_ddv2:

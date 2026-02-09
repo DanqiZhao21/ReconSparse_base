@@ -11,8 +11,8 @@ model:
   num_groups: 4
   trajectory_sampling:
     num_poses: 8
-  plan_anchor_path: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/resnet34.a1_in1k/kmeans_navsim_traj_20.npy
-  bkb_path: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/resnet34.a1_in1k/pytorch_model.bin
+  plan_anchor_path: DiffusionDriveV2/ckpt/resnet34.a1_in1k/kmeans_navsim_traj_20.npy
+  bkb_path: DiffusionDriveV2/ckpt/resnet34.a1_in1k/pytorch_model.bin
   bev_features_channels: 256
   num_bev_classes: 20
   lidar_resolution_height: 256
@@ -204,7 +204,7 @@ train:
 
 agent:
   use_ddv2: true
-  ckpt: /root/clone/ReconDreamer-RL/DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt
+  ckpt: DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt
 
 eval:
   save_video: true

@@ -1,0 +1,5 @@
+Trainer
+  ↓
+Algorithm (PPO / REINFORCE / ...)
+  ↓
+algorithm_core (ddv2_ppo_update / reinforce_core / ...)

@@ -1,3 +1,8 @@
+"""Vectorized environment wrappers.
+
+Canonical implementation migrated from the legacy simulator wrappers.
+"""
+
 from __future__ import annotations
 
 import multiprocessing as mp

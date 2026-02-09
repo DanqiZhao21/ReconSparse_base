@@ -255,3 +255,11 @@ def ddv2_ppo_update(
         ratio_mean=float(last_ratio_mean),
         adv_mean=float(last_adv_mean),
     )
+
+
+__all__ = [
+    "DDV2PPOUpdateResult",
+    "compute_gae",
+    "normalize_advantages",
+    "ddv2_ppo_update",
+]
