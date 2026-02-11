@@ -806,6 +806,14 @@ class TrajectoryHead(nn.Module):
             *linear_relu_ln(d_model, 1, 1,512),
             nn.Linear(d_model, d_model),
         )
+        # Some upstream DDV2-RL checkpoints include this module under
+        # _trajectory_head.plan_anchor_scorer_encoder.*. Define it here so those
+        # weights are not dropped as "unexpected" during load, and so PPO/
+        # Reinforce++ fine-tuned checkpoints retain the same parameter key count.
+        self.plan_anchor_scorer_encoder = nn.Sequential(
+            *linear_relu_ln(d_model, 1, 1,2*512),
+            nn.Linear(d_model, 512),
+        )
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(d_model),
             nn.Linear(d_model, d_model * 4),

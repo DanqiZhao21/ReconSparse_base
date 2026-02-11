@@ -90,6 +90,7 @@ class Diffusiondrivev2_Sel_Agent(AbstractAgent):
             
             # Remove 'agent.' prefix from keys if present
             state_dict = {k.replace('agent.', ''): v for k, v in state_dict.items()}
+            state_dict = {k.replace('_transfuser_model.', ''): v for k, v in state_dict.items()}
 
             missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
             if missing_keys:
@@ -110,7 +111,7 @@ class Diffusiondrivev2_Sel_Agent(AbstractAgent):
             state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
                 "state_dict"
             ]
-        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()}, strict=False)
+        self.load_state_dict({k.replace("agent.", "").replace("_transfuser_model.", ""): v for k, v in state_dict.items()}, strict=False)
 
 
     def get_sensor_config(self) -> SensorConfig:

@@ -127,14 +127,15 @@ LOG_DIR=./logs GPUS="0 1 2 3" bash tools/trainclosedloop.sh
 典型用法：
 
 ```bash
-# 生成 1 个 scene 的完整 18s（36步）rollout：duration 必须是 0.5s 的整数倍（默认 step_frames=5, frame_dt=0.1）
-bash tools/smalltool/visualize/generate_video.sh --scene-list 413 --duration-s 18.0 --step-frames 5 --fps 10 --outdir outputs/visualize
+# 生成 1 个 scene 的完整 18s（36步）rollout：用 --realtime 保证“播放时长 = 仿真时长”（不加速）
+# - interp=none 时，会自动用 fps=2（1 step/帧，0.5s/step）
+bash tools/smalltool/visualize/generate_video.sh --scene-list 413 --duration-s 18.0 --step-frames 5 --realtime --outdir outputs/visualize
 
 # 指定多个 scene + 只跑 5 秒
 bash tools/smalltool/visualize/generate_video.sh --num-scenes 3 --duration-s 5.0 --seed 0 --outdir outputs/visualize
 
-# 插帧（让视频更顺滑，非改变仿真步长）
-bash tools/smalltool/visualize/generate_video.sh --scene-list 413 --duration-s 18.0 --interp-method blend --interp-frames-per-step 5
+# 插帧（更顺滑，但不改变仿真步长）。配合 --realtime 会自动变成 10fps（5 帧/step，0.1s/帧）
+bash tools/smalltool/visualize/generate_video.sh --scene-list 413 --duration-s 18.0 --step-frames 5 --interp-method blend --interp-frames-per-step 5 --realtime
 ```
 
 ## 常见问题（Actor-Learner 框架）

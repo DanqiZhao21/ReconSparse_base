@@ -48,18 +48,19 @@ env:
 train:
   # Algorithm switch: ppo | reinforcepp
   algo: ppo
-  # Actor-Learner reads only a subset of keys under train.*
-  # Total learner update count (i.e., weights_version bump次数). Used as fallback if actor_learner.max_updates is not set.
+  # Total learner update count (i.e., weights_version bump 次数).
+  # Used as fallback if actor_learner.max_updates is not set.
   updates: 50
+
+  # DDV2 sampling / optimization
   ddv2_eta: 1.0
   ddv2_mode_idx: -1
   ddv2_mode_select: greedy
   ddv2_max_grad_norm: 0.5
-  seed: 42
+  ddv2_lr: 3.0e-4
   actor_learner:
     mode: async
     buffer_dir: outputs/actor_learner
-    # num_actors: 2
     num_actors: 2
     # NOTE(actor_horizon): after introducing commit_steps, actor_horizon counts *macro decisions*.
     # Effective env steps per shard ≈ actor_horizon * commit_steps (within an episode, capped by env.max_steps).
@@ -80,8 +81,6 @@ train:
     # Stop condition: run this many learner updates (weights_version bumps) then exit and signal actors.
     # Set <=0 to disable (infinite). 最多更新的次数
     max_updates: 50
-    wandb_actors: true
-    wandb_log_every_steps: 1
 
   vf_coef: 0.5
   lr_value: 1.0e-4
@@ -94,39 +93,6 @@ train:
   ddp:
     grad_accum_steps: 1
     seed: 42
-
-  replay:
-    compute_dtype:
-      camera_feature: fp32
-      diffusion_chain: fp32
-
-  wandb:
-    enabled: true
-    project: ReconDreamerRL
-    run_name: ddv2_actor_learner
-    # group: ddv2_actor_learner
-
-  save:
-    upload_to_wandb: false
-
-  ddv2_lr: 3.0e-4
-  ddv2_baseline_beta: 0.98
-
-  #NOTE Reinforce++ (critic-free) settings (only used when train.algo: reinforcepp)
-  reinforcepp:
-    # Global Advantage Normalization epsilon
-    norm_eps: 1.0e-8
-    # KL regularization to a fixed reference policy (0 disables and avoids loading ref policy)
-    kl_coef: 0.0
-    # Optional explicit reference checkpoint; default is agent.ckpt
-    # ref_ckpt: /path/to/reference.ckpt
-    # Extra epochs over the same data are usually not recommended for REINFORCE-style updates.
-    epochs: 1
-    #对同一 batch 数据做多少轮更新——REINFORCE 是 高方差策略梯度，重复使用同一数据容易导致方差爆炸;
-    # Baseline variant inspired by Reinforce++w/ Baseline:
-    # - none: no group baseline
-    # - scene: subtract per-scene mean return before global std normalization
-    group_baseline: none #分组基线（baseline）——减少训练方差，提高稳定性
 
 agent:
   ckpt: DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt

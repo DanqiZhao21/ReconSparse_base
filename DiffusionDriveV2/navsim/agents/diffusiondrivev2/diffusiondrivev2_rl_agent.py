@@ -76,6 +76,8 @@ class Diffusiondrivev2_Rl_Agent(AbstractAgent):
             
             # Remove 'agent.' prefix from keys if present
             state_dict = {k.replace('agent.', ''): v for k, v in state_dict.items()}
+            # Some ckpts also include an extra '_transfuser_model.' namespace.
+            state_dict = {k.replace('_transfuser_model.', ''): v for k, v in state_dict.items()}
             # Load state dict and get info about missing and unexpected keys
             missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
             if missing_keys:
@@ -100,7 +102,7 @@ class Diffusiondrivev2_Rl_Agent(AbstractAgent):
             ]
         # Evaluation should be tolerant to extra keys (model definition drifts across commits).
         # Otherwise Ray workers crash with "Unexpected key(s)".
-        self.load_state_dict({k.replace("agent.", ""): v for k, v in state_dict.items()}, strict=False)
+        self.load_state_dict({k.replace("agent.", "").replace("_transfuser_model.", ""): v for k, v in state_dict.items()}, strict=False)
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         """Override default compute_trajectory.

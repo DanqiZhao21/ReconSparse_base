@@ -81,7 +81,12 @@ class DiffusionDriveV2Policy(Agent):
     # -------------------- Agent interface -------------------- #
     def initialize(self) -> None:
         return
-
+#NOTE
+########################################### 
+# 对外动作接口
+########################################### 
+# 实际调用 sample_ddv2rl_with_replay(...)  sample_ddv2rl_with_replay_batch(...)
+# 返回值不是只给动作，还给：logp（或 logp 列表）replay dict（PPO 训练需要）
     def act(
         self,
         observation: Dict[str, Any],
@@ -119,7 +124,11 @@ class DiffusionDriveV2Policy(Agent):
         if self._agent is None or not hasattr(self._agent, "parameters"):
             return []
         return self._agent.parameters()
-
+#NOTE 
+########################################### 
+# 多卡训练用 DDP 包装 Distributed Data Parallel
+########################################### 
+# 作用：把 self._agent._transfuser_model 用 torch.nn.parallel.DistributedDataParallel 包起来。
     def wrap_ddp(
         self,
         *,
@@ -193,7 +202,10 @@ class DiffusionDriveV2Policy(Agent):
             pass
 
         return self
-
+#NOTE
+########################################### 
+#统一保存/加载格式
+########################################### 
     # -------------------- Checkpoint IO (actor-learner) -------------------- #
     def state_dict(self) -> Dict[str, torch.Tensor]:
         """Return the underlying transfuser model state_dict."""
@@ -232,6 +244,10 @@ class DiffusionDriveV2Policy(Agent):
             kk = str(k)
             if kk.startswith("agent."):
                 kk = kk[len("agent.") :]
+            # Some checkpoints save the *agent* state_dict and include an extra
+            # "_transfuser_model." namespace.
+            if kk.startswith("_transfuser_model."):
+                kk = kk[len("_transfuser_model.") :]
             if torch.is_tensor(v):
                 sd2[kk] = v
 
@@ -252,6 +268,11 @@ class DiffusionDriveV2Policy(Agent):
             except Exception:
                 pass
         return torch.device("cpu")
+
+#NOTE 采样功能函数
+########################################### 
+# REINFORCE 用的单步采样（带梯度）
+########################################### 
 
     # -------------------- DDV2-RL policy-gradient (REINFORCE) -------------------- #
     def step_ddv2rl(self, observation: Dict[str, np.ndarray], *, eta: float = 1.0):
@@ -321,6 +342,9 @@ class DiffusionDriveV2Policy(Agent):
         action = (float(x), float(y), float(yaw), 2)
         return action, lp
 
+########################################### 
+# PPO 采样（无梯度 + 保存 replay
+########################################### 
     def sample_ddv2rl_with_replay(
         self,
         observation: Dict[str, np.ndarray],
@@ -403,12 +427,15 @@ class DiffusionDriveV2Policy(Agent):
 
         action = (float(x), float(y), float(yaw), 2)
         replay = {
-            "camera_feature": camera_feature.detach().cpu(),
-            "diffusion_chain": diffusion_chain.detach().cpu(),
+            # IMPORTANT: clone() to avoid retaining a larger underlying storage
+            # (e.g. from batched inference views). Otherwise torch.save may
+            # serialize the full storage and bloat shard files massively.
+            "camera_feature": camera_feature.detach().cpu().clone(),
+            "diffusion_chain": diffusion_chain.detach().cpu().clone(),
             "mode_idx": mi,
             # Selected trajectory points (for commit/closed-loop execution on actor side).
             # Shape: (H, 3) where H is DDV2 trajectory horizon (typically 8).
-            "traj_xyyaw": traj0[mi].detach().cpu(),
+            "traj_xyyaw": traj0[mi].detach().cpu().clone(),
         }
         return action, lp, replay
 
@@ -505,11 +532,14 @@ class DiffusionDriveV2Policy(Agent):
             logps.append(lp)
             replays.append(
                 {
-                    "camera_feature": camera_feature[b : b + 1].detach().cpu(),
-                    "diffusion_chain": diffusion_chain[b : b + 1].detach().cpu(),
+                    # IMPORTANT: slices like x[b:b+1] are views that can retain
+                    # the full batch storage. clone() makes each item own its
+                    # minimal storage to keep shard files small.
+                    "camera_feature": camera_feature[b : b + 1].detach().cpu().clone(),
+                    "diffusion_chain": diffusion_chain[b : b + 1].detach().cpu().clone(),
                     "mode_idx": mi,
                     # Shape: (H, 3)
-                    "traj_xyyaw": traj[b, mi].detach().cpu(),
+                    "traj_xyyaw": traj[b, mi].detach().cpu().clone(),
                 }
             )
 

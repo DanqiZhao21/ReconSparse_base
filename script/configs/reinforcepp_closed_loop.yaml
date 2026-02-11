@@ -52,11 +52,13 @@ train:
   algo: reinforcepp
 
   updates: 50
+
+  # DDV2 sampling / optimization
   ddv2_eta: 1.0
   ddv2_mode_idx: -1
   ddv2_mode_select: greedy
   ddv2_max_grad_norm: 0.5
-  seed: 42
+  ddv2_lr: 3.0e-4
 
   actor_learner:
     # Use sync to avoid long waits and ensure steady updates.
@@ -78,19 +80,10 @@ train:
     max_inflight_per_actor: 2048
     poll_interval_s: 0.2
     max_updates: 50
-    wandb_actors: true
-    wandb_log_every_steps: 1
 
   # Shared
   minibatch_size: 64
   gamma: 0.99
-
-  # PPO-only keys (ignored by reinforcepp)
-  vf_coef: 0.5
-  lr_value: 1.0e-4
-  epochs: 2
-  clip_eps: 0.2
-  gae_lambda: 0.95
 
   ddp:
     grad_accum_steps: 1
@@ -98,30 +91,12 @@ train:
     # Reduce collective timeout to fail fast if coordination stalls.
     timeout_s: 900
 
-  replay:
-    compute_dtype:
-      camera_feature: fp32
-      diffusion_chain: fp32
-
-  wandb:
-    enabled: true
-    project: ReconDreamerRL
-    run_name: ddv2_actor_learner_reinforcepp
-
-  save:
-    upload_to_wandb: false
-
-  ddv2_lr: 3.0e-4
-  ddv2_baseline_beta: 0.98
-
   reinforcepp:
     norm_eps: 1.0e-8
     # KL regularization to a fixed reference policy (agent.ckpt by default)
     kl_coef: 0.0
     # ref_ckpt: /abs/path/to/reference.ckpt
     epochs: 1
-    # Optional baseline variant (adapted): subtract per-scene mean return before global normalization
-    group_baseline: none
 
 agent:
   ckpt: DiffusionDriveV2/ckpt/diffusiondrivev2_rl.ckpt
