@@ -44,4 +44,5 @@ nuscenes-devkit/
 outputs/
 wandb/
 outputs*
+outputs
 __pycache__
