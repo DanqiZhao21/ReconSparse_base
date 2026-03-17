@@ -32,8 +32,9 @@ env
 torch  2.1.0+cu118
 Python 3.10.19
 mmcv-full mmcv_full-1.7.0+torch2.1.0cu118-cp310-cp310-win_amd64.whl
-pip install mmcv_full=='1.7.0+torch2.1
-.0cu118' -f https://modelscope.oss-cn-beijing.aliyuncs.com/releases/repo.html
+pip install mmcv_full=='1.7.0+torch2.1.0cu118' -f https://modelscope.oss-cn-beijing.aliyuncs.com/releases/repo.html
+或者从这里下载
+file:///tmp/MicrosoftEdgeDownloads/cae3d1aa-d1f9-4413-bdff-5b54ee511db4/repo.html
 
 难点
 flash_attn 需要手动下载对应版本 后 安装，目前下载在ckpt下，

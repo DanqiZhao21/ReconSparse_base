@@ -215,12 +215,18 @@ class ReconSimulator(gym.Env):
         # NOTE: this simulator uses x-z as the horizontal plane (y is up).
         # Therefore, the planar SE(2) motion should be applied in (x,z) with
         # a yaw rotation about the +y axis.
+        # tpt = np.array([
+        #     [math.cos(future_yaw), 0.0, -math.sin(future_yaw), future_x],
+        #     [0.0,                 1.0,  0.0,                 0.0],
+        #     [math.sin(future_yaw), 0.0,  math.cos(future_yaw), future_y],
+        #     [0.0,                 0.0,  0.0,                 1.0]
+        # ], dtype=np.float64)
         tpt = np.array([
-            [math.cos(future_yaw), 0.0, -math.sin(future_yaw), future_x],
-            [0.0,                 1.0,  0.0,                 0.0],
-            [math.sin(future_yaw), 0.0,  math.cos(future_yaw), future_y],
-            [0.0,                 0.0,  0.0,                 1.0]
-        ], dtype=np.float64)
+                [math.cos(future_yaw), -math.sin(future_yaw), 0, future_x],
+                [math.sin(future_yaw), math.cos(future_yaw), 0, future_y],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ])
         action_next_ego = self.start_ego @ tpt
         # 记录用于 info 的位置（x,y,z）与航向/误差
         self.last_exp_pos = expert_next_ego[:3, 3].copy()
@@ -268,7 +274,7 @@ class ReconSimulator(gym.Env):
             # )
         else:
             # 非 debug 模式：遵循原始逻辑（flag=1 走专家；否则走 action）
-            if flag:
+            if flag==1:
                 self.start_ego = expert_next_ego
             else:
                 self.start_ego = action_next_ego
