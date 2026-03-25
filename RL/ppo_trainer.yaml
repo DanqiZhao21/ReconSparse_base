@@ -1,0 +1,22 @@
+_target_: rift.ego.fine_tuner.ppo.ppo_trainer.LightningTrainer
+
+params:
+  use_kl_term: false
+  pretrained_ema_decay: 0.99
+  temperature: 1.0
+  frame_rate: 10
+  epochs: 4
+  warmup_epochs: 0
+  lr: 1e-4
+  min_lr: 5e-6
+  weight_decay: 1e-5
+  ppo:
+    policy_weight: 1.0
+    value_weight: 0.5
+    distill_weight: 0.5
+    kl_loss_weight: 0.1
+    clip_eps: 0.2
+    value_clip_eps: 2.0
+    critic_lr_multiplier: 2.0
+
+trainable_layers: []

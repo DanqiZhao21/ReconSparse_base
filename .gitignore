@@ -1,0 +1,54 @@
+# ----------------------
+# 临时文件 / 缓存
+# ----------------------
+*.log
+*.tmp
+*.out
+*.cache
+*.npz
+
+# ----------------------
+# PyTorch / Lightning 输出
+# ----------------------
+/lightning_logs/
+/checkpoints/
+/*.ckpt
+
+# ----------------------
+# 数据集 / 大文件
+# ----------------------
+/OpenDataset/
+/*.pkl
+*.xz
+
+# ----------------------
+# 你指定不上传的目录
+# ----------------------
+/visual/
+/assets/   # 软链接也会被忽略
+/DiffusionDriveV2/gtrs_traj/
+gtrs_traj/
+# ----------------------
+# Python / IDE 相关
+# ----------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.idea/
+*.vscode/
+*.run
+nuscenes-devkit/
+
+outputs/
+wandb/
+
+/root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0311.py
+/root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0307.py
+
+flash-attention/
+
+egoADs/
+
