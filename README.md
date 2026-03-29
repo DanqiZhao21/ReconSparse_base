@@ -1,154 +1,133 @@
-# ReconDreamer-RL / ReconDiff（闭环强化学习）
+# framework
 
-本仓库用于训练与评测“ReconDiff”闭环策略：将 DiffusionDriveV2（轨迹扩散策略）与 ReconDreamer 3D Gaussian Splatting（3DGS）仿真环境结合，通过 Actor-Learner 框架进行 PPO / Reinforce++ 强化学习。
+这个目录是 ReconDreamer-RL 当前使用的强化学习训练主框架，核心目标是把自动驾驶策略模型接入 actor-learner 训练流程，并支持 PPO、ReinforcePP 等算法在闭环仿真环境中持续采样和更新。
 
-## 近期改动
+## 整体职责
 
-- **统一到 framework/**：训练/评测/可视化脚本统一从 `framework.*` 导入；历史 `rl/*` 命名空间已收敛。
-- **Actor-Learner v2 入口**：统一使用 [script/train_actor_learner_v2.py](script/train_actor_learner_v2.py)。
-- **rollout 语义修正（commit-to-plan）**：引入 `train.actor_learner.commit_steps=K`，每次从 DDV2 采样一次 plan，然后连续执行前 $K$ 个点，并聚合为 1 条 macro transition 写入 buffer；对应折扣使用 $\gamma_{eff}=\gamma^K$。
-- **时长对齐**：默认 `step_frames=5` 且 `frame_dt=0.1s`，因此 1 个 `env.step` 对应 $0.5s$；18s 一局最多 36 步（见 [script/configs/ppo_closed_loop.yaml](script/configs/ppo_closed_loop.yaml)）。
-- **buffer 磁盘卫生**：learner 消费过的 shard 会自动移动/清理，避免长期堆积占满磁盘。
-- **视频生成工具**：新增 [tools/smalltool/visualize/generate_video.py](tools/smalltool/visualize/generate_video.py) + [tools/smalltool/visualize/generate_video.sh](tools/smalltool/visualize/generate_video.sh)，可按“秒”控制 rollout 时长（必须是 0.5s 的整数倍，或更一般地是 `step_frames*frame_dt` 的整数倍）。
+- 把具体策略模型封装成统一 Agent 接口。
+- 把仿真环境包装成 RL 可采样的 reset 和 step 接口。
+- 在 Actor 侧采集轨迹，生成 shard。
+- 在 Learner 侧把 shard 组装成 batch，并执行策略更新。
+- 通过文件缓冲区完成 actor 和 learner 之间的异步协作。
+- 用 Lightning 管理训练循环、日志、checkpoint 和权重版本切换。
 
-## 代码结构
+## 主训练链路
 
-- **Env 封装**：`framework/env_wrapper/`（ReconSimulator + gymnasium 封装，vec-env 适配等）
-- **Agent/Policy**：`framework/agent/`（DDV2 RL 适配器/采样 + logp 接口）
-- **算法**：
-  - PPO：`framework/algorithms/ppo.py` + `framework/algorithms/ppo_ddv2_core.py`
-  - Reinforce++：`framework/algorithms/reinforcepp.py` + `framework/algorithms/reinforcepp_core.py`
-- **Buffer IO**：`framework/io/buffer.py`（shard/weights/version 管理、消费与清理）
+当前主入口是 script/train_actor_learner_v2.py。整体运行流程可以概括为：
 
-## 环境配置
+1. runner/factories.py 根据 YAML 配置构建环境、Agent、算法和值函数组件。
+2. runner/actor_learner.py 启动 orchestrator、actor、learner 三类角色。
+3. Actor 通过 env_wrapper 和 rollout 不断与环境交互，调用 agent 产出动作、logp 和 replay。
+4. rollout/collector.py 把观测、奖励、done、replay 等信息打包成 shard。
+5. io/buffer.py 把 shard 写入共享缓冲区，并维护权重版本和消费状态。
+6. Learner 通过 lightning/actor_learner_datamodule.py 读取 shard，交给 batch 和 algorithms 生成训练 batch。
+7. algorithms 和 lightning 共同完成 PPO 或 ReinforcePP 更新。
+8. 更新后的权重重新写回 buffer，Actor 检测到新版本后继续采样。
 
-推荐直接使用 [environment.yml](environment.yml)（CUDA 11.8 + Python 3.10）：
+简化后的数据流如下：
 
-```bash
-conda env create -f environment.yml
-conda activate recondreamerNew-rl
-```
+Actor -> env_wrapper -> agent -> rollout -> io/buffer -> batch -> algorithms -> lightning -> 新权重 -> Actor
 
-## 数据与模型准备（Denso/OpenDataset 场景）
+## 目录分工
 
-如果使用Denso 服务器环境，数据/模型通常已经在 `OpenDataset` 盘中准备好；需要确认环境变量 + 软连接。
+### agent/
 
-### 1) navsim 数据集
+策略适配层。
 
-参考官方安装说明：https://github.com/autonomousvision/navsim/blob/main/docs/install.md
+- 把 DiffusionDriveV2、SparseDrive、SparseDriveV2 这类具体模型封装成统一 Agent 接口。
+- 负责动作采样、replay 保存、logp 重算、checkpoint 保存和加载。
 
-确认以下环境变量（路径以你的服务器实际为准）：
+### algorithms/
 
-```bash
-export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
-export NUPLAN_MAPS_ROOT="/OpenDataset/navsim/dataset/maps"
-export NAVSIM_EXP_ROOT="/OpenDataset/navsim/exp"
-export NAVSIM_DEVKIT_ROOT="/OpenDataset/navsim/navsim"
-export OPENSCENE_DATA_ROOT="/OpenDataset/navsim/dataset"
-```
+算法层。
 
-### 2) DiffusionDriveV2 预训练资源（GTRS/ckpt）
+- 实现 PPO、ReinforcePP 及其底层目标函数。
+- 负责从 replay 重算 logp、计算 advantage 相关损失和训练指标。
 
-需要保证 [DiffusionDriveV2/gtrs_traj](DiffusionDriveV2/gtrs_traj) 与 [DiffusionDriveV2/ckpt](DiffusionDriveV2/ckpt) 指向共享盘或已下载的真实目录，例如：
+### batch/
 
-```bash
-ls -l DiffusionDriveV2/gtrs_traj
-ls -l DiffusionDriveV2/ckpt
-```
+batch 构建入口层。
 
-### 3) ReconSimulator 资产（3DGS anchors 等）
+- 向 Learner 提供稳定的 build_training_batch 接口。
+- 实际把 shard 变成训练 batch 的逻辑主要下沉在 algorithms/trajectory_batch.py。
 
-根目录 [assets](assets) 通常应为指向共享盘的软连接：
+### env_wrapper/
 
-```bash
-ls -l assets
-```
+环境包装层。
 
-## 快速评测（DiffusionDriveV2 / navsim）
+- 把 ReconSimulator 包装成 RL 环境接口。
+- 处理 scene 采样、起始帧选择、碰撞标记、终止逻辑和 3DGS 相关工具。
 
-### 生成 cache
+### io/
 
-```bash
-bash tools/cache_fast.sh
-# 或完整版本
-bash tools/cache.sh
-```
+actor-learner 通信层。
 
-### 运行评测
+- 定义 buffer 目录结构、版本文件、停止标记和 shard 生命周期。
+- 支撑 actor 和 learner 之间的异步协作。
 
-```bash
-bash tools/evaluate_fast.sh
-bash tools/evaluate.sh
-```
+### lightning/
 
-如果要评测 RL checkpoint（PDM score），可参考 [tools/evaluate_rl.sh](tools/evaluate_rl.sh)。
+训练调度层。
 
-## 闭环 RL 训练（推荐：Actor-Learner）
+- 把算法更新接入 PyTorch Lightning。
+- 管理 datamodule、training_step、训练锁、WandB 日志和更新后权重回写。
 
-入口脚本：
+### rewards/
 
-- Launcher：[tools/train_actor_learner.sh](tools/train_actor_learner.sh)
-- Python：[script/train_actor_learner_v2.py](script/train_actor_learner_v2.py)
+奖励计算层。
 
-示例：
+- 定义轨迹跟踪、碰撞、jerk、terminal penalty 等 reward 逻辑。
 
-```bash
-# PPO（默认配置为 ppo_closed_loop.yaml）
-LOG_DIR=./logs ALGO=ppo bash tools/train_actor_learner.sh
+### rollout/
 
-# Reinforce++（默认配置为 reinforcepp_closed_loop.yaml）
-LOG_DIR=./logs ALGO=reinforcepp bash tools/train_actor_learner.sh
+采样层。
 
-# 显式指定配置（推荐做法）
-LOG_DIR=./logs CONFIG=script/configs/ppo_closed_loop.yaml bash tools/train_actor_learner.sh
-```
+- 负责 Actor 侧与环境交互并把结果打包成 shard。
 
-重要配置项（建议先读一遍）：
+### runner/
 
-- 环境时长：`env.max_steps=36`，`env.step_frames=5`（对应 18s/局，0.5s/step）
-- 宏动作：`train.actor_learner.commit_steps=K`（一次采样 plan 后连续执行 K 步，再写 1 条宏 transition）
-- `actor_horizon` 语义：引入 `commit_steps` 后，`actor_horizon` 是“宏决策次数”，而不是原始 env.step 数。
+总调度层。
 
-<!-- ## 闭环训练（单进程/多 GPU，偏调试用途）
+- 负责真正拉起训练进程，是整个 framework 的运行中枢。
 
-如果你想用“每 GPU 一个进程”的方式跑闭环训练（更像旧版脚本行为），可用 [tools/trainclosedloop.sh](tools/trainclosedloop.sh)：
+### utils/
 
-```bash
-LOG_DIR=./logs GPUS="0 1 2 3" bash tools/trainclosedloop.sh
-``` -->
+支撑工具层。
 
-## 生成 rollout 视频
+- 提供观测预处理、路径解析、gsplat 后端选择与预热、环境缓存构建等公共能力。
 
-新增工具：
+## 推荐阅读顺序
 
-- 脚本：[tools/smalltool/visualize/generate_video.py](tools/smalltool/visualize/generate_video.py)
-- Wrapper：[tools/smalltool/visualize/generate_video.sh](tools/smalltool/visualize/generate_video.sh)
+如果是第一次阅读这个框架，建议按下面顺序看：
 
-典型用法：
+1. script/train_actor_learner_v2.py
+2. runner/actor_learner.py
+3. runner/factories.py
+4. rollout/collector.py
+5. lightning/actor_learner_datamodule.py
+6. algorithms/trajectory_batch.py
+7. algorithms/ppo.py 或 algorithms/reinforcepp.py
+8. agent/ 对应的具体策略实现
 
-```bash
-# 生成 1 个 scene 的完整 18s（36步）rollout：用 --realtime 保证“播放时长 = 仿真时长”（不加速）
-# - interp=none 时，会自动用 fps=2（1 step/帧，0.5s/step）
-bash tools/smalltool/visualize/generate_video.sh --scene-list 413 --duration-s 18.0 --step-frames 5 --realtime --outdir outputs/visualize
+这样可以先抓住主链路，再回头看各个子模块的细节。
 
-# 指定多个 scene + 只跑 5 秒
-bash tools/smalltool/visualize/generate_video.sh --num-scenes 3 --duration-s 5.0 --seed 0 --outdir outputs/visualize
+## 子目录 README
 
-# 插帧（更顺滑，但不改变仿真步长）。配合 --realtime 会自动变成 10fps（5 帧/step，0.1s/帧）
-bash tools/smalltool/visualize/generate_video.sh --scene-list 413 --duration-s 18.0 --step-frames 5 --interp-method blend --interp-frames-per-step 5 --realtime
-```
+各一级子目录都已经补充了更细的说明，适合按模块深入阅读：
 
-## 常见问题（Actor-Learner 框架）
+- agent/README.md
+- algorithms/README.md
+- batch/README.md
+- env_wrapper/README.md
+- io/README.md
+- lightning/README.md
+- rewards/README.md
+- rollout/README.md
+- runner/README.md
+- utils/README.md
 
-- **权重版本**：learner 更新后由 rank0 保存 `latest.ckpt` 并将 `version.txt` 加 1；actor 在写 shard 前会尝试加载最新版本。
-- **shard 消费机制**：learner 选定本次更新使用的 shard 文件名，通过 DDP 广播；更新完成后 rank0 会把已消费 shard 移动到 `consumed/` 并按策略清理。
-- **DDP 超时（NCCL/Gloo）**：常见原因是 actor/learner 在 `broadcast/barrier` 前后状态不一致或 shard 堆积。建议降低 `shards_per_update`、适当调小 `num_envs_per_actor`、或将 `actor_learner.mode` 设为 `sync`。
-- **ninja / cpp_extension 报错**：通常是运行时触发 JIT 编译（如 nvdiffrast）但找不到 CUDA headers/libs。优先使用各类 `.sh` wrapper（训练/评测/视频）启动，它们会补齐 `CUDA_HOME/CPATH/LD_LIBRARY_PATH` 并设置 torch extension cache 目录。
+## 维护约定
 
-## 参考
-
-- 环境文件：[environment.yml](environment.yml)
-- DiffusionDriveV2 官方仓库：https://github.com/hustvl/DiffusionDriveV2
-- navsim 安装说明：https://github.com/autonomousvision/navsim/blob/main/docs/install.md
-- Anchor/资产说明（示例数据集）：https://huggingface.co/datasets/Ni1111/ReconDreamer-RL/tree/main/assets
-   
+- 新训练逻辑优先补到现有模块中，不要在 framework 下堆叠历史备份文件或兼容残留文件。
+- 如果某个辅助脚本不属于当前 actor-learner 主链路，优先放到 framework 之外，或者在对应 README 中写清楚它的保留原因。
+- 如果修改配置字段，最好同步检查 runner/factories.py 和 runner/actor_learner.py，确认这些字段在当前代码路径里真的会被读取。

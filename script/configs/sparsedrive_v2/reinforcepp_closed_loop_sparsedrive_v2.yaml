@@ -1,3 +1,8 @@
+# Reinforce++ closed-loop config for SparseDriveV2
+# Critic-free policy-gradient update reusing the same actor-learner pipeline as PPO.
+# This version mirrors the active SparseDriveV2 PPO setup where possible, while
+# keeping the learner update switched to train.algo=reinforcepp.
+
 env:
   max_steps: 36
   step_frames: 5
@@ -19,10 +24,10 @@ env:
     w_static: 5.0
     w_pos: 2.0
     w_heading: 1.0
+    dt: 0.5
     w_longitudinal_jerk: 0.05
     w_yaw_jerk: 0.05
     jerk_clip: 50.0
-    dt: 0.5
     logging:
       wandb:
         enable: true
@@ -46,46 +51,46 @@ train:
   wandb:
     enabled: true
     project: ReconDiff
-    group: ppo_closed_loop_sparsedrive_v2
+    group: reinforcepp_closed_loop_sparsedrive_v2
 
-  algo: ppo
+  algo: reinforcepp
+
   eta: 1.0
   mode_idx: -1
 
   policy_mode_select: sample
   policy_execute_mode: first_step
-  ddv2_max_grad_norm: 0.5
+  max_grad_norm: 0.5
   policy_lr: 3.0e-5
+  clip_eps: 0.2
 
   actor_learner:
     mode: async
     buffer_dir: outputs/actor_learner
     learner_gpu_id: 0
     actor_gpu_pool: [0, 1, 2, 3]
-    actors_per_gpu: 2   #FIXME:
+    actors_per_gpu: 4
     auto_max_inflight_per_actor: true
     pause_actor_on_learner_gpu: true
     scene_shard_by_actor: true
     scene_shard_strategy: round_robin
     actor_horizon: 32
     num_envs_per_actor: 1
-    # shards_per_update: 128  #128*32=4096 steps/update#FIXME:
     shards_per_update: 32
     poll_interval_s: 0.2
     max_updates: 50
 
-  vf_coef: 0.5
-  lr_value: 1.0e-4
-  epochs: 2
-  # minibatch_size: 64
   minibatch_size: 4
-  clip_eps: 0.2
   gamma: 0.99
-  gae_lambda: 0.95
 
   ddp:
     grad_accum_steps: 16
     seed: 42
+
+  reinforcepp:
+    norm_eps: 1.0e-8
+    kl_coef: 0.0
+    epochs: 1
 
 agent:
   type: sparsedrive_v2

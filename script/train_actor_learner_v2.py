@@ -75,4 +75,7 @@ if __name__ == "__main__":
     main()
     
     
-# python script/train_actor_learner_v2.py --role orchestrator --config script/configs/ppo_closed_loop_sparsedrive_v2.yaml
+# python script/train_actor_learner_v2.py --role orchestrator --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml
+
+
+# python script/train_actor_learner_v2.py --role orchestrator --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml

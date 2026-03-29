@@ -1,0 +1,51 @@
+# framework/lightning
+
+这个目录负责把 RL 更新流程接入 PyTorch Lightning。它位于训练链路的 Learner 中央控制层，作用是把“算法逻辑”和“训练循环调度”分开。
+
+## 目录职责
+
+- 把 trajectory batch 封装成 DataModule。
+- 把 PPO 或 ReinforcePP 的损失计算封装成 LightningModule。
+- 在 actor-learner 模式下，把 shard 选择、训练结束后的 checkpoint 回写、WandB 日志等流程接进 Lightning 生命周期。
+
+## 文件说明
+
+### __init__.py
+
+导出 TrajectoryUpdateDataModule 和 TrajectoryLightningModule，供 algorithms/ppo.py 和 algorithms/reinforcepp.py 直接使用。
+
+### trajectory_datamodule.py
+
+通用训练数据模块。
+
+- 把已经准备好的 batch 切成 dataset 和 dataloader。
+- 负责 minibatch 粒度的数据读取、collate 和分布式 sampler 配置。
+- 是算法层和 Lightning Trainer 之间的标准数据桥梁。
+
+### trajectory_module.py
+
+通用训练模块。
+
+- 在 training_step 中根据 algo_kind 分流到 PPO 或 Reinforce 目标函数。
+- 调用 algorithms/trajectory_policy_core.py 计算 loss 和 metrics。
+- 这是 Learner 真正执行反向传播时最直接的训练步入口。
+
+### actor_learner_datamodule.py
+
+专门给 actor-learner 训练使用的数据模块。
+
+- 不只是读 batch，还负责在训练开始前等待 shard 到齐。
+- 会按版本过滤旧 shard、丢弃 replay 格式不兼容的 shard，并调用 batch/build_training_batch 生成训练数据。
+- 它连接了 IO 层和 Lightning 层，是 Learner 每次 update 前的第一站。
+
+### actor_learner_module.py
+
+专门给 actor-learner 训练使用的训练模块。
+
+- 继承 TrajectoryLightningModule，在 epoch 开始和结束时额外处理训练锁、消费 shard、保存权重、递增 version。
+- 还负责把一次 update 的统计信息发到 stage 日志和 WandB。
+- 可以看作“Learner 更新生命周期控制器”。
+
+## 训练时如何经过这里
+
+Learner 从 runner/actor_learner.py 进入后，会先构建 actor_learner_datamodule.py 和 actor_learner_module.py。真正进入每个 minibatch 的 loss 计算时，又会下沉到 trajectory_module.py 和 trajectory_datamodule.py。这个目录因此同时管理“整轮 update 的生命周期”和“单个 minibatch 的训练步”。

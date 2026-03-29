@@ -322,7 +322,6 @@ PPO // Reinforce++;
 optimizer;
 value_net(PPO);
 '''
-#TODO:似乎还有一些残留的ddv2的专用信息；
 
 def build_algorithm_bundle(
     cfg: Dict[str, Any],
@@ -342,13 +341,13 @@ def build_algorithm_bundle(
         algo_key = "reinforce"
 
     minibatch_size = int(train_cfg.get("minibatch_size", 16))
-    max_grad_norm = float(train_cfg.get("ddv2_max_grad_norm", 0.5))
+    max_grad_norm = float(train_cfg.get("max_grad_norm", 0.5))
     clip_eps = float(train_cfg.get("clip_eps", 0.2))
     ppo_epochs = int(train_cfg.get("epochs", 2))
     vf_coef = float(train_cfg.get("vf_coef", 0.5))
     value_clip_eps = float((train_cfg.get("ppo", {}) or {}).get("value_clip_eps", 0.0))
-    eta = float(train_cfg.get("eta", train_cfg.get("ddv2_eta", 1.0)))
-    replay_mode_idx = int(train_cfg.get("mode_idx", train_cfg.get("ddv2_mode_idx", -1)))
+    eta = float(train_cfg.get("eta", 1.0))
+    replay_mode_idx = int(train_cfg.get("mode_idx", -1))
     ddp_seed = int(((train_cfg.get("ddp", {}) or {}).get("seed", 0)))
     grad_accum_steps = int(((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))
     rpp_cfg = (train_cfg.get("reinforcepp", {}) or {})
@@ -358,12 +357,34 @@ def build_algorithm_bundle(
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
     if algo_key in {"ppo", "ppo_kl", "ppo_dual_clip", "ppo_value_clip"}:
+        
         policy_params = _trainable_parameters(getattr(agent, "trainable_module", None) or agent)
         if len(policy_params) == 0:
             raise RuntimeError("No trainable policy parameters found for PPO")
+        # 1)value net
+        value_net = ValueNet().to(device)
+        if ddp_enabled and torch.cuda.is_available():
+            value_net = DDP(
+                value_net,
+                device_ids=[int(device.index)] if device.index is not None else None,
+                output_device=int(device.index) if device.index is not None else None,
+                process_group=process_group,
+                find_unused_parameters=False,
+            )
+        # 2)optimizer 
+        value_params = _trainable_parameters(value_net)
+        value_lr = float(train_cfg.get("lr_value", 1e-4))
+        optimizer = torch.optim.Adam(
+            [
+                {"params": policy_params, "lr": float(policy_lr), "weight_decay": float(weight_decay)},
+                {"params": value_params, "lr": float(value_lr), "weight_decay": 0.0},
+            ]
+        )
+        value_optim = optimizer
+        
         algo = PPO(
-            optimizer=None,
-            value_net=None,
+            optimizer=optimizer,
+            value_net=value_net,
             clip_eps=clip_eps,
             vf_coef=vf_coef,
             ppo_epochs=ppo_epochs,
@@ -381,27 +402,11 @@ def build_algorithm_bundle(
             dual_clip=(float(ppo_cfg.get("dual_clip", 3.0)) if algo_key == "ppo_dual_clip" else None),
             value_clip_eps=(float(value_clip_eps) if algo_key in {"ppo", "ppo_value_clip"} else 0.0),
         )
-        value_net = ValueNet().to(device)
-        if ddp_enabled and torch.cuda.is_available():
-            value_net = DDP(
-                value_net,
-                device_ids=[int(device.index)] if device.index is not None else None,
-                output_device=int(device.index) if device.index is not None else None,
-                process_group=process_group,
-                find_unused_parameters=False,
-            )
-        value_params = _trainable_parameters(value_net)
-        value_lr = float(train_cfg.get("lr_value", 1e-4))
-        optimizer = torch.optim.Adam(
-            [
-                {"params": policy_params, "lr": float(policy_lr), "weight_decay": float(weight_decay)},
-                {"params": value_params, "lr": float(value_lr), "weight_decay": 0.0},
-            ]
-        )
-        algo.optimizer = optimizer
-        algo.value_net = value_net
-        value_optim = optimizer
-    else:
+        
+        
+    
+    elif algo_key in {"reinforce++", "reinforce", "reinforcepp", "reinforce_vanilla"}:
+    # else: algo_key in {"reinforcepp", "reinforce", "reinforce_vanilla", "vanilla_reinforce"}
         policy_params = _trainable_parameters(getattr(agent, "trainable_module", None) or agent)
         if len(policy_params) == 0:
             raise RuntimeError("No trainable policy parameters found for Reinforce")

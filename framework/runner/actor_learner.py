@@ -436,7 +436,7 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
 
     paths = BufferPaths(root=str(al_cfg.get("buffer_dir", "outputs/actor_learner")))
     ensure_buffer_layout(paths)
-    mode = str(al_cfg.get("mode", "sync")).strip().lower()
+    mode = str(al_cfg.get("mode", "async")).strip().lower()
     num_actors = int(al_cfg.get("num_actors", 2))
     learner_gpu_id = int(al_cfg.get("learner_gpu_id", 0))
     shards_per_update = int(al_cfg.get("shards_per_update", num_actors))
@@ -449,10 +449,13 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
             stage(f"[learner] config deadlock risk: clamping shards_per_update {shards_per_update} -> {total_capacity}")
             shards_per_update = int(total_capacity)
 
-    raw_max_updates = al_cfg.get("max_updates", train_cfg.get("updates", 0))
+    raw_max_updates = al_cfg.get("max_updates", train_cfg.get("updates", 50))
     max_updates = int(raw_max_updates or 0)
-    gamma = float(train_cfg.get("gamma", 0.99))
-    gae_lambda = float(train_cfg.get("gae_lambda", 0.95))
+    gamma = float(train_cfg.get("gamma", 0.99))#折扣因子
+    gae_lambda = float(train_cfg.get("gae_lambda", 0.95))#GAE 参数
+    '''
+    一次 update”映射成了 Lightning 里的“一次 epoch",做一次 policy update”;
+    '''
     if torch.cuda.is_available():
         learner_device_id = int(local_rank) if ddp_enabled else int(learner_gpu_id)
         torch.cuda.set_device(int(learner_device_id))
@@ -464,7 +467,8 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
     agent = build_agent(cfg, device=device)
     if ddp_enabled and torch.cuda.is_available():
         agent.wrap_ddp(device_id=local_rank, process_group=dist.group.WORLD)
-    #构建 算法包
+        
+    #构建算法包
     algo, value_net, value_optim, algo_meta = build_algorithm_bundle(
         cfg,
         agent=agent,
