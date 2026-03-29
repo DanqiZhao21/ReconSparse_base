@@ -44,6 +44,7 @@ nuscenes-devkit/
 
 outputs/
 wandb/
+.worktrees/
 
 /root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0311.py
 /root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0307.py
@@ -51,4 +52,3 @@ wandb/
 flash-attention/
 
 egoADs/
-
