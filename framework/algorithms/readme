@@ -1,5 +1,0 @@
-Trainer
-  ↓
-Algorithm (PPO / REINFORCE / ...)
-  ↓
-algorithm_core (ppo_update / reinforcepp_update / ...)

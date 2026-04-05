@@ -57,6 +57,7 @@ class LightningTrainer(L.LightningModule):
         self.clip_eps = params.ppo.clip_eps
         self.policy_weight = params.ppo.policy_weight
         self.value_weight = params.ppo.value_weight
+        
         self.distill_weight = params.ppo.distill_weight
         self.kl_loss_weight = params.ppo.kl_loss_weight
         self.value_clip_eps = params.ppo.value_clip_eps

@@ -3,6 +3,8 @@ import os
 import sys
 from typing import Any, Dict
 
+import torch
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -49,26 +51,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_runner_entrypoints() -> Dict[str, Any]:
+    from framework.runner.actor_runtime import actor_main
+    from framework.runner.config_normalization import normalize_actor_learner_cfg
+    from framework.runner.learner_runtime import learner_main
+    from framework.runner.orchestrator import orchestrator_main
+
+    return {
+        "actor_main": actor_main,
+        "learner_main": learner_main,
+        "normalize_actor_learner_cfg": normalize_actor_learner_cfg,
+        "orchestrator_main": orchestrator_main,
+    }
+
+
 def main() -> None:
+    torch.set_float32_matmul_precision("high")
     args = parse_args()
     cfg = load_yaml(args.config)
-    from framework.runner.actor_learner import actor_main, learner_main, orchestrator_main
-    from framework.runner.factories import normalize_actor_learner_cfg
-
-    normalize_actor_learner_cfg(cfg)
+    entrypoints = load_runner_entrypoints()
+    entrypoints["normalize_actor_learner_cfg"](cfg)
 
     if args.role == "orchestrator":
-        orchestrator_main(cfg, config_path=args.config)
+        entrypoints["orchestrator_main"](cfg, config_path=args.config)
         return
     if args.role == "actor":
-        actor_main(
+        entrypoints["actor_main"](
             cfg,
             actor_id=args.actor_id,
             gpu_id=args.gpu_id,
             total_actors=args.num_actors,
         )
         return
-    learner_main(cfg, learner_rank=args.learner_rank)
+    entrypoints["learner_main"](cfg, learner_rank=args.learner_rank)
 
 
 if __name__ == "__main__":

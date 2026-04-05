@@ -20,7 +20,7 @@
 仓库路径解析工具。
 
 - 统一定位 REPO_ROOT、egoADs 根目录以及具体 agent 子目录。
-- runner/factories.py 和 runner/launch_env.py 会直接依赖这里来解析 ckpt、config 和子仓库路径。
+- `runner/agent_factory.py` 和 `runner/launch_env.py` 会直接依赖这里来解析 ckpt、config 和子仓库路径。
 
 ### gsplat_backend.py
 

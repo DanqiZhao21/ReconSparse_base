@@ -118,6 +118,7 @@ def compute_ppo_objective(
         adv_mean=adv.mean(),
     )
 
+#adv是在 framework/batch/actor_learner.py (line 101) 的 build_training_batch(...) 里生成的。
 
 def compute_reinforce_objective(
     *,

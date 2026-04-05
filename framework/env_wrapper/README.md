@@ -15,7 +15,7 @@
 包导出层。
 
 - 对外导出 RLReconEnv、SceneSamplingEnv、SubprocVecEnv、SerialVecEnv 以及 3DGS 相关工具函数。
-- runner/factories.py 主要通过这里统一拿环境构造能力。
+- `runner/env_factory.py` 主要通过这里统一拿环境构造能力。
 
 ### rl_wrapper.py
 
@@ -32,7 +32,7 @@
 并行环境与场景采样控制器。
 
 - SceneSamplingEnv 负责在 reset 时自动选择 scene 和 start frame。
-- make_scene_sampling_env 是 runner/factories.py 构建采样环境时的主要入口。
+- make_scene_sampling_env 是 `runner/env_factory.py` 构建采样环境时的主要入口。
 - SubprocVecEnv 提供多进程并行环境执行能力。
 - 这个文件还承担“每个 worker 自己管理场景轮换”的职责，让主进程只关心 reset 和 step。
 
@@ -46,7 +46,7 @@
 
 ## 训练时如何经过这里
 
-runner/factories.py 会调用 make_scene_sampling_env 构建环境。随后：
+`runner/env_factory.py` 会调用 make_scene_sampling_env 构建环境。随后：
 
 - Actor 在 rollout/collector.py 中不断对这里的环境调用 step。
 - rl_wrapper.py 会在每一步把仿真结果转成 RL 能理解的 reward 和终止信号。

@@ -2,7 +2,7 @@
 
 这个目录负责把具体的自动驾驶策略模型封装成统一的 RL Agent 接口。它位于训练链路中“策略执行”和“重算 log-prob”这一层：
 
-- Actor 采样时，runner 会先通过 factories 构建这里的 Agent。
+- Actor 采样时，runner 会先通过 `agent_factory.py` 构建这里的 Agent。
 - rollout/collector 会调用 Agent 的 act 或 act_batch 产出动作、旧 logp 和 replay 数据。
 - Learner 更新时，algorithms 和 lightning 会再次调用 Agent 的 logp_from_replay 系列接口，在当前参数下重算策略概率。
 
@@ -11,6 +11,9 @@
 ### __init__.py
 
 包导出文件。把 Agent 抽象基类和三种具体策略实现统一暴露给外部模块使用，同时保留 DiffusionDriveV2Agent 这个兼容别名。
+
+- 现在通过 lazy export 避免在 `import framework.agent` 时立即加载所有重策略模块。
+- 这样基础测试、轻量脚本和工具代码只在真正访问具体 policy 时才触发对应依赖导入。
 
 ### base.py
 
@@ -28,6 +31,14 @@ DiffusionDriveV2 的 RL 适配器。
 - 在 act 阶段把模型输出的轨迹转换成环境可执行的动作，当前主要走 first-step 执行模式。
 - 维护 replay 信息，使 Learner 能在 PPO 或 Reinforce 更新时重新计算当前策略下的 logp。
 - 处理设备迁移、DDP 包装、checkpoint 保存与加载，是 DiffusionDriveV2 进入训练主链路的关键适配层。
+
+### policy_dummy.py
+
+测试用的最小 Agent 适配器。
+
+- 只服务 framework smoke tests，不参与真实训练配置。
+- 提供一个极小的可训练模块、checkpoint 读写和 replay-logp 重算能力。
+- 作用是让 learner-only smoke path 能验证入口、batch、Lightning 和 version publish，而不依赖真实大模型权重。
 
 ### policy_sparsedrive.py
 
@@ -49,7 +60,7 @@ SparseDriveV2 的 RL 适配器，是当前仓库较新的策略接入层。
 
 ## 训练时如何经过这里
 
-主入口 script/train_actor_learner_v2.py 启动后，runner/factories.py 会优先进入这个目录构建 Agent。随后：
+主入口 `script/train_actor_learner_v2.py` 启动后，`runner/agent_factory.py` 会优先进入这个目录构建 Agent。随后：
 
 - Actor 进程在 rollout 期间不断调用这里的策略实现来采样动作。
 - Learner 进程在训练时通过 replay 再次进入这里，计算新旧策略概率比值。

@@ -46,6 +46,32 @@ class Agent:
         return isinstance(replay, dict)
 
     @property
+    def value_feature_dim(self) -> int | None:
+        return None
+
+    def supports_value_features(self) -> bool:
+        return self.value_feature_dim is not None
+
+    def value_features_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def value_features_from_observation(self, observation: Dict[str, Any]) -> torch.Tensor:
+        raise NotImplementedError
+
+    def value_features_from_observation_batch(
+        self,
+        observations: Sequence[Dict[str, Any]],
+    ) -> torch.Tensor:
+        vals = [self.value_features_from_observation(obs) for obs in observations]
+        if len(vals) == 0:
+            feature_dim = int(self.value_feature_dim or 0)
+            return torch.empty((0, feature_dim), dtype=torch.float32)
+        return torch.cat([val.to(dtype=torch.float32).view(1, -1) for val in vals], dim=0)
+
+    @property
     def optimizer(self):
         opt = getattr(self, "_optimizer", None)
         if opt is None:

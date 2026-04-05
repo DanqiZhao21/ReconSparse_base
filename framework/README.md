@@ -13,20 +13,26 @@
 
 ## 主训练链路
 
-当前主入口是 script/train_actor_learner_v2.py。整体运行流程可以概括为：
+当前主入口是 `script/train_actor_learner_v2.py`。整体运行流程可以概括为：
 
-1. runner/factories.py 根据 YAML 配置构建环境、Agent、算法和值函数组件。
-2. runner/actor_learner.py 启动 orchestrator、actor、learner 三类角色。
-3. Actor 通过 env_wrapper 和 rollout 不断与环境交互，调用 agent 产出动作、logp 和 replay。
-4. rollout/collector.py 把观测、奖励、done、replay 等信息打包成 shard。
-5. io/buffer.py 把 shard 写入共享缓冲区，并维护权重版本和消费状态。
-6. Learner 通过 lightning/actor_learner_datamodule.py 读取 shard，交给 batch 和 algorithms 生成训练 batch。
-7. algorithms 和 lightning 共同完成 PPO 或 ReinforcePP 更新。
-8. 更新后的权重重新写回 buffer，Actor 检测到新版本后继续采样。
+1. `runner/config_normalization.py` 先规范化 actor-learner 相关配置。
+2. `runner/orchestrator.py`、`runner/actor_runtime.py`、`runner/learner_runtime.py` 分别负责 orchestrator、actor、learner 三类角色。
+3. Actor 通过 `env_wrapper/` 和 `rollout/` 不断与环境交互，调用 `agent/` 产出动作、logp 和 replay。
+4. `rollout/` 把观测、奖励、done、replay 等信息打包成 shard。
+5. `io/buffer.py` 把 shard 写入共享缓冲区，并维护权重版本、消费状态和停止标记；`io/shard_policy.py` 负责 learner 侧 shard 选择策略。
+6. Learner 通过 `lightning/actor_learner_datamodule.py` 读取 shard，交给 `batch/actor_learner.py` 生成训练 batch。
+7. `algorithms/` 提供 objective/spec，`lightning/trajectory_module.py` 执行训练步，`configure_optimizers()` 负责主动优化器构建。
+8. `lightning/actor_learner_module.py` 在 update 结束后保存新权重、推进 version，并让 Actor 检测新版本后继续采样。
 
 简化后的数据流如下：
 
-Actor -> env_wrapper -> agent -> rollout -> io/buffer -> batch -> algorithms -> lightning -> 新权重 -> Actor
+`script/train_actor_learner_v2.py`
+-> `runner/`
+-> `rollout/` + `io/`
+-> `batch/`
+-> `algorithms/` + `lightning/`
+-> 新权重
+-> Actor
 
 ## 目录分工
 
@@ -43,13 +49,14 @@ Actor -> env_wrapper -> agent -> rollout -> io/buffer -> batch -> algorithms -> 
 
 - 实现 PPO、ReinforcePP 及其底层目标函数。
 - 负责从 replay 重算 logp、计算 advantage 相关损失和训练指标。
+- 现在更准确地说是 objective/config 层，而不是直接驱动 Trainer 的执行层。
 
 ### batch/
 
 batch 构建入口层。
 
 - 向 Learner 提供稳定的 build_training_batch 接口。
-- 实际把 shard 变成训练 batch 的逻辑主要下沉在 algorithms/trajectory_batch.py。
+- 实际 canonical 实现在 `batch/actor_learner.py`，也是当前唯一明确的 shard-to-batch 入口。
 
 ### env_wrapper/
 
@@ -63,6 +70,7 @@ batch 构建入口层。
 actor-learner 通信层。
 
 - 定义 buffer 目录结构、版本文件、停止标记和 shard 生命周期。
+- 包含 shard 过滤与选择这类文件协议策略。
 - 支撑 actor 和 learner 之间的异步协作。
 
 ### lightning/
@@ -70,7 +78,7 @@ actor-learner 通信层。
 训练调度层。
 
 - 把算法更新接入 PyTorch Lightning。
-- 管理 datamodule、training_step、训练锁、WandB 日志和更新后权重回写。
+- 管理 datamodule、training_step、`configure_optimizers()`、训练锁、WandB 日志和更新后权重回写。
 
 ### rewards/
 
@@ -101,13 +109,14 @@ actor-learner 通信层。
 如果是第一次阅读这个框架，建议按下面顺序看：
 
 1. script/train_actor_learner_v2.py
-2. runner/actor_learner.py
-3. runner/factories.py
+2. runner/orchestrator.py / runner/actor_runtime.py / runner/learner_runtime.py
+3. runner/config_normalization.py / runner/agent_factory.py / runner/env_factory.py / runner/learner_factory.py
 4. rollout/collector.py
 5. lightning/actor_learner_datamodule.py
-6. algorithms/trajectory_batch.py
-7. algorithms/ppo.py 或 algorithms/reinforcepp.py
-8. agent/ 对应的具体策略实现
+6. batch/actor_learner.py
+7. lightning/trajectory_module.py
+8. algorithms/ppo.py 或 algorithms/reinforcepp.py
+9. agent/ 对应的具体策略实现
 
 这样可以先抓住主链路，再回头看各个子模块的细节。
 
@@ -130,4 +139,4 @@ actor-learner 通信层。
 
 - 新训练逻辑优先补到现有模块中，不要在 framework 下堆叠历史备份文件或兼容残留文件。
 - 如果某个辅助脚本不属于当前 actor-learner 主链路，优先放到 framework 之外，或者在对应 README 中写清楚它的保留原因。
-- 如果修改配置字段，最好同步检查 runner/factories.py 和 runner/actor_learner.py，确认这些字段在当前代码路径里真的会被读取。
+- 如果修改配置字段，最好同步检查 `runner/config_normalization.py`、对应 runtime 模块和相关 factory，确认这些字段在当前代码路径里真的会被读取。

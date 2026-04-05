@@ -1,13 +1,19 @@
 # framework/algorithms
 
-这个目录负责实现 RL 更新逻辑，是训练链路里真正计算损失函数和做参数更新的地方。它位于“采样数据已经落盘之后、模型权重回写之前”的核心 Learner 阶段。
+这个目录负责 **算法目标函数与算法配置描述**。它是 learner 链路里的 objective/config 层，不负责直接运行 Trainer。
 
 ## 目录职责
 
 - 从 batch 模块拿到已经整理好的 obs、adv、ret、old_logp、replay。
 - 调用 agent 的 replay 接口，重算当前策略下的 logp。
 - 计算 PPO 或 ReinforcePP 的目标函数、裁剪项、价值损失和统计指标。
-- 通过 lightning 模块把这些目标函数放进 Trainer 的训练循环中执行。
+- 提供 PPO/ReinforcePP 规格对象（裁剪系数、优化超参数、梯度与采样相关参数）给 learner runtime 使用。
+
+不属于这个目录的职责：
+
+- 不在这里构建 Lightning `Trainer`。
+- 不在这里驱动训练循环。
+- 不在这里做 actor-learner 协调与 checkpoint/version 发布。
 
 ## 文件说明
 
@@ -22,52 +28,24 @@
 
 算法抽象基类。
 
-- 定义 update 接口，约束所有算法都以同一种方式接收 agent、batch 和 device。
-- get_value_components 用于让 PPO 这类带 value net 的算法把附属组件回传给上层。
+- 定义算法规格对象的公共接口。
+- `update` 仅保留兼容入口，不再由 algorithms 层执行训练循环。
 
 ### ppo.py
 
-PPO 的高层封装。
+PPO 的配置/规格容器。
 
-- 负责把 PPO 相关超参数组织起来。
-- 创建 TrajectoryLightningModule 和 TrajectoryUpdateDataModule。
-- 用 Lightning Trainer 跑多 epoch、多 minibatch 的更新流程。
-- 适合看作“PPO 的训练调度入口”。
-
-### ppo_core.py
-
-PPO 的底层数值实现。
-
-- 逐 minibatch 计算新 logp、value 预测、裁剪目标和梯度。
-- 处理 grad accumulation、梯度裁剪、DDP sampler 等训练细节。
-- 这里更接近纯算法内核，适合单独分析 PPO 公式如何落到代码里。
+- 组织 PPO 所需超参数与 value net 引用。
+- 暴露 learner runtime 需要读取的字段（如 `clip_eps`、`vf_coef`、`minibatch_size`、`grad_accum_steps` 等）。
+- 由 Lightning 侧根据这些字段创建优化器；算法规格对象本身不再持有 optimizer。
 
 ### reinforcepp.py
 
-ReinforcePP 的高层封装。
+ReinforcePP 的配置/规格容器。
 
 - 组织 ReinforcePP 训练所需参数。
-- 与 ppo.py 类似，负责把算法挂到 Lightning 的训练循环里。
-- 适合看作“无 value head 版本的策略梯度训练入口”。
-
-### reinforcepp_core.py
-
-ReinforcePP 的底层更新逻辑。
-
-- 根据 replay 重算 logp，用 advantage 直接构建策略梯度损失。
-- 支持可选的 KL 正则和参考策略比较。
-- 负责 minibatch 更新、梯度裁剪和分布式采样细节。
-
-### trajectory_batch.py
-
-把 actor 侧 shard 变成 learner 可训练 batch 的核心文件。
-
-- 从 shard 中读取 obs、reward、done、replay 等字段。
-- 对 PPO 计算 value、GAE 和 return。
-- 对 Reinforce 家族计算 return 和 advantage。
-- 负责 advantage 归一化，并做各种长度一致性检查。
-
-这是连接 rollout 数据和算法更新的关键中间层。
+- 暴露 learner runtime 读取的训练相关字段。
+- 不直接创建 Trainer 或执行训练循环。
 
 ### trajectory_policy_core.py
 
@@ -75,17 +53,16 @@ ReinforcePP 的底层更新逻辑。
 
 - 提供 agent_logp_from_replay_batch，屏蔽不同 Agent 的 replay 接口差异。
 - 统一实现 PPO 目标函数、Reinforce 目标函数和对应 metrics 统计。
-- lightning/trajectory_module.py 的 training_step 会直接依赖这里。
-
-### readme
-
-旧的简短说明文件，只概括了 Trainer -> Algorithm -> algorithm_core 的关系。现在的 README.md 更完整，覆盖了每个 Python 文件的具体职责。
+- `framework/lightning/trajectory_module.py` 的 `training_step` 会直接依赖这里。
 
 ## 训练时如何经过这里
 
 Learner 端主流程大致是：
 
 1. lightning/actor_learner_datamodule.py 选出一批 shard。
-2. trajectory_batch.py 把 shard 组装成训练 batch。
-3. ppo.py 或 reinforcepp.py 建立 Lightning 训练循环。
-4. trajectory_policy_core.py 和 ppo_core.py 或 reinforcepp_core.py 计算目标并更新参数。
+2. `framework/batch/actor_learner.py` 把 shard 组装成训练 batch。
+3. runner/learner_factory.py 构建 PPO/ReinforcePP 规格对象（仅配置承载，PPO 同时携带 value net）。
+4. runner/learner_runtime.py 组装 Lightning 训练入口，`trajectory_module.py` 负责实际 `training_step`，`actor_learner_module.py` 负责 actor-learner 生命周期钩子。
+5. trajectory_policy_core.py 为 Lightning 模块提供 PPO/Reinforce 目标函数与 metrics 计算。
+
+这里不再保留旧的 algorithm execution driver 文件。当前 canonical 目标函数入口就是 `trajectory_policy_core.py`，batch 组装入口就是 `framework/batch/actor_learner.py`。

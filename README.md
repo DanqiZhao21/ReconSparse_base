@@ -15,18 +15,18 @@
 
 当前主入口是 script/train_actor_learner_v2.py。整体运行流程可以概括为：
 
-1. runner/factories.py 根据 YAML 配置构建环境、Agent、算法和值函数组件。
-2. runner/actor_learner.py 启动 orchestrator、actor、learner 三类角色。
+1. runner/config_normalization.py 先补齐 actor-learner 相关配置。
+2. runner/orchestrator.py、runner/actor_runtime.py、runner/learner_runtime.py 分别负责 orchestrator、actor、learner 三类角色。
 3. Actor 通过 env_wrapper 和 rollout 不断与环境交互，调用 agent 产出动作、logp 和 replay。
 4. rollout/collector.py 把观测、奖励、done、replay 等信息打包成 shard。
-5. io/buffer.py 把 shard 写入共享缓冲区，并维护权重版本和消费状态。
-6. Learner 通过 lightning/actor_learner_datamodule.py 读取 shard，交给 batch 和 algorithms 生成训练 batch。
-7. algorithms 和 lightning 共同完成 PPO 或 ReinforcePP 更新。
+5. io/buffer.py 和 io/shard_policy.py 负责 shard 写入、筛选、消费与权重版本同步。
+6. Learner 通过 lightning/actor_learner_datamodule.py 读取 shard，交给 batch/actor_learner.py 生成训练 batch。
+7. algorithms/trajectory_policy_core.py 和 lightning/trajectory_module.py 共同完成 PPO 或 ReinforcePP 更新，优化器由 Lightning `configure_optimizers()` 创建。
 8. 更新后的权重重新写回 buffer，Actor 检测到新版本后继续采样。
 
 简化后的数据流如下：
 
-Actor -> env_wrapper -> agent -> rollout -> io/buffer -> batch -> algorithms -> lightning -> 新权重 -> Actor
+script/train_actor_learner_v2.py -> runner -> rollout + io -> batch -> algorithms + lightning -> 新权重 -> Actor
 
 ## 目录分工
 
@@ -49,7 +49,7 @@ Actor -> env_wrapper -> agent -> rollout -> io/buffer -> batch -> algorithms -> 
 batch 构建入口层。
 
 - 向 Learner 提供稳定的 build_training_batch 接口。
-- 实际把 shard 变成训练 batch 的逻辑主要下沉在 algorithms/trajectory_batch.py。
+- 实际把 shard 变成训练 batch 的逻辑集中在 batch/actor_learner.py。
 
 ### env_wrapper/
 
@@ -101,13 +101,14 @@ actor-learner 通信层。
 如果是第一次阅读这个框架，建议按下面顺序看：
 
 1. script/train_actor_learner_v2.py
-2. runner/actor_learner.py
-3. runner/factories.py
+2. runner/orchestrator.py / runner/actor_runtime.py / runner/learner_runtime.py
+3. runner/config_normalization.py / runner/agent_factory.py / runner/env_factory.py / runner/learner_factory.py
 4. rollout/collector.py
 5. lightning/actor_learner_datamodule.py
-6. algorithms/trajectory_batch.py
-7. algorithms/ppo.py 或 algorithms/reinforcepp.py
-8. agent/ 对应的具体策略实现
+6. batch/actor_learner.py
+7. lightning/trajectory_module.py
+8. algorithms/ppo.py 或 algorithms/reinforcepp.py
+9. agent/ 对应的具体策略实现
 
 这样可以先抓住主链路，再回头看各个子模块的细节。
 
@@ -130,4 +131,4 @@ actor-learner 通信层。
 
 - 新训练逻辑优先补到现有模块中，不要在 framework 下堆叠历史备份文件或兼容残留文件。
 - 如果某个辅助脚本不属于当前 actor-learner 主链路，优先放到 framework 之外，或者在对应 README 中写清楚它的保留原因。
-- 如果修改配置字段，最好同步检查 runner/factories.py 和 runner/actor_learner.py，确认这些字段在当前代码路径里真的会被读取。
+- 如果修改配置字段，最好同步检查 runner/config_normalization.py、对应 runtime 模块和相关 factory，确认这些字段在当前代码路径里真的会被读取。

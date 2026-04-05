@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .base import Agent
@@ -175,6 +176,7 @@ class SparseDriveV2Policy(Agent):
             self._optimizer = torch.optim.Adam(params, lr=float(rl_lr))
 
         self._last_missing_feature_fields: List[str] = []
+        self._teacher_model: torch.nn.Module | None = None
 
     @property
     def device(self) -> torch.device:
@@ -197,7 +199,7 @@ class SparseDriveV2Policy(Agent):
             pass
         return self
 
-    def _load_weights(self, path: str) -> None:
+    def _load_state_into_model(self, model: torch.nn.Module, path: str) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"SparseDriveV2 ckpt not found: {path}")
         ckpt = torch.load(path, map_location="cpu")
@@ -213,12 +215,15 @@ class SparseDriveV2Policy(Agent):
                     normalized_key = "_backbone." + normalized_key
                 state_dict[normalized_key] = value
 
-        missing, unexpected = self._model.load_state_dict(state_dict, strict=False)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
         print(f"[SparseDriveV2Policy] Loaded ckpt: {path}")
         if missing:
             print(f"[SparseDriveV2Policy] missing_keys={len(missing)}")
         if unexpected:
             print(f"[SparseDriveV2Policy] unexpected_keys={len(unexpected)} (ignored)")
+
+    def _load_weights(self, path: str) -> None:
+        self._load_state_into_model(self._model, path)
 
     def initialize(self) -> None:
         return
@@ -503,8 +508,11 @@ class SparseDriveV2Policy(Agent):
                 out[key] = value.to(device=device, dtype=torch.float32)
         return out
 
-    def _forward_policy(self, features_dev: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        model = self._model.module if isinstance(self._model, DDP) else self._model
+    @staticmethod
+    def _unwrap_model(module: torch.nn.Module | DDP) -> torch.nn.Module:
+        return module.module if isinstance(module, DDP) else module
+
+    def _forward_policy_on_model(self, model: torch.nn.Module, features_dev: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         out, _loss_dict = model(features_dev, targets={})
         if "trajectory" not in out:
             raise RuntimeError("SparseDriveV2 output missing 'trajectory'")
@@ -526,6 +534,10 @@ class SparseDriveV2Policy(Agent):
         out["candidate_trajectories"] = candidate_trajectories
         out["candidate_scores"] = candidate_scores.to(dtype=torch.float32)
         return out
+
+    def _forward_policy(self, features_dev: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        model = self._unwrap_model(self._model)
+        return self._forward_policy_on_model(model, features_dev)
 
     @staticmethod
     def _traj_to_xyyaw(traj: torch.Tensor) -> np.ndarray:
@@ -741,6 +753,165 @@ class SparseDriveV2Policy(Agent):
         )
         logp_all = torch.log_softmax(score_logits, dim=1)
         return logp_all[torch.arange(score_logits.shape[0], device=score_logits.device), mode_indices]
+
+    def init_distillation_teacher(self, *, ckpt_path: str | None = None) -> None:
+        teacher_ckpt = str(ckpt_path) if ckpt_path is not None else str(self.ckpt_path)
+        teacher = self._SparseDriveModel(self._cfg)
+        self._load_state_into_model(teacher, teacher_ckpt)
+        teacher.to(self.device)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+        self._teacher_model = teacher
+
+    def _distill_log_probs_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        *,
+        temperature: float = 1.0,
+        model: torch.nn.Module,
+        use_inference_mode: bool,
+    ) -> torch.Tensor:
+        if len(replays) == 0:
+            return torch.empty((0, 0), device=self.device, dtype=torch.float32)
+
+        batched_dev = self._batched_replay_features(replays)
+        if use_inference_mode:
+            model.eval()
+            with torch.inference_mode():
+                out = self._forward_policy_on_model(model, batched_dev)
+        else:
+            out = self._forward_policy_on_model(model, batched_dev)
+        score_logits = out["candidate_scores"].to(dtype=torch.float32)
+        return F.log_softmax(score_logits / float(temperature), dim=1)
+
+    def distill_student_log_probs_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        *,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        return self._distill_log_probs_from_replay_batch(
+            replays,
+            temperature=float(temperature),
+            model=self._unwrap_model(self._model),
+            use_inference_mode=False,
+        )
+
+    def distill_teacher_log_probs_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        *,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        if self._teacher_model is None:
+            raise RuntimeError("SparseDriveV2 distillation teacher is not initialized")
+        return self._distill_log_probs_from_replay_batch(
+            replays,
+            temperature=float(temperature),
+            model=self._teacher_model,
+            use_inference_mode=True,
+        )
+
+    @property
+    def value_feature_dim(self) -> int | None:
+        model = self._model.module if isinstance(self._model, DDP) else self._model
+        backbone_dim = int(getattr(getattr(model, "_backbone", None), "embed_dims", 0))
+        status_encoder = getattr(model, "_status_encoding", None)
+        status_dim = int(getattr(status_encoder, "out_features", 0)) if status_encoder is not None else 0
+        if backbone_dim <= 0 or status_dim <= 0:
+            return None
+        return int(backbone_dim + status_dim)
+
+    def _batched_replay_features(self, replays: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        if len(replays) == 0:
+            raise RuntimeError("SparseDriveV2 value replay batch is empty")
+
+        bad_indices = [
+            idx for idx, replay in enumerate(replays)
+            if not self.replay_is_compatible(replay)
+        ]
+        if len(bad_indices) > 0:
+            raise RuntimeError(
+                "SparseDriveV2 value replay batch contains incompatible replay entries. "
+                f"Bad replay indices: {bad_indices[:8]}"
+            )
+
+        camera_feature = replays[0].get("camera_feature", None)
+        if not isinstance(camera_feature, dict) or "imgs" not in camera_feature:
+            raise RuntimeError("SparseDriveV2 value replay batch is missing camera_feature['imgs']")
+
+        batched_camera = {
+            key: torch.cat([rep["camera_feature"][key] for rep in replays], dim=0)
+            for key in camera_feature.keys()
+        }
+        try:
+            batched_status = torch.cat([rep["status_feature"] for rep in replays], dim=0)
+        except KeyError as exc:
+            raise RuntimeError("SparseDriveV2 value replay batch requires status_feature") from exc
+
+        return self._to_device_features(
+            {
+                "camera_feature": batched_camera,
+                "status_feature": batched_status,
+            },
+            self.device,
+        )
+
+    def value_features_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+    ) -> torch.Tensor:
+        if len(replays) == 0:
+            feature_dim = int(self.value_feature_dim or 0)
+            return torch.empty((0, feature_dim), device=self.device, dtype=torch.float32)
+
+        batched_dev = self._batched_replay_features(replays)
+        model = self._model.module if isinstance(self._model, DDP) else self._model
+        model.eval()
+        with torch.inference_mode():
+            feature_maps = model._backbone(batched_dev["camera_feature"]["imgs"])
+            last_feature_map = feature_maps[-1].to(dtype=torch.float32)
+            pooled_vision = last_feature_map.mean(dim=(1, 3, 4))
+            status_encoding = model._status_encoding(batched_dev["status_feature"]).to(dtype=torch.float32)
+            features = torch.cat([pooled_vision, status_encoding], dim=1)
+        return features.detach().clone()
+
+    def value_features_from_observation(self, observation: Dict[str, Any]) -> torch.Tensor:
+        return self.value_features_from_observation_batch([observation]).view(-1)
+
+    def value_features_from_observation_batch(
+        self,
+        observations: Sequence[Dict[str, Any]],
+    ) -> torch.Tensor:
+        if len(observations) == 0:
+            feature_dim = int(self.value_feature_dim or 0)
+            return torch.empty((0, feature_dim), device=self.device, dtype=torch.float32)
+
+        features_list = [self._build_features(obs) for obs in observations]
+        camera_keys = list(features_list[0]["camera_feature"].keys())
+        batched_camera = {
+            key: torch.cat([feat["camera_feature"][key] for feat in features_list], dim=0)
+            for key in camera_keys
+        }
+        batched_status = torch.cat([feat["status_feature"] for feat in features_list], dim=0)
+        batched_dev = self._to_device_features(
+            {
+                "camera_feature": batched_camera,
+                "status_feature": batched_status,
+            },
+            self.device,
+        )
+
+        model = self._model.module if isinstance(self._model, DDP) else self._model
+        model.eval()
+        with torch.inference_mode():
+            feature_maps = model._backbone(batched_dev["camera_feature"]["imgs"])
+            last_feature_map = feature_maps[-1].to(dtype=torch.float32)
+            pooled_vision = last_feature_map.mean(dim=(1, 3, 4))
+            status_encoding = model._status_encoding(batched_dev["status_feature"]).to(dtype=torch.float32)
+            features = torch.cat([pooled_vision, status_encoding], dim=1)
+        return features.detach().clone()
 
     def replay_is_compatible(self, replay: Dict[str, Any]) -> bool:
         if not isinstance(replay, dict):

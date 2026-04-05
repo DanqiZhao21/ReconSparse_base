@@ -1,4 +1,4 @@
-"""Algorithm implementations and cores.
+"""Algorithm specs and objective cores.
 
 Note:
 - Keep this module side-effect free and only import symbols that actually exist.

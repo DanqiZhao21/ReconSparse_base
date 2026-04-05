@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import os
+import time
+import uuid
+from typing import Any, Dict, Optional
+
+import torch
+
+from framework.io.buffer import (
+    BufferPaths,
+    atomic_torch_save,
+    count_inflight,
+    ensure_buffer_layout,
+    read_int,
+    stop_requested,
+    wait_for_version,
+)
+from framework.rollout import collect_single_env_shard, collect_vector_env_shards
+from framework.runner.agent_factory import build_agent
+from framework.runner.env_factory import build_actor_env
+from framework.runner.logging import stage
+
+
+def _stop_before_writing_shard(paths: BufferPaths, *, actor_id: int, shard_count: int) -> bool:
+    if not stop_requested(paths):
+        return False
+    stage(f"[actor{actor_id}] stop requested after collecting {shard_count} shard(s); discarding unsaved shard(s)")
+    return True
+
+
+def actor_main(
+    cfg: Dict[str, Any],
+    *,
+    actor_id: int,
+    gpu_id: Optional[int] = None,
+    total_actors: Optional[int] = None,
+) -> None:
+    train_cfg = cfg.get("train", {}) or {}
+    al_cfg = train_cfg.get("actor_learner", {}) or {}
+    paths = BufferPaths(root=str(al_cfg.get("buffer_dir", "outputs/actor_learner")))
+    ensure_buffer_layout(paths)
+
+    mode = str(al_cfg.get("mode", "sync")).strip().lower()
+    horizon = int(al_cfg.get("actor_horizon", 32))
+    max_inflight = int(al_cfg.get("max_inflight_per_actor", 2))
+    poll_s = float(al_cfg.get("poll_interval_s", 0.2))
+    num_envs_per_actor = max(1, int(al_cfg.get("num_envs_per_actor", 1)))
+    vec_env_mode = str(al_cfg.get("vec_env_mode", "serial")).strip().lower()
+    if num_envs_per_actor != 1:
+        stage(f"[actor{actor_id}] forcing num_envs_per_actor=1 (process-level parallel only)")
+        num_envs_per_actor = 1
+
+    if torch.cuda.is_available():
+        if gpu_id is None:
+            gpu_id = int(actor_id) % max(1, int(torch.cuda.device_count()))
+        cuda = int(gpu_id)
+        torch.cuda.set_device(cuda)
+        device = torch.device(f"cuda:{cuda}")
+    else:
+        cuda = -1
+        device = torch.device("cpu")
+
+    learner_gpu_id = int(al_cfg.get("learner_gpu_id", 0))
+    pause_actor_on_learner_gpu = bool(al_cfg.get("pause_actor_on_learner_gpu", True))
+    training_lock_file = os.path.join(paths.root, "TRAINING_LOCK")
+    agent = build_agent(cfg, device=device)
+    local_ver = 0
+    v0 = read_int(paths.version_file, default=0)
+    if v0 > 0 and os.path.exists(paths.latest_ckpt):
+        try:
+            agent.load_checkpoint(paths.latest_ckpt)
+            local_ver = int(v0)
+            stage(f"[actor{actor_id}] loaded learner weights ver={local_ver}")
+        except Exception as exc:
+            stage(f"[actor{actor_id}] failed to load learner weights: {exc}")
+
+    eta = float(train_cfg.get("eta", train_cfg.get("ddv2_eta", 1.0)))
+    mode_idx = int(train_cfg.get("mode_idx", train_cfg.get("ddv2_mode_idx", -1)))
+    mode_select = str(train_cfg.get("policy_mode_select", train_cfg.get("ddv2_mode_select", "sample"))).strip().lower()
+    shard_idx = 0
+    shard_idx_per_env = [0 for _ in range(int(num_envs_per_actor))]
+
+    if num_envs_per_actor == 1:
+        env = build_actor_env(
+            cfg,
+            cuda=int(cuda if cuda >= 0 else 0),
+            actor_id=int(actor_id),
+            total_actors=(int(total_actors) if total_actors is not None else max(1, int(al_cfg.get("num_actors", 1)))),
+        )
+        obs, _info = env.reset()
+        while True:
+            if stop_requested(paths):
+                stage(f"[actor{actor_id}] stop requested; exiting")
+                break
+            if pause_actor_on_learner_gpu and int(cuda) >= 0 and int(cuda) == int(learner_gpu_id):
+                while os.path.exists(training_lock_file):
+                    if stop_requested(paths):
+                        stage(f"[actor{actor_id}] stop requested during learner-train pause; exiting")
+                        return
+                    time.sleep(poll_s)
+            reserve = 1
+            while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
+                if stop_requested(paths):
+                    stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
+                    return
+                time.sleep(poll_s)
+
+            cur_ver = read_int(paths.version_file, default=0)
+            if cur_ver > local_ver and os.path.exists(paths.latest_ckpt):
+                try:
+                    agent.load_checkpoint(paths.latest_ckpt)
+                    local_ver = int(cur_ver)
+                    stage(f"[actor{actor_id}] updated weights ver={local_ver}")
+                except Exception as exc:
+                    stage(f"[actor{actor_id}] weight reload failed: {exc}")
+
+            shard, obs = collect_single_env_shard(
+                env=env,
+                agent=agent,
+                obs=obs,
+                horizon=horizon,
+                eta=eta,
+                mode_idx=mode_idx,
+                mode_select=mode_select,
+                actor_id=actor_id,
+                local_ver=local_ver,
+                shard_idx=shard_idx,
+            )
+            if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=1):
+                break
+            name = f"actor{actor_id}_e0_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
+            atomic_torch_save(shard, os.path.join(paths.shards_dir, name))
+            stage(f"[actor{actor_id}] wrote shard {shard_idx} horizon={horizon} ver={local_ver}")
+            shard_idx += 1
+            if mode.startswith("sync"):
+                wait_for_version(paths, min_version=int(local_ver) + 1, poll_s=poll_s, timeout_s=None, stop_file=paths.stop_file)
+                if stop_requested(paths):
+                    stage(f"[actor{actor_id}] stop requested after sync wait; exiting")
+                    break
+    else:
+        from framework.env_wrapper import SerialVecEnv, SubprocVecEnv
+
+        env_fns = []
+        for i in range(int(num_envs_per_actor)):
+            wid = int(actor_id) * 1000 + int(i)
+            env_fns.append(lambda i=i: build_actor_env(cfg, cuda=int(cuda if cuda >= 0 else 0), actor_id=int(actor_id), worker_id=int(wid)))
+        vec_env = SerialVecEnv(env_fns) if not vec_env_mode.startswith("sub") else SubprocVecEnv(env_fns)
+        obs_list, _info = vec_env.reset()
+        while True:
+            if stop_requested(paths):
+                stage(f"[actor{actor_id}] stop requested; exiting")
+                break
+            reserve = max(1, int(num_envs_per_actor))
+            while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
+                if stop_requested(paths):
+                    stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
+                    return
+                time.sleep(poll_s)
+            cur_ver = read_int(paths.version_file, default=0)
+            if cur_ver > local_ver and os.path.exists(paths.latest_ckpt):
+                try:
+                    agent.load_checkpoint(paths.latest_ckpt)
+                    local_ver = int(cur_ver)
+                    stage(f"[actor{actor_id}] updated weights ver={local_ver}")
+                except Exception as exc:
+                    stage(f"[actor{actor_id}] weight reload failed: {exc}")
+
+            shards, obs_list = collect_vector_env_shards(
+                vec_env=vec_env,
+                agent=agent,
+                obs_list=obs_list,
+                num_envs_per_actor=num_envs_per_actor,
+                horizon=horizon,
+                eta=eta,
+                mode_idx=mode_idx,
+                mode_select=mode_select,
+                actor_id=actor_id,
+                local_ver=local_ver,
+                shard_idx_per_env=shard_idx_per_env,
+            )
+            if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=len(shards)):
+                break
+            for i, shard in enumerate(shards):
+                name = f"actor{actor_id}_e{i}_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
+                atomic_torch_save(shard, os.path.join(paths.shards_dir, name))
+                stage(f"[actor{actor_id}] wrote shard env={i} idx={shard_idx_per_env[i]} horizon={horizon} ver={local_ver}")
+                shard_idx_per_env[i] += 1
+            if mode.startswith("sync"):
+                wait_for_version(paths, min_version=int(local_ver) + 1, poll_s=poll_s, timeout_s=None, stop_file=paths.stop_file)
+                if stop_requested(paths):
+                    stage(f"[actor{actor_id}] stop requested after sync wait; exiting")
+                    break
+
+
+__all__ = ["actor_main"]

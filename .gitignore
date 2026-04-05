@@ -52,3 +52,6 @@ wandb/
 flash-attention/
 
 egoADs/
+
+test/
+docs/

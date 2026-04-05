@@ -15,6 +15,23 @@ def _default_obs_tensor(obs: Any) -> torch.Tensor:
         return torch.zeros((18, 64, 64), dtype=torch.float32)
 
 
+def _next_value_feature(agent: Any, next_observation: Any) -> Optional[torch.Tensor]:
+    supports_fn = getattr(agent, "supports_value_features", None)
+    if callable(supports_fn) and not bool(supports_fn()):
+        return None
+    batch_fn = getattr(agent, "value_features_from_observation_batch", None)
+    if callable(batch_fn):
+        features = batch_fn([next_observation])
+        if torch.is_tensor(features) and int(features.shape[0]) > 0:
+            return features[0].detach().cpu().to(dtype=torch.float32).clone()
+    single_fn = getattr(agent, "value_features_from_observation", None)
+    if callable(single_fn):
+        feature = single_fn(next_observation)
+        if torch.is_tensor(feature):
+            return feature.detach().cpu().to(dtype=torch.float32).view(-1).clone()
+    return None
+
+
 def collect_single_env_shard(
     *,
     env: Any,
@@ -66,6 +83,7 @@ def collect_single_env_shard(
             obs, _info = env.reset()
 
     next_obs_t = last_next_obs_t if last_next_obs_t is not None else _default_obs_tensor(obs)
+    next_value_feature = _next_value_feature(agent, next_obs_after if step_count > 0 else obs)
     shard = {
         "obs": torch.stack(obs_buf, dim=0),
         "old_logp": torch.stack(old_logp_buf, dim=0).view(-1),
@@ -86,6 +104,8 @@ def collect_single_env_shard(
             "shard_idx": int(shard_idx),
         },
     }
+    if next_value_feature is not None:
+        shard["next_value_feature"] = next_value_feature
     return shard, obs
 
 
@@ -111,6 +131,7 @@ def collect_vector_env_shards(
     truncated_bufs: List[List[float]] = [[] for _ in range(int(num_envs_per_actor))]
     replay_bufs: List[List[Dict[str, Any]]] = [[] for _ in range(int(num_envs_per_actor))]
     last_next_obs_ts: List[Optional[torch.Tensor]] = [None for _ in range(int(num_envs_per_actor))]
+    last_next_obs_raw: List[Any] = [None for _ in range(int(num_envs_per_actor))]
     last_dones: List[float] = [1.0 for _ in range(int(num_envs_per_actor))]
     last_terminateds: List[float] = [1.0 for _ in range(int(num_envs_per_actor))]
 
@@ -144,6 +165,7 @@ def collect_vector_env_shards(
             terminated_bufs[i].append(1.0 if bool(term_list[i]) else 0.0)
             truncated_bufs[i].append(1.0 if bool(trunc_list[i]) else 0.0)
             last_next_obs_ts[i] = _default_obs_tensor(step_next_obs[i])
+            last_next_obs_raw[i] = step_next_obs[i]
             last_dones[i] = 1.0 if step_done[i] else 0.0
             last_terminateds[i] = 1.0 if bool(term_list[i]) else 0.0
 
@@ -174,4 +196,10 @@ def collect_vector_env_shards(
                 },
             }
         )
+        next_value_feature = _next_value_feature(
+            agent,
+            last_next_obs_raw[i] if last_next_obs_raw[i] is not None else obs_list[i],
+        )
+        if next_value_feature is not None:
+            shards[-1]["next_value_feature"] = next_value_feature
     return shards, obs_list

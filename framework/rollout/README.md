@@ -6,7 +6,7 @@
 
 ### __init__.py
 
-导出 collect_single_env_shard 和 collect_vector_env_shards，供 runner/actor_learner.py 直接调用。
+导出 collect_single_env_shard 和 collect_vector_env_shards，供 `runner/actor_runtime.py` 直接调用。
 
 ### collector.py
 
@@ -20,4 +20,4 @@ actor 采样核心文件。
 
 ## 训练时如何经过这里
 
-runner/actor_learner.py 中的 Actor 主循环会持续调用这里的函数收集固定 horizon 的轨迹片段。收集完成的 shard 会交给 io/buffer.py 写入磁盘，然后等待 Learner 消费。
+`runner/actor_runtime.py` 中的 Actor 主循环会持续调用这里的函数收集固定 horizon 的轨迹片段。收集完成的 shard 会交给 `io/buffer.py` 写入磁盘，然后等待 Learner 消费。

@@ -58,26 +58,40 @@ class TrackingRewardComputer:
         w_longitudinal_jerk = float(cfg.get("w_longitudinal_jerk", 0.0))
         w_yaw_jerk = float(cfg.get("w_yaw_jerk", 0.0))
         jerk_clip = float(cfg.get("jerk_clip", 50.0))
+        rpd_cap = cfg.get("rpd_cap", None)
+        rhd_cap = cfg.get("rhd_cap", None)
+        rpd_cap = None if rpd_cap is None else float(rpd_cap)
+        rhd_cap = None if rhd_cap is None else float(rhd_cap)
 
         ego_xz = env.start_ego[:3, 3][[0, 2]]
         pos_dev = 0.0
-        try:
-            #TODO:这里是否换成不参照traj 而是使用Path来
-            step_frames = int(getattr(env, "step_frames", 1))
-            now_frame = int(getattr(env, "now_frame", 0))
-            exp_list = getattr(env, "all_expert_ego", None)
-            if isinstance(exp_list, list) and len(exp_list) > 0 and step_frames > 0:
-                idx = max(0, min(int(now_frame // step_frames), len(exp_list) - 1))
-                exp_pose = exp_list[idx]
-                exp_xz = np.asarray(exp_pose[:3, 3][[0, 2]], dtype=np.float32)
-                pos_dev = float(np.linalg.norm(exp_xz - ego_xz))
-            else:
-                raise ValueError("expert list unavailable")
-        except Exception:
-            expert_xz_list = getattr(env, "expert_pair", [])
-            if len(expert_xz_list) > 0:
-                expert_arr = np.asarray(expert_xz_list, dtype=np.float32)
-                pos_dev = float(np.linalg.norm(expert_arr - ego_xz, axis=1).min())
+        pos_dev_source = "env"
+        if isinstance(info, dict) and info.get("xz_err_m") is not None:
+            try:
+                pos_dev = max(0.0, float(info.get("xz_err_m")))
+                pos_dev_source = "info.xz_err_m"
+            except Exception:
+                pos_dev = 0.0
+        else:
+            try:
+                # TODO:这里是否换成不参照traj 而是使用Path来
+                step_frames = int(getattr(env, "step_frames", 1))
+                now_frame = int(getattr(env, "now_frame", 0))
+                exp_list = getattr(env, "all_expert_ego", None)
+                if isinstance(exp_list, list) and len(exp_list) > 0 and step_frames > 0:
+                    idx = max(0, min(int(now_frame // step_frames), len(exp_list) - 1))
+                    exp_pose = exp_list[idx]
+                    exp_xz = np.asarray(exp_pose[:3, 3][[0, 2]], dtype=np.float32)
+                    pos_dev = float(np.linalg.norm(exp_xz - ego_xz))
+                    pos_dev_source = "env.all_expert_ego"
+                else:
+                    raise ValueError("expert list unavailable")
+            except Exception:
+                expert_xz_list = getattr(env, "expert_pair", [])
+                if len(expert_xz_list) > 0:
+                    expert_arr = np.asarray(expert_xz_list, dtype=np.float32)
+                    pos_dev = float(np.linalg.norm(expert_arr - ego_xz, axis=1).min())
+                    pos_dev_source = "env.expert_pair"
 
         rot = env.start_ego[:3, :3]
         yaw = math.atan2(float(rot[0, 0]), float(rot[2, 0]))
@@ -122,6 +136,10 @@ class TrackingRewardComputer:
 
         rpd = w_pos * max(0.0, float(pos_dev) - dmax)
         rhd = w_heading * max(0.0, float(yaw_err_deg) - psi_max_deg)
+        if rpd_cap is not None:
+            rpd = min(float(rpd), float(rpd_cap))
+        if rhd_cap is not None:
+            rhd = min(float(rhd), float(rhd_cap))
         rsc = w_static if static_collision else 0.0
         rdc = w_dynamic if dynamic_collision else 0.0
         jerk_pen = w_longitudinal_jerk * abs(float(jerk))
@@ -135,6 +153,7 @@ class TrackingRewardComputer:
                 "step_idx": int(step_idx),
                 "reward": float(reward),
                 "pos_dev": float(pos_dev),
+                "pos_dev_source": str(pos_dev_source),
                 "yaw_err_deg": float(yaw_err_deg),
                 "longitudinal_jerk": float(jerk),
                 "yaw_jerk": float(yaw_jerk),

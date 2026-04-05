@@ -19,13 +19,13 @@ actor-learner 文件式缓冲区的核心实现。
 - 提供 shard 枚举、原子保存、版本号读写、已消费 shard 回收、停止信号检测等能力。
 - actor_main 和 learner_main 都直接依赖这里，它决定了采样数据如何落盘、权重如何广播以及旧 shard 如何清理。
 
-### actor_learner_io.py
+### shard_policy.py
 
-兼容性重导出层。
+Learner 侧 shard 选择策略。
 
-- 本身几乎不实现新逻辑，只是把 buffer.py 里的核心 IO 工具重新导出。
-- 作用是保留旧导入路径，减少主流程重构时对其他模块的影响。
+- 负责 stale shard 丢弃、replay 兼容性过滤，以及 sync/async 模式下的 shard 选择规则。
+- 让 DataModule 不再直接拥有 buffer 协议策略。
 
 ## 训练时如何经过这里
 
-Actor 每次采样完一个 shard 会通过这里定义的路径规则写入 buffer。Learner 则不断轮询这些 shard，训练完成后再把它们移到 consumed，并把最新权重和 version 写回 weights 目录。整个 actor-learner 协作是围绕这个目录提供的文件协议展开的。
+Actor 每次采样完一个 shard 会通过这里定义的路径规则写入 buffer。Learner 则不断轮询这些 shard，先经过 `shard_policy.py` 做筛选，再把训练完成的 shard 移到 consumed，并把最新权重和 version 写回 weights 目录。整个 actor-learner 协作是围绕这个目录提供的文件协议展开的。

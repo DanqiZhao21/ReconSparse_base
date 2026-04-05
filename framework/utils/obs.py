@@ -31,9 +31,4 @@ def obs_to_tensor(
         t = F.interpolate(t, size=image_size, mode="bilinear", align_corners=False)
     return t
 
-
-# Backward-friendly alias used by legacy PPO code.
-_obs_to_tensor = obs_to_tensor
-
-
-__all__ = ["CAM_KEYS", "obs_to_tensor", "_obs_to_tensor"]
+__all__ = ["CAM_KEYS", "obs_to_tensor"]

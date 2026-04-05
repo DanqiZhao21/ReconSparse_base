@@ -1,6 +1,6 @@
 # framework/batch
 
-这个目录负责提供 Learner 侧“构建训练 batch”的稳定入口。它本身很轻，但在训练主流程中承担了兼容层的作用：上层 datamodule 不需要知道底层 batch 构建逻辑具体放在哪个文件里。
+这个目录负责提供 Learner 侧“构建训练 batch”的稳定入口。现在这里已经是 canonical 实现层，而不只是薄兼容层。
 
 ## 文件说明
 
@@ -9,16 +9,16 @@
 包导出层。
 
 - 对外暴露 LoadedShardBatch 和 build_training_batch。
-- 让上层模块只依赖 framework.batch，而不用直接耦合 algorithms/trajectory_batch.py。
+- 让上层模块只依赖 `framework.batch`，而不用直接耦合具体实现文件。
 
 ### actor_learner.py
 
-薄封装文件。
+当前的 canonical 实现文件。
 
-- 实际工作几乎都委托给 algorithms/trajectory_batch.py。
-- 作用是给 actor-learner 训练链路提供稳定的导入路径。
-- 这样即使底层 batch 实现继续演进，Learner datamodule 的调用方式也可以尽量保持不变。
+- 负责 shard 到训练 batch 的主要实现。
+- 包含 GAE、return、advantage normalization 和 batch 组装逻辑。
+- 当前主路径直接依赖这里，不再通过 algorithms 层的兼容别名转发。
 
 ## 训练时如何经过这里
 
-Learner 在 lightning/actor_learner_datamodule.py 里选好 shard 之后，会调用这里的 build_training_batch。然后底层再转到 algorithms/trajectory_batch.py，计算 advantage、return 并整理成最终 minibatch 可读的数据结构。
+Learner 在 `lightning/actor_learner_datamodule.py` 里选好 shard 之后，会调用这里的 `build_training_batch`。这里会直接完成 advantage、return 和 batch 结构整理，然后交给 Lightning 的 dataloader / training_step 使用。

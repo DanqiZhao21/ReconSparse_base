@@ -33,8 +33,24 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
         self.rank = int(rank)
         self.wandb_enabled = bool(wandb_enabled)
         self.global_sample_step = 0
-        self._epoch_train_t0 = 0.0
+        self.global_train_seen_sample_step = 0
+        self._update_train_t0 = 0.0
         self._latest_epoch_had_data = False
+
+    def _inner_epochs(self) -> int:
+        return max(1, int(self.learner_config.inner_epochs))
+
+    def _inner_epoch_index(self) -> int:
+        return int(self.current_epoch % self._inner_epochs())
+
+    def _update_index(self) -> int:
+        return int(self.current_epoch // self._inner_epochs())
+
+    def _is_update_start(self) -> bool:
+        return self._inner_epoch_index() == 0
+
+    def _is_update_end(self) -> bool:
+        return self._inner_epoch_index() == (self._inner_epochs() - 1)
 
     def on_train_epoch_start(self) -> None:
         datamodule = self.trainer.datamodule
@@ -42,10 +58,12 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
         if bool(getattr(datamodule, "should_stop", False)) or not self._latest_epoch_had_data:
             self.trainer.should_stop = True
             return
-        self._epoch_train_t0 = time.time()
-        if self.rank == 0:
+        if self._is_update_start():
+            self._update_train_t0 = time.time()
+            self._reset_update_metric_aggregates()
+        if self.rank == 0 and self._is_update_start():
             with open(os.path.join(self.paths.root, "TRAINING_LOCK"), "w", encoding="utf-8") as handle:
-                handle.write(f"training update={int(self.current_epoch)} time={time.time()}\n")
+                handle.write(f"training update={int(self._update_index())} time={time.time()}\n")
 
     def on_train_epoch_end(self) -> None:
         datamodule = self.trainer.datamodule
@@ -55,6 +73,9 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
 
         if self.ddp_enabled and getattr(self.dist_module, "is_initialized", lambda: False)():
             self.dist_module.barrier()
+
+        if not self._is_update_end():
+            return
 
         if self.rank == 0:
             training_lock_file = os.path.join(self.paths.root, "TRAINING_LOCK")
@@ -79,7 +100,7 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                 self.stage_fn(f"[learner] save/bump failed: {exc}")
             save_broadcast_s = float(time.time() - save_t0)
 
-            train_time_s = float(time.time() - self._epoch_train_t0)
+            train_time_s = float(time.time() - self._update_train_t0)
             update_time_s = float(getattr(datamodule, "current_wait_shards_s", 0.0)) + float(train_time_s)
             n = int(getattr(loaded, "num_samples", 0)) if loaded is not None else 0
             reward_sum = float(getattr(loaded, "reward_sum", 0.0)) if loaded is not None else 0.0
@@ -90,14 +111,20 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             done_rate = float(done_sum) / float(max(1, done_count))
             ret = datamodule.current_loaded.batch["ret"]
             adv = datamodule.current_loaded.batch["adv"]
-            metrics = dict(self.latest_metrics)
+            metrics = self.aggregated_update_metrics()
             self.stage_fn(f"[learner] stage3 broadcast: ver={new_v}")
-            self.stage_fn(f"[learner] update={int(self.current_epoch)} shards={len(selected)} samples={n} ver={new_v} metrics={metrics}")
+            self.stage_fn(
+                f"[learner] update={int(self._update_index())} shards={len(selected)} "
+                f"samples={n} ver={new_v} metrics={metrics}"
+            )
 
             if self.wandb_enabled and wandb is not None:
+                global_sample_step = int(self.global_sample_step + n)
                 payload: Dict[str, Any] = {
-                    "update": int(self.current_epoch),
-                    "global_step": int(self.global_sample_step + n),
+                    "update": int(self._update_index()),
+                    "global_step": int(global_sample_step),
+                    "global_sample_step": int(global_sample_step),
+                    "global_train_seen_sample_step": int(self.global_train_seen_sample_step),
                     "weights_version": int(new_v),
                     "shards": int(len(selected)),
                     "samples": int(n),
@@ -121,6 +148,28 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                         payload[str(key)] = float(value)
                     except Exception:
                         continue
+                update_view = {
+                    "reward_sum": float(reward_sum),
+                    "reward_mean": float(reward_mean),
+                    "done_rate": float(done_rate),
+                    "ret_mean": float(payload["ret_mean"]),
+                    "ret_std": float(payload["ret_std"]),
+                    "adv_std": float(payload["adv_std"]),
+                    "samples": float(n),
+                    "shards": float(len(selected)),
+                    "weights_version": float(new_v),
+                    "collect_time_s": float(payload["collect_time_s"]),
+                    "load_shards_time_s": float(payload["load_shards_time_s"]),
+                    "prepare_batch_time_s": float(payload["prepare_batch_time_s"]),
+                    "train_time_s": float(payload["train_time_s"]),
+                    "update_time_s": float(payload["update_time_s"]),
+                    "save_broadcast_time_s": float(payload["save_broadcast_time_s"]),
+                    "time_per_sample_s": float(payload["time_per_sample_s"]),
+                    "time_per_shard_s": float(payload["time_per_shard_s"]),
+                }
+                update_view.update({key: float(value) for key, value in metrics.items()})
+                for key, value in update_view.items():
+                    payload[f"train_update/{key}"] = float(value)
                 try:
                     self.global_sample_step += int(n)
                     wandb.log(payload)

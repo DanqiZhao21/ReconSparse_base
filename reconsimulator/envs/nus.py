@@ -1,4 +1,5 @@
 import os
+import csv
 import copy
 import math
 import json
@@ -74,8 +75,16 @@ class ReconSimulator(gym.Env):
         self._status_vel_xy = np.zeros((2,), dtype=np.float32)
         self._status_acc_xy = np.zeros((2,), dtype=np.float32)
         self._status_cmd = np.zeros((4,), dtype=np.float32)
+        self._status_steering_angle = 0.0
+        self._status_steering_rate = 0.0
         self._tracked_first_step_xyyaw = np.zeros((3,), dtype=np.float64)
+        self._tracked_rollout_local_xyyaw = np.zeros((0, 3), dtype=np.float64)
         self._external_plan_local_xyyaw: np.ndarray | None = None
+        self._tracker_debug_pending = False
+        self._tracker_debug_cleaned = False
+        self._tracker_debug_image_index = 0
+        self._tracker_debug_last_path: str | None = None
+        self._tracker_debug_csv_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
         # Optional: nuScenes DB + can_bus access (lazy-init).
         self._nusc = None
@@ -356,6 +365,224 @@ class ReconSimulator(gym.Env):
     def _wrap_angle(angle: float) -> float:
         return float(math.atan2(math.sin(float(angle)), math.cos(float(angle))))
 
+    @staticmethod
+    def _estimate_steering_angle_from_motion(
+        *,
+        yaw_delta: float,
+        speed_xy: np.ndarray,
+        dt: float,
+        wheel_base: float = 3.089,
+        max_steer_rad: float = 0.7,
+    ) -> float:
+        dt_s = max(1e-3, float(dt))
+        speed = float(np.linalg.norm(np.asarray(speed_xy, dtype=np.float64)[:2], ord=2))
+        if speed < 1e-3:
+            return 0.0
+        yaw_rate = float(yaw_delta) / dt_s
+        steer = math.atan(float(wheel_base) * float(yaw_rate) / max(speed, 1e-3))
+        steer = max(-float(max_steer_rad), min(float(max_steer_rad), float(steer)))
+        return float(steer)
+
+    def _estimate_initial_steering_state(self, *, dt: float) -> tuple[float, float]:
+        prev_steer = float(getattr(self, "_status_steering_angle", 0.0))
+        prev_yaw_delta = 0.0
+        try:
+            prev_yaw_delta = float(np.asarray(self._tracked_first_step_xyyaw, dtype=np.float64)[2])
+        except Exception:
+            prev_yaw_delta = 0.0
+        steer = self._estimate_steering_angle_from_motion(
+            yaw_delta=float(prev_yaw_delta),
+            speed_xy=np.asarray(self._status_vel_xy, dtype=np.float64),
+            dt=float(dt),
+        )
+        steer_rate = float((float(steer) - float(prev_steer)) / max(1e-3, float(dt)))
+        return float(steer), float(steer_rate)
+
+    def _tracker_debug_output_dir(self) -> str:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        return os.path.join(
+            repo_root,
+            "outputs",
+            "visualize",
+            f"trajTransition-scene{int(self.scene):03d}",
+            "trackerdebug",
+        )
+
+    def _tracker_debug_csv_path(self) -> str:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        return os.path.join(
+            repo_root,
+            "outputs",
+            "visualize",
+            f"trajTransition-scene{int(self.scene):03d}",
+            "expert_ego_local_frame.csv",
+        )
+
+    def _load_tracker_debug_csv_poses(self) -> tuple[np.ndarray, np.ndarray] | None:
+        cached = self._tracker_debug_csv_cache.get(int(self.scene), None)
+        if cached is not None:
+            return cached
+
+        csv_path = self._tracker_debug_csv_path()
+        if not os.path.isfile(csv_path):
+            return None
+
+        try:
+            frames: list[int] = []
+            poses: list[np.ndarray] = []
+            with open(csv_path, "r", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    frame = int(row["frame"])
+                    x = float(row["x"])
+                    y = float(row["y"])
+                    yaw = float(row["yaw_xy_rad_signed"])
+                    frames.append(frame)
+                    poses.append(self._pose_from_local_xyyaw(x, y, yaw))
+            if len(frames) <= 0 or len(poses) <= 0:
+                return None
+            cached_value = (
+                np.asarray(frames, dtype=np.int64),
+                np.stack(poses, axis=0).astype(np.float64, copy=False),
+            )
+            self._tracker_debug_csv_cache[int(self.scene)] = cached_value
+            return cached_value
+        except Exception:
+            return None
+
+    def _build_tracker_debug_gt_local_xyyaw(
+        self,
+        *,
+        start_frame_idx: int,
+        horizon_points: int,
+        step_stride: int,
+    ) -> np.ndarray | None:
+        cached = self._load_tracker_debug_csv_poses()
+        if cached is None:
+            return None
+
+        frames, poses = cached
+        if frames.ndim != 1 or poses.ndim != 3 or poses.shape[0] != frames.shape[0] or poses.shape[1:] != (4, 4):
+            return None
+        if frames.shape[0] <= 0:
+            return None
+
+        start_frame = int(start_frame_idx)
+        stride = max(1, int(step_stride))
+        horizon = max(1, int(horizon_points))
+
+        pos = int(np.searchsorted(frames, start_frame))
+        if pos >= int(frames.shape[0]):
+            pos = int(frames.shape[0]) - 1
+        if pos > 0:
+            prev_pos = pos - 1
+            if abs(int(frames[prev_pos]) - start_frame) <= abs(int(frames[pos]) - start_frame):
+                pos = prev_pos
+
+        base_pose = np.asarray(poses[pos], dtype=np.float64)
+        base_inv = np.linalg.inv(base_pose)
+        out = np.zeros((horizon, 3), dtype=np.float64)
+        for i in range(horizon):
+            target_frame = start_frame + stride * (i + 1)
+            target_pos = int(np.searchsorted(frames, int(target_frame)))
+            if target_pos >= int(frames.shape[0]):
+                target_pos = int(frames.shape[0]) - 1
+            if target_pos > 0 and target_pos < int(frames.shape[0]):
+                prev_target = target_pos - 1
+                if abs(int(frames[prev_target]) - int(target_frame)) <= abs(int(frames[target_pos]) - int(target_frame)):
+                    target_pos = prev_target
+            rel = base_inv @ np.asarray(poses[target_pos], dtype=np.float64)
+            out[i, 0] = float(rel[0, 3])
+            out[i, 1] = float(rel[1, 3])
+            out[i, 2] = self._yaw_from_pose_xy(rel)
+        return out
+
+    def _save_tracker_debug_plot(
+        self,
+        *,
+        frame_idx: int,
+        plan_local_xyyaw: np.ndarray,
+        tracked_rollout_local_xyyaw: np.ndarray,
+        gt_local_xyyaw: np.ndarray | None = None,
+    ) -> None:
+        if not bool(getattr(self, "_tracker_debug_pending", False)):
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            self._tracker_debug_pending = False
+            return
+
+        try:
+            out_dir = self._tracker_debug_output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            if not bool(getattr(self, "_tracker_debug_cleaned", False)):
+                for name in os.listdir(out_dir):
+                    if not name.lower().endswith(".png"):
+                        continue
+                    fp = os.path.join(out_dir, name)
+                    if os.path.isfile(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
+                self._tracker_debug_cleaned = True
+
+            plan = np.asarray(plan_local_xyyaw, dtype=np.float64)
+            tracked = np.asarray(tracked_rollout_local_xyyaw, dtype=np.float64)
+            gt = None if gt_local_xyyaw is None else np.asarray(gt_local_xyyaw, dtype=np.float64)
+
+            fig, ax = plt.subplots(figsize=(7.5, 7.5), dpi=160)
+            ax.scatter([0.0], [0.0], c="black", s=45, marker="x", label="start")
+            if plan.shape[0] > 0:
+                ax.plot(plan[:, 0], plan[:, 1], color="#1f77b4", marker="o", linewidth=2.0, label="proposal")
+            if tracked.shape[0] > 0:
+                ax.plot(tracked[:, 0], tracked[:, 1], color="#d62728", marker="x", linewidth=2.0, label="tracked")
+            if gt is not None and gt.shape[0] > 0:
+                ax.plot(gt[:, 0], gt[:, 1], color="#2ca02c", marker="s", linewidth=2.0, label="gt_4s_csv")
+
+            count = int(min(plan.shape[0], tracked.shape[0]))
+            for i in range(count):
+                ax.text(float(plan[i, 0]), float(plan[i, 1]), f"p{i + 1}", color="#1f77b4", fontsize=8)
+                ax.text(float(tracked[i, 0]), float(tracked[i, 1]), f"t{i + 1}", color="#d62728", fontsize=8)
+            if gt is not None:
+                for i in range(int(gt.shape[0])):
+                    ax.text(float(gt[i, 0]), float(gt[i, 1]), f"g{i + 1}", color="#2ca02c", fontsize=8)
+
+            if plan.shape[0] > 0 and tracked.shape[0] > 0:
+                first_err = float(np.linalg.norm(plan[0, :2] - tracked[0, :2], ord=2))
+            else:
+                first_err = float("nan")
+            if plan.shape[0] > 0 and gt is not None and gt.shape[0] > 0:
+                gt_first_err = float(np.linalg.norm(plan[0, :2] - gt[0, :2], ord=2))
+            else:
+                gt_first_err = float("nan")
+
+            ax.set_title(
+                f"scene={int(self.scene):03d} frame={int(frame_idx):03d}\n"
+                f"proposal vs tracker rollout (track err={first_err:.4f} m, gt err={gt_first_err:.4f} m)"
+            )
+            ax.set_xlabel("local x (m)")
+            ax.set_ylabel("local y (m)")
+            ax.grid(True, linestyle="--", alpha=0.35)
+            ax.axis("equal")
+            ax.legend(loc="best")
+            fig.tight_layout()
+
+            out_path = os.path.join(
+                out_dir,
+                f"trackerdebug_{int(self._tracker_debug_image_index):03d}_frame{int(frame_idx):03d}.png",
+            )
+            fig.savefig(out_path, bbox_inches="tight")
+            plt.close(fig)
+            self._tracker_debug_image_index += 1
+            self._tracker_debug_last_path = out_path
+        except Exception:
+            pass
+        finally:
+            self._tracker_debug_pending = False
+
     def _build_plan_local_xyyaw(self, *, action: Any, flag: int, ax_index: int | None, ay_index: int | None) -> np.ndarray:
         # Target sampling is 4s / 0.5s = 8 points.
         n = 8
@@ -415,10 +642,38 @@ class ReconSimulator(gym.Env):
 
         # Fallback from first proposal point directly.
         def _fallback() -> tuple[np.ndarray, np.ndarray]:
-            first = np.asarray(plan_local_xyyaw[0], dtype=np.float64)
+            try:
+                plan_arr = np.asarray(plan_local_xyyaw, dtype=np.float64)
+            except Exception:
+                plan_arr = np.zeros((0, 3), dtype=np.float64)
+            if plan_arr.ndim != 2 or plan_arr.shape[0] <= 0 or plan_arr.shape[1] < 3:
+                plan_arr = np.zeros((0, 3), dtype=np.float64)
+                first = np.zeros((3,), dtype=np.float64)
+            else:
+                first = np.asarray(plan_arr[0, :3], dtype=np.float64)
+            ref_frame_idx = int(max(0, int(getattr(self, "now_frame", 0)) - int(getattr(self, "step_frames", 1))))
+            gt_local = self._build_tracker_debug_gt_local_xyyaw(
+                start_frame_idx=ref_frame_idx,
+                horizon_points=int(plan_arr.shape[0]) if plan_arr.ndim == 2 else 0,
+                step_stride=int(getattr(self, "step_frames", 1)),
+            )
             v = np.asarray([first[0] / dt, first[1] / dt], dtype=np.float32)
             a = ((v - np.asarray(self._status_prev_vel_xy if self._status_prev_vel_xy is not None else np.zeros((2,), dtype=np.float32), dtype=np.float32)) / dt).astype(np.float32)
             self._tracked_first_step_xyyaw = np.asarray([float(first[0]), float(first[1]), float(first[2])], dtype=np.float64)
+            self._status_steering_angle = self._estimate_steering_angle_from_motion(
+                yaw_delta=float(first[2]),
+                speed_xy=np.asarray(v, dtype=np.float64),
+                dt=float(dt),
+            )
+            self._status_steering_rate = 0.0
+            self._tracked_rollout_local_xyyaw = np.asarray(plan_arr[:, :3], dtype=np.float64).copy()
+            
+            self._save_tracker_debug_plot(
+                frame_idx=ref_frame_idx,
+                plan_local_xyyaw=np.asarray(plan_arr, dtype=np.float64),
+                tracked_rollout_local_xyyaw=np.asarray(self._tracked_rollout_local_xyyaw, dtype=np.float64),
+                gt_local_xyyaw=gt_local,
+            )
             return v, a
 
         if (not isinstance(plan_local_xyyaw, np.ndarray)) or plan_local_xyyaw.ndim != 2 or plan_local_xyyaw.shape[0] <= 0:
@@ -442,6 +697,7 @@ class ReconSimulator(gym.Env):
             # Keep tracker inputs in the same local frame as plan_local_xyyaw.
             # Origin state is (0, 0, 0), so proposal headings stay local-relative.
             yaw0 = 0.0
+            init_steer, init_steer_rate = self._estimate_initial_steering_state(dt=float(dt))
             proposal_states[0, 0, StateIndex.X] = float(0)
             proposal_states[0, 0, StateIndex.Y] = float(0)
             proposal_states[0, 0, StateIndex.HEADING] = float(yaw0)
@@ -450,8 +706,8 @@ class ReconSimulator(gym.Env):
             proposal_states[0, 0, StateIndex.VELOCITY_Y] = float(self._status_vel_xy[1])
             proposal_states[0, 0, StateIndex.ACCELERATION_X] = float(self._status_acc_xy[0])
             proposal_states[0, 0, StateIndex.ACCELERATION_Y] = float(self._status_acc_xy[1])
-            proposal_states[0, 0, StateIndex.STEERING_ANGLE] = 0.0
-            proposal_states[0, 0, StateIndex.STEERING_RATE] = 0.0
+            proposal_states[0, 0, StateIndex.STEERING_ANGLE] = float(init_steer)
+            proposal_states[0, 0, StateIndex.STEERING_RATE] = float(init_steer_rate)
 
             for i in range(n):
                 px, py, pyaw = float(plan_local_xyyaw[i, 0]), float(plan_local_xyyaw[i, 1]), float(plan_local_xyyaw[i, 2])
@@ -469,32 +725,28 @@ class ReconSimulator(gym.Env):
             simulated_states = np.zeros(proposal_states.shape, dtype=np.float64)
             simulated_states[:, 0] = proposal_states[:, 0]
 
-            current_iteration = SimulationIteration(TimePoint(0), 0)
-            next_iteration = SimulationIteration(TimePoint(0) + TimeDuration.from_s(float(dt)), 1)
-            sampling_time = next_iteration.time_point - current_iteration.time_point
-
-            command_states = tracker.track_trajectory(current_iteration, next_iteration, simulated_states[:, 0])
-
-            # NOTE:
-            # In navsim's kinematic bicycle implementation, steering rate updates steering angle,
-            # and heading uses steering angle from the *current* integration state.
-            # A single coarse dt step can therefore produce near-zero yaw/y response.
-            # Use sub-stepping across the same dt to capture first-step yaw/y more faithfully.
             sub_steps = max(2, int(round(float(dt) / 0.05)))
             sub_dt = float(dt) / float(sub_steps)
             sub_sampling_time = TimeDuration.from_s(float(sub_dt))
-            sim_state = np.asarray(simulated_states[:, 0], dtype=np.float64).copy()
-            for _ in range(sub_steps):
-                sim_state = motion_model.propagate_state(
-                    states=sim_state,
-                    command_states=command_states,
-                    sampling_time=sub_sampling_time,
+            base_time = TimePoint(0)
+            for i in range(n):
+                current_iteration = SimulationIteration(
+                    base_time + TimeDuration.from_s(float(i) * float(dt)),
+                    int(i),
                 )
-            simulated_states[:, 1] = sim_state
-            
-            # print(f"💗💗[In PDM Tracker] plan_local_xyyaw is {plan_local_xyyaw}")
-            # print(f"💗💗[In PDM Tracker] proposal_states is {proposal_states[:,:2]}")
-            # print(f"💗💗[In PDM Tracker] simulated_states is {simulated_states[:,:2]}")
+                next_iteration = SimulationIteration(
+                    base_time + TimeDuration.from_s(float(i + 1) * float(dt)),
+                    int(i + 1),
+                )
+                command_states = tracker.track_trajectory(current_iteration, next_iteration, simulated_states[:, i])
+                sim_state = np.asarray(simulated_states[:, i], dtype=np.float64).copy()
+                for _ in range(sub_steps):
+                    sim_state = motion_model.propagate_state(
+                        states=sim_state,
+                        command_states=command_states,
+                        sampling_time=sub_sampling_time,
+                    )
+                simulated_states[:, i + 1] = sim_state
 
             vel = np.asarray(
                 [
@@ -511,17 +763,21 @@ class ReconSimulator(gym.Env):
                 dtype=np.float32,
             )
 
-            x1 = float(simulated_states[0, 1, StateIndex.X])
-            y1 = float(simulated_states[0, 1, StateIndex.Y])
-            yaw1 = float(simulated_states[0, 1, StateIndex.HEADING])
-            
-            # vel = np.asarray([float(x1 / dt), float(y1 / dt)], dtype=np.float32)
-            # prev_vel = np.asarray(
-            #     self._status_prev_vel_xy if self._status_prev_vel_xy is not None else np.zeros((2,), dtype=np.float32),
-            #     dtype=np.float32,
-            # )
-            # acc = ((vel - prev_vel) / float(dt)).astype(np.float32)
-            
+            tracked_rollout = np.zeros((n, 3), dtype=np.float64)
+            tracked_rollout[:, 0] = simulated_states[0, 1:, StateIndex.X]
+            tracked_rollout[:, 1] = simulated_states[0, 1:, StateIndex.Y]
+            tracked_rollout[:, 2] = simulated_states[0, 1:, StateIndex.HEADING]
+            self._tracked_rollout_local_xyyaw = tracked_rollout
+            ref_frame_idx = int(max(0, int(getattr(self, "now_frame", 0)) - int(getattr(self, "step_frames", 1))))
+            gt_local = self._build_tracker_debug_gt_local_xyyaw(
+                start_frame_idx=ref_frame_idx,
+                horizon_points=int(n),
+                step_stride=int(getattr(self, "step_frames", 1)),
+            )
+
+            x1 = float(tracked_rollout[0, 0])
+            y1 = float(tracked_rollout[0, 1])
+            yaw1 = float(tracked_rollout[0, 2])
             dyaw_local = self._wrap_angle(float(yaw1 - yaw0))
             self._tracked_first_step_xyyaw = np.asarray(
                 [
@@ -531,6 +787,24 @@ class ReconSimulator(gym.Env):
                 ],
                 dtype=np.float64,
             )
+            next_steer = self._estimate_steering_angle_from_motion(
+                yaw_delta=float(dyaw_local),
+                speed_xy=np.asarray(vel, dtype=np.float64),
+                dt=float(dt),
+            )
+            prev_steer_for_rate = float(getattr(self, "_status_steering_angle", 0.0))
+            self._status_steering_angle = float(next_steer)
+            self._status_steering_rate = float(
+                (float(next_steer) - float(prev_steer_for_rate)) / max(1e-3, float(dt))
+            )
+            #TODO: 绘制三条曲线
+            # self._save_tracker_debug_plot(
+            #     frame_idx=ref_frame_idx,
+            #     plan_local_xyyaw=np.asarray(plan_local_xyyaw, dtype=np.float64),
+            #     tracked_rollout_local_xyyaw=np.asarray(self._tracked_rollout_local_xyyaw, dtype=np.float64),
+            #     gt_local_xyyaw=gt_local,
+            # )
+            
             return vel, acc
         except Exception:
             return _fallback()
@@ -553,11 +827,25 @@ class ReconSimulator(gym.Env):
 
         self._status_vel_xy = np.asarray(vel, dtype=np.float32)
         
-        # self._status_acc_xy = np.asarray(acc, dtype=np.float32)
+        self._status_acc_xy = np.asarray(acc, dtype=np.float32)
         # self._status_vel_xy = np.asarray(vel1, dtype=np.float32)
-        self._status_acc_xy = np.asarray(acc1, dtype=np.float32)
+        # self._status_acc_xy = np.asarray(acc1, dtype=np.float32)
         self._status_cmd = np.asarray(cmd, dtype=np.float32)
         self._status_prev_vel_xy = self._status_vel_xy.copy()
+
+
+#ADD TRACKER END
+
+    def _refresh_status_from_dataset(self) -> None:
+        try:
+            vel, acc, cmd = self._status_from_dataset(int(self.now_frame))
+            self._status_vel_xy = np.asarray(vel, dtype=np.float32)
+            self._status_acc_xy = np.asarray(acc, dtype=np.float32)
+            self._status_cmd = np.asarray(cmd, dtype=np.float32)
+            self._status_prev_vel_xy = self._status_vel_xy.copy()
+        except Exception:
+            # Keep previous defaults when dataset mapping is unavailable.
+            pass
 
     def _refresh_status_from_derivation(self, *, frame_idx: int, plan_local_xyyaw: np.ndarray, dt: float = 0.5) -> None:
         """
@@ -601,19 +889,6 @@ class ReconSimulator(gym.Env):
             plan_local_xyyaw=np.asarray(plan_local_xyyaw, dtype=np.float64),
             dt=float(dt),
         )
-
-#ADD TRACKER END
-
-    def _refresh_status_from_dataset(self) -> None:
-        try:
-            vel, acc, cmd = self._status_from_dataset(int(self.now_frame))
-            self._status_vel_xy = np.asarray(vel, dtype=np.float32)
-            self._status_acc_xy = np.asarray(acc, dtype=np.float32)
-            self._status_cmd = np.asarray(cmd, dtype=np.float32)
-            self._status_prev_vel_xy = self._status_vel_xy.copy()
-        except Exception:
-            # Keep previous defaults when dataset mapping is unavailable.
-            pass
  
  #ADD: COMMAND     end   
 
@@ -738,19 +1013,72 @@ class ReconSimulator(gym.Env):
             pass
         return out
 
+    def _nearest_expert_tracking_info(self) -> dict[str, Any]:
+        try:
+            act_pose = np.asarray(getattr(self, "start_ego"), dtype=np.float64)
+        except Exception:
+            return {}
+
+        try:
+            expert_poses = list(getattr(self, "expert_world_all"))
+            expert_pair = np.asarray(getattr(self, "expert_pair"), dtype=np.float64)
+        except Exception:
+            return {}
+
+        if act_pose.shape != (4, 4):
+            return {}
+        if len(expert_poses) <= 0 or expert_pair.ndim != 2 or expert_pair.shape[1] != 2:
+            return {}
+
+        count = min(int(len(expert_poses)), int(expert_pair.shape[0]))
+        if count <= 0:
+            return {}
+
+        act_pos = np.asarray(act_pose[:3, 3], dtype=np.float32)
+        act_xz = np.asarray(act_pose[:3, 3][[0, 2]], dtype=np.float64)
+        candidate_xz = np.asarray(expert_pair[:count], dtype=np.float64)
+        distances = np.linalg.norm(candidate_xz - act_xz.reshape(1, 2), axis=1)
+        nearest_idx = int(np.argmin(distances))
+
+        exp_pose = np.asarray(expert_poses[nearest_idx], dtype=np.float64)
+        if exp_pose.shape != (4, 4):
+            return {}
+        exp_pos = np.asarray(exp_pose[:3, 3], dtype=np.float32)
+
+        exp_yaw_deg = float(np.rad2deg(self._yaw_from_pose_xz(exp_pose)))
+        act_yaw_deg = float(np.rad2deg(self._yaw_from_pose_xz(act_pose)))
+        yaw_err_deg = abs(float(np.rad2deg(self._wrap_angle(np.deg2rad(act_yaw_deg - exp_yaw_deg)))))
+        xz_err_m = float(distances[nearest_idx])
+
+        info = {
+            "scene_id": int(getattr(self, "scene", 0)),
+            "now_frame": int(getattr(self, "now_frame", 0)),
+            "nearest_expert_idx": int(nearest_idx),
+            "exp_pos": exp_pos,
+            "act_pos": act_pos,
+            "exp_yaw_deg": float(exp_yaw_deg),
+            "act_yaw_deg": float(act_yaw_deg),
+            "xz_err_m": float(xz_err_m),
+            "xy_err_m": float(xz_err_m),
+            "yaw_err_deg": float(yaw_err_deg),
+            "ground_ref_idx": int(nearest_idx),
+            "ground_ref_pos": exp_pos,
+            "ground_ref_dist_m": float(xz_err_m),
+        }
+
+        self.last_exp_pos = exp_pos
+        self.last_act_pos = act_pos
+        self.last_exp_yaw_deg = float(exp_yaw_deg)
+        self.last_act_yaw_deg = float(act_yaw_deg)
+        self.last_xy_err_m = float(xz_err_m)
+        self.last_yaw_err_deg = float(yaw_err_deg)
+        self.last_ground_ref_idx = int(nearest_idx)
+        self.last_ground_ref_pos = exp_pos
+        self.last_ground_ref_dist_m = float(xz_err_m)
+        return info
+
     def _get_info(self):
-        return {}
-        # return {
-        #     "exp_pos": getattr(self, "last_exp_pos", None),
-        #     "act_pos": getattr(self, "last_act_pos", None),
-        #     "exp_yaw_deg": getattr(self, "last_exp_yaw_deg", None),
-        #     "act_yaw_deg": getattr(self, "last_act_yaw_deg", None),
-        #     "xy_err_m": getattr(self, "last_xy_err_m", None),
-        #     "yaw_err_deg": getattr(self, "last_yaw_err_deg", None),
-        #     "ground_ref_idx": getattr(self, "last_ground_ref_idx", None),
-        #     "ground_ref_pos": getattr(self, "last_ground_ref_pos", None),
-        #     "ground_ref_dist_m": getattr(self, "last_ground_ref_dist_m", None),
-        # }
+        return self._nearest_expert_tracking_info()
 
 #     # ------------------------- Gym API ------------------------ #
 # ------------------------- Gym API ------------------------ #
@@ -768,6 +1096,15 @@ class ReconSimulator(gym.Env):
             step_frames = None
 
         self.update(seed, step_frames=step_frames, start_frame=start_frame)
+        self._tracked_first_step_xyyaw = np.zeros((3,), dtype=np.float64)
+        self._tracked_rollout_local_xyyaw = np.zeros((0, 3), dtype=np.float64)
+        self._status_steering_angle = 0.0
+        self._status_steering_rate = 0.0
+        self._tracker_debug_pending = False
+        self._tracker_debug_cleaned = False
+        self._tracker_debug_image_index = 0
+        self._tracker_debug_last_path = None
+        self._tracker_debug_csv_cache = {}
         # Initialize status vectors from dataset at the selected start frame.
         self._refresh_status_from_dataset()
         start_pose = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt"))
@@ -820,6 +1157,10 @@ class ReconSimulator(gym.Env):
             x_cmd = y_cmd = yaw_cmd = 0.0
 
         # Build planned trajectory in local frame for status tracking update.
+        self._tracker_debug_pending = bool(
+            int(flag) == 2
+            and isinstance(getattr(self, "_external_plan_local_xyyaw", None), np.ndarray)
+        )
         plan_local_xyyaw = self._build_plan_local_xyyaw(
             action=action,
             flag=int(flag),
@@ -839,28 +1180,19 @@ class ReconSimulator(gym.Env):
         
         #TODO:使用原来的未经过跟踪的轨迹点
         #试用一下完全的数据集
-        
         # self._refresh_status_from_dataset()
         # print(f"💗[In step] dataset vel = {self._status_vel_xy}, acc = {self._status_acc_xy}, cmd = {self._status_cmd}")
         
-        
-        # # Update status from tracked plan (vel/acc) + dataset command.
+        # # 使用控制器跟踪：Update status from tracked plan (vel/acc) + dataset command.
         self._refresh_status_from_plan(
             frame_idx=int(self.now_frame),
             prev_pose=np.asarray(prev_pose, dtype=np.float64),
             plan_local_xyyaw=np.asarray(plan_local_xyyaw, dtype=np.float64),
         )
         # print(f"💗[In step] plan vel = {self._status_vel_xy}, acc = {self._status_acc_xy}, cmd = {self._status_cmd}")
-        
         # self._refresh_status_from_dataset()
         # print(f"💗[In step] dataset vel = {self._status_vel_xy}, acc = {self._status_acc_xy}, cmd = {self._status_cmd}")
-        
-        #也还是有问题呢
-        # self._refresh_status_from_derivation(
-        #     frame_idx=int(self.now_frame),
-        #     plan_local_xyyaw=np.asarray(plan_local_xyyaw, dtype=np.float64),
-        #     dt=0.5,
-        # )
+    
         
         # --- 计算 action 推进的“假设下一帧”位姿（用于对比或真实推进） ---
         # front-start 局部坐标约定：x-y 为平面，yaw 绕 z 轴。
@@ -871,7 +1203,7 @@ class ReconSimulator(gym.Env):
             # planar motion in local x-y with yaw about +z.
             #TODO:使用原来的未经过跟踪的轨迹点
             dx_fwd, dy_left, dyaw = float(x_cmd), float(y_cmd), float(yaw_cmd)
-            
+            #TODO:使用经过跟踪后的轨迹点
             # dx_fwd, dy_left, dyaw = (
             #     float(self._tracked_first_step_xyyaw[0]),
             #     float(self._tracked_first_step_xyyaw[1]),
