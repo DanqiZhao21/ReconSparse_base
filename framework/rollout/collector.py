@@ -3,8 +3,10 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
+from framework.rollout.timing import build_rollout_timing, extract_env_timing
 from framework.utils.obs import obs_to_tensor
 
 
@@ -32,6 +34,48 @@ def _next_value_feature(agent: Any, next_observation: Any) -> Optional[torch.Ten
     return None
 
 
+def _extract_external_plan_local_xyyaw(replay: Any) -> Optional[np.ndarray]:
+    if not isinstance(replay, dict):
+        return None
+
+    plan = replay.get("traj_xyyaw", None)
+    if plan is None:
+        return None
+
+    if torch.is_tensor(plan):
+        plan_arr = plan.detach().cpu().numpy()
+    else:
+        try:
+            plan_arr = np.asarray(plan)
+        except Exception:
+            return None
+
+    if plan_arr.ndim != 2 or plan_arr.shape[0] <= 0 or plan_arr.shape[1] < 3:
+        return None
+
+    return np.asarray(plan_arr[:, :3], dtype=np.float64).copy()
+
+
+def _inject_external_plan_single_env(env: Any, replay: Any) -> None:
+    plan_arr = _extract_external_plan_local_xyyaw(replay)
+    if plan_arr is None:
+        return
+
+    setter = getattr(env, "set_external_plan_local_xyyaw", None)
+    if callable(setter):
+        setter(plan_arr)
+
+
+def _inject_external_plan_vec_env(vec_env: Any, env_idx: int, replay: Any) -> None:
+    plan_arr = _extract_external_plan_local_xyyaw(replay)
+    if plan_arr is None:
+        return
+
+    call_one = getattr(vec_env, "call_one", None)
+    if callable(call_one):
+        call_one(int(env_idx), "set_external_plan_local_xyyaw", plan_arr)
+
+
 def collect_single_env_shard(
     *,
     env: Any,
@@ -56,13 +100,26 @@ def collect_single_env_shard(
     last_next_obs_t: Optional[torch.Tensor] = None
     last_done = 1.0
     last_terminated = 1.0
+    next_obs_after = obs
+    step_records: List[Dict[str, float]] = []
+    counters: Dict[str, int] = {"done_count": 0, "reset_count": 0}
 
     step_count = 0
+    collect_t0 = time.perf_counter()
     while step_count < int(horizon):
         obs_decision = obs
+        step_timing: Dict[str, float] = {}
+        t0 = time.perf_counter()
         obs_t = _default_obs_tensor(obs_decision)
+        step_timing["obs_tensor_s"] = float(time.perf_counter() - t0)
+        t0 = time.perf_counter()
         action0, logp, replay = agent.act(obs_decision, eta=eta, mode_idx=mode_idx, mode_select=mode_select)
+        step_timing["act_s"] = float(time.perf_counter() - t0)
+        _inject_external_plan_single_env(env, replay)
+        t0 = time.perf_counter()
         obs, reward, terminated, truncated, _info = env.step(action0)
+        step_timing["env_step_s"] = float(time.perf_counter() - t0)
+        step_timing.update(extract_env_timing(_info))
         done = bool(terminated or truncated)
         next_obs_after = obs
 
@@ -80,10 +137,24 @@ def collect_single_env_shard(
         last_terminated = 1.0 if bool(terminated) else 0.0
 
         if done:
+            counters["done_count"] += 1
+            t0 = time.perf_counter()
             obs, _info = env.reset()
+            step_timing["env_reset_s"] = float(time.perf_counter() - t0)
+            counters["reset_count"] += 1
+        step_records.append(step_timing)
 
     next_obs_t = last_next_obs_t if last_next_obs_t is not None else _default_obs_tensor(obs)
+    next_value_feature_t0 = time.perf_counter()
     next_value_feature = _next_value_feature(agent, next_obs_after if step_count > 0 else obs)
+    next_value_feature_s = float(time.perf_counter() - next_value_feature_t0)
+    timing = build_rollout_timing(
+        horizon=int(horizon),
+        step_records=step_records,
+        collect_shard_s=float(time.perf_counter() - collect_t0),
+        next_value_feature_s=float(next_value_feature_s),
+        counters=counters,
+    )
     shard = {
         "obs": torch.stack(obs_buf, dim=0),
         "old_logp": torch.stack(old_logp_buf, dim=0).view(-1),
@@ -102,6 +173,7 @@ def collect_single_env_shard(
             "weights_version": int(local_ver),
             "time": float(time.time()),
             "shard_idx": int(shard_idx),
+            "timing": timing,
         },
     }
     if next_value_feature is not None:
@@ -134,9 +206,13 @@ def collect_vector_env_shards(
     last_next_obs_raw: List[Any] = [None for _ in range(int(num_envs_per_actor))]
     last_dones: List[float] = [1.0 for _ in range(int(num_envs_per_actor))]
     last_terminateds: List[float] = [1.0 for _ in range(int(num_envs_per_actor))]
+    step_records_by_env: List[List[Dict[str, float]]] = [[] for _ in range(int(num_envs_per_actor))]
+    counters_by_env: List[Dict[str, int]] = [{"done_count": 0, "reset_count": 0} for _ in range(int(num_envs_per_actor))]
 
     step_count = 0
+    collect_t0 = time.perf_counter()
     while step_count < int(horizon):
+        act_t0 = time.perf_counter()
         obs_t_list = [_default_obs_tensor(obs) for obs in obs_list]
         actions0, logps, replays = agent.act_batch(
             obs_list,
@@ -144,16 +220,26 @@ def collect_vector_env_shards(
             mode_idx=mode_idx,
             mode_select=mode_select,
         )
+        act_s = float(time.perf_counter() - act_t0) / float(max(1, int(num_envs_per_actor)))
+        for i, replay in enumerate(replays):
+            _inject_external_plan_vec_env(vec_env, i, replay)
 
+        env_step_t0 = time.perf_counter()
         next_obs_list, reward_list, term_list, trunc_list, _info_list = vec_env.step(actions0)
+        env_step_s = float(time.perf_counter() - env_step_t0) / float(max(1, int(num_envs_per_actor)))
         step_done = [False for _ in range(int(num_envs_per_actor))]
         step_next_obs: List[Any] = list(next_obs_list)
+        reset_s_list = [0.0 for _ in range(int(num_envs_per_actor))]
         for i in range(int(num_envs_per_actor)):
             done = bool(term_list[i] or trunc_list[i])
             step_done[i] = done
             if done:
+                reset_t0 = time.perf_counter()
                 o2, _info2 = vec_env.reset_one(i)
+                reset_s_list[i] = float(time.perf_counter() - reset_t0)
                 next_obs_list[i] = o2
+                counters_by_env[i]["done_count"] += 1
+                counters_by_env[i]["reset_count"] += 1
         obs_list = next_obs_list
 
         for i in range(int(num_envs_per_actor)):
@@ -168,12 +254,33 @@ def collect_vector_env_shards(
             last_next_obs_raw[i] = step_next_obs[i]
             last_dones[i] = 1.0 if step_done[i] else 0.0
             last_terminateds[i] = 1.0 if bool(term_list[i]) else 0.0
+            step_timing: Dict[str, float] = {
+                "act_s": float(act_s),
+                "env_step_s": float(env_step_s),
+            }
+            step_timing.update(extract_env_timing(_info_list[i]))
+            if step_done[i]:
+                step_timing["env_reset_s"] = float(reset_s_list[i])
+            step_records_by_env[i].append(step_timing)
 
         step_count += 1
 
     shards: List[Dict[str, Any]] = []
     for i in range(int(num_envs_per_actor)):
         next_obs_t = last_next_obs_ts[i] if last_next_obs_ts[i] is not None else _default_obs_tensor(obs_list[i])
+        next_value_feature_t0 = time.perf_counter()
+        next_value_feature = _next_value_feature(
+            agent,
+            last_next_obs_raw[i] if last_next_obs_raw[i] is not None else obs_list[i],
+        )
+        next_value_feature_s = float(time.perf_counter() - next_value_feature_t0)
+        timing = build_rollout_timing(
+            horizon=int(horizon),
+            step_records=step_records_by_env[i],
+            collect_shard_s=float(time.perf_counter() - collect_t0),
+            next_value_feature_s=float(next_value_feature_s),
+            counters=counters_by_env[i],
+        )
         shards.append(
             {
                 "obs": torch.stack(obs_bufs[i], dim=0),
@@ -193,12 +300,9 @@ def collect_vector_env_shards(
                     "weights_version": int(local_ver),
                     "time": float(time.time()),
                     "shard_idx": int(shard_idx_per_env[i]),
+                    "timing": timing,
                 },
             }
-        )
-        next_value_feature = _next_value_feature(
-            agent,
-            last_next_obs_raw[i] if last_next_obs_raw[i] is not None else obs_list[i],
         )
         if next_value_feature is not None:
             shards[-1]["next_value_feature"] = next_value_feature

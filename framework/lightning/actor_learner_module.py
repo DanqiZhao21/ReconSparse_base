@@ -117,6 +117,15 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                 f"[learner] update={int(self._update_index())} shards={len(selected)} "
                 f"samples={n} ver={new_v} metrics={metrics}"
             )
+            self.stage_fn(
+                f"[learner] timing update={int(self._update_index())} "
+                f"collect={float(getattr(datamodule, 'current_wait_shards_s', 0.0)):.2f}s "
+                f"load={float(getattr(datamodule, 'current_load_shards_s', 0.0)):.2f}s "
+                f"prepare={float(getattr(datamodule, 'current_prepare_batch_s', 0.0)):.2f}s "
+                f"train={float(train_time_s):.2f}s save={float(save_broadcast_s):.2f}s "
+                f"update={float(update_time_s):.2f}s "
+                f"time_per_shard={float(train_time_s / float(max(1, len(selected)))):.2f}s"
+            )
 
             if self.wandb_enabled and wandb is not None:
                 global_sample_step = int(self.global_sample_step + n)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import math
 import os
 import sys
@@ -101,6 +102,18 @@ def _predict_next_pose_from_action(start_ego: np.ndarray, action: tuple[Any, ...
 
 def _yaw_from_R_xy(Rm: np.ndarray) -> float:
     return float(np.arctan2(float(Rm[1, 0]), float(Rm[0, 0])))
+
+
+def _relative_local_xyyaw(prev_pose: np.ndarray, next_pose: np.ndarray) -> np.ndarray:
+    rel = np.linalg.inv(np.asarray(prev_pose, dtype=np.float64)) @ np.asarray(next_pose, dtype=np.float64)
+    return np.asarray(
+        [
+            float(rel[0, 3]),
+            float(rel[1, 3]),
+            float(_yaw_from_R_xy(rel[:3, :3])),
+        ],
+        dtype=np.float64,
+    )
 
 
 def _local_plan_to_front_frame(start_ego: np.ndarray, traj_xyyaw: np.ndarray) -> np.ndarray:
@@ -236,6 +249,85 @@ def _load_expert_traj_front_xz(scene: int, start_frame: int, step_frames: int) -
     return np.asarray(rows, dtype=np.float64)
 
 
+def _load_expert_front_xz_for_frame(
+    scene: int,
+    start_frame: int,
+    frame_idx: int,
+    *,
+    base_data_dir: str | None = None,
+) -> np.ndarray:
+    if base_data_dir is None:
+        from reconsimulator.envs import nus_config as cfg  # type: ignore
+
+        base_data_dir = str(cfg.BASE_DATA_DIR)
+
+    scene_dir = os.path.join(str(base_data_dir), f"{int(scene):03d}")
+    ego_pose_dir = os.path.join(scene_dir, "ego_pose")
+    cam2ego0_path = os.path.join(scene_dir, "cam2ego", "0.txt")
+
+    ego0_world = np.asarray(np.loadtxt(os.path.join(ego_pose_dir, f"{int(start_frame):03d}.txt")), dtype=np.float64)
+    cam2ego0 = np.asarray(np.loadtxt(cam2ego0_path), dtype=np.float64)
+    camera_front_start = ego0_world @ cam2ego0
+    inv_front = np.linalg.inv(camera_front_start)
+
+    T_ego_world = np.asarray(np.loadtxt(os.path.join(ego_pose_dir, f"{int(frame_idx):03d}.txt")), dtype=np.float64)
+    T_front = inv_front @ T_ego_world
+    return np.asarray([float(T_front[0, 3]), float(T_front[2, 3])], dtype=np.float64)
+
+
+def _append_online_expert_xz(target: List[List[float]], expert_front_xz: np.ndarray) -> None:
+    arr = np.asarray(expert_front_xz, dtype=np.float64).reshape(2)
+    target.append([float(arr[0]), float(arr[1])])
+
+
+def _build_online_step_stats_paths(traj_plot_path: str) -> Dict[str, str]:
+    traj_plot_abs = os.path.abspath(str(traj_plot_path))
+    root, _ext = os.path.splitext(traj_plot_abs)
+    suffix = "_expert_vs_ego_traj"
+    if root.endswith(suffix):
+        prefix = root[: -len(suffix)]
+    else:
+        prefix = root
+    return {
+        "per_step_csv": f"{prefix}_online_step_summary.csv",
+        "aggregate_csv": f"{prefix}_online_step_aggregate.csv",
+        "rollout_csv": f"{prefix}_online_rollout_points.csv",
+        "overlay_svg": f"{prefix}_online_rollout_overlay.svg",
+        "error_hist_svg": f"{prefix}_online_error_hist.svg",
+        "worst_svg": f"{prefix}_online_worst_steps.svg",
+    }
+
+
+def _load_scene99_step_summary_module() -> Any:
+    module_path = os.path.join(_REPO_ROOT, "outputs", "visualize", "debug_tracker_scene099", "summarize_scene99_tracker_steps.py")
+    spec = importlib.util.spec_from_file_location("summarize_scene99_tracker_steps", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load scene99 summary module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _save_online_rollout_points_csv(rows: List[Dict[str, float | int]], out_path: str) -> None:
+    _ensure_parent(out_path)
+    fieldnames = list(rows[0].keys()) if rows else []
+    with open(out_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _step_marker_indices(num_points: int, every: int = 5) -> List[int]:
+    if num_points <= 0:
+        return []
+    every_n = max(1, int(every))
+    indices = list(range(0, int(num_points), every_n))
+    last_idx = int(num_points) - 1
+    if indices[-1] != last_idx:
+        indices.append(last_idx)
+    return indices
+
+
 def _save_traj_plot_xz(scene: int, expert_xz: np.ndarray, ego_xz: np.ndarray, out_path: str) -> bool:
     try:
         import matplotlib.pyplot as plt
@@ -254,7 +346,33 @@ def _save_traj_plot_xz(scene: int, expert_xz: np.ndarray, ego_xz: np.ndarray, ou
     ax.plot(ego_xz[:, 0], ego_xz[:, 1], color="#d62728", linewidth=2.0, label="ego")
     ax.scatter(expert_xz[0, 0], expert_xz[0, 1], color="#1f77b4", s=28)
     ax.scatter(ego_xz[0, 0], ego_xz[0, 1], color="#d62728", s=28)
-    ax.set_title(f"Scene {scene:03d}: SparseDriveV2 Expert vs Ego (front-frame XZ)")
+    for step_idx in _step_marker_indices(expert_xz.shape[0], every=5):
+        x_val = float(expert_xz[step_idx, 0])
+        z_val = float(expert_xz[step_idx, 1])
+        ax.scatter([x_val], [z_val], color="#1f77b4", s=34, marker="o")
+        ax.annotate(
+            f"step {step_idx}",
+            (x_val, z_val),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=7,
+            color="#1f77b4",
+            alpha=0.95,
+        )
+    for step_idx in _step_marker_indices(ego_xz.shape[0], every=5):
+        x_val = float(ego_xz[step_idx, 0])
+        z_val = float(ego_xz[step_idx, 1])
+        ax.scatter([x_val], [z_val], color="#d62728", s=38, marker="^")
+        ax.annotate(
+            f"step {step_idx}",
+            (x_val, z_val),
+            xytext=(4, -10),
+            textcoords="offset points",
+            fontsize=7,
+            color="#d62728",
+            alpha=0.95,
+        )
+    ax.set_title(f"Scene {scene:03d}: SparseDriveV2 Expert vs Ego (front-frame XZ, markers every 5 steps)")
     ax.set_xlabel("x (right +)")
     ax.set_ylabel("z (forward/north +)")
     ax.set_aspect("equal", adjustable="box")
@@ -354,9 +472,21 @@ def main() -> None:
 
     rows: List[Dict[str, float | int]] = []
     ego_xz: List[List[float]] = []
+    expert_xz_online: List[List[float]] = []
+    online_summary_rows: List[Dict[str, float | int]] = []
+    online_rollout_rows: List[Dict[str, float | int]] = []
 
     start_pose = np.asarray(getattr(sim, "start_ego"), dtype=np.float64)
     ego_xz.append([float(start_pose[0, 3]), float(start_pose[2, 3])])
+    try:
+        start_frame_expert_xz = _load_expert_front_xz_for_frame(
+            scene=scene,
+            start_frame=int(args.start_frame),
+            frame_idx=int(args.start_frame),
+        )
+        _append_online_expert_xz(expert_xz_online, start_frame_expert_xz)
+    except Exception as e:
+        print(f"[traj-online] failed to load expert start pose: {e}")
 
     done = False
     steps = 0
@@ -417,13 +547,70 @@ def main() -> None:
         err_xz = float(np.linalg.norm(pred_xz - real_xz, ord=2))
 
         frame_after = int(getattr(sim, "now_frame", -1))
+        tracked_first_local = np.asarray(getattr(sim, "_tracked_first_step_xyyaw", np.zeros((3,), dtype=np.float64)), dtype=np.float64).reshape(3)
+        executed_first_local = np.asarray(
+            getattr(sim, "_executed_first_step_xyyaw", tracked_first_local),
+            dtype=np.float64,
+        ).reshape(3)
+        tracked_rollout = np.asarray(getattr(sim, "_tracked_rollout_local_xyyaw", np.zeros((0, 3), dtype=np.float64)), dtype=np.float64)
+        actual_local = _relative_local_xyyaw(start_ego, pose_after)
+        tracked_first_front = _local_plan_to_front_frame(start_ego, tracked_first_local.reshape(1, 3))[0]
+        try:
+            expert_after_xz = _load_expert_front_xz_for_frame(
+                scene=scene,
+                start_frame=int(args.start_frame),
+                frame_idx=int(frame_after),
+            )
+            _append_online_expert_xz(expert_xz_online, expert_after_xz)
+        except Exception as e:
+            print(f"[traj-online] failed to load expert pose for frame={frame_after}: {e}")
+            expert_after_xz = np.asarray([np.nan, np.nan], dtype=np.float64)
         cmd_obs, vel_obs, acc_obs = _extract_status_from_obs(obs)
         cmd_ds, vel_ds, acc_ds = _dataset_status_from_sim(sim, frame_after)
+
+        online_summary_rows.append(
+            {
+                "step": int(steps),
+                "frame_before": int(now_frame),
+                "frame_after": int(frame_after),
+                "plan_tracked_xy_err": float(np.linalg.norm(traj_xyyaw[0, :2] - tracked_first_local[:2])),
+                "tracked_executed_xy_err": float(np.linalg.norm(tracked_first_local[:2] - executed_first_local[:2])),
+                "plan_actual_front_xz_err": float(np.linalg.norm(pred_xz - real_xz, ord=2)),
+                "tracked_actual_front_xz_err": float(np.linalg.norm(tracked_first_front[[0, 2]] - np.asarray([real_xz[0], real_xz[1]], dtype=np.float64), ord=2)),
+                "expert_actual_front_xz_err": float(np.linalg.norm(expert_after_xz - real_xz, ord=2)) if np.isfinite(expert_after_xz).all() else float("nan"),
+                "tracked_local_x": float(tracked_first_local[0]),
+                "tracked_local_y": float(tracked_first_local[1]),
+                "tracked_local_yaw": float(tracked_first_local[2]),
+                "executed_local_x": float(executed_first_local[0]),
+                "executed_local_y": float(executed_first_local[1]),
+                "executed_local_yaw": float(executed_first_local[2]),
+                "actual_local_x": float(actual_local[0]),
+                "actual_local_y": float(actual_local[1]),
+                "actual_local_yaw": float(actual_local[2]),
+            }
+        )
+        for pt_idx in range(int(traj_xyyaw.shape[0])):
+            tracked_pt = tracked_rollout[pt_idx] if tracked_rollout.ndim == 2 and pt_idx < tracked_rollout.shape[0] else np.asarray([np.nan, np.nan, np.nan], dtype=np.float64)
+            online_rollout_rows.append(
+                {
+                    "step": int(steps),
+                    "point_idx": int(pt_idx),
+                    "plan_local_x": float(traj_xyyaw[pt_idx, 0]),
+                    "plan_local_y": float(traj_xyyaw[pt_idx, 1]),
+                    "plan_local_yaw": float(traj_xyyaw[pt_idx, 2]),
+                    "tracked_local_x": float(tracked_pt[0]),
+                    "tracked_local_y": float(tracked_pt[1]),
+                    "tracked_local_yaw": float(tracked_pt[2]),
+                }
+            )
         
         print(
             "[pose-check-v2] "
             f"step={steps} frame={now_frame} "
             f"action(dx,dy,dyaw)=({float(action[0]):.6f},{float(action[1]):.6f},{float(action[2]):.6f}) "
+            f"tracked_first_local=({tracked_first_local[0]:.6f},{tracked_first_local[1]:.6f},{tracked_first_local[2]:.6f}) "
+            f"executed_first_local=({executed_first_local[0]:.6f},{executed_first_local[1]:.6f},{executed_first_local[2]:.6f}) "
+            f"actual_local=({actual_local[0]:.6f},{actual_local[1]:.6f},{actual_local[2]:.6f}) "
             f"pred_src=plan_first_point "
             f"pred_next_xz=({pred_xz[0]:.6f},{pred_xz[1]:.6f}) "
             f"real_next_xz=({real_xz[0]:.6f},{real_xz[1]:.6f}) "
@@ -466,28 +653,43 @@ def main() -> None:
         w.writeheader()
         w.writerows(rows)
 
-    try:
-        expert_xz = _load_expert_traj_front_xz(
-            scene=scene,
-            start_frame=int(args.start_frame),
-            step_frames=int(args.step_frames),
-        )
-    except Exception as e:
-        print(f"[traj-plot] failed to load expert ego2world trajectory: {e}")
-        expert_xz = np.zeros((0, 2), dtype=np.float64)
-
     ego_xz_np = np.asarray(ego_xz, dtype=np.float64)
+    expert_xz_np = np.asarray(expert_xz_online, dtype=np.float64)
     print(f"[traj-v2] ego_xz shape={ego_xz_np.shape}")
     print(np.array2string(ego_xz_np, precision=6, suppress_small=False))
-    print(f"[traj-v2] expert_xz shape={expert_xz.shape}")
-    print(np.array2string(expert_xz, precision=6, suppress_small=False))
+    print(f"[traj-v2-online] expert_xz shape={expert_xz_np.shape}")
+    print(np.array2string(expert_xz_np, precision=6, suppress_small=False))
 
-    if expert_xz.shape[0] >= 2 and ego_xz_np.shape[0] >= 2:
-        saved = _save_traj_plot_xz(scene=scene, expert_xz=expert_xz, ego_xz=ego_xz_np, out_path=traj_plot)
+    if expert_xz_np.shape[0] >= 2 and ego_xz_np.shape[0] >= 2:
+        saved = _save_traj_plot_xz(scene=scene, expert_xz=expert_xz_np, ego_xz=ego_xz_np, out_path=traj_plot)
         if saved:
             print(f"traj_plot_saved={traj_plot}")
     else:
-        print("[traj-plot] skip export due to insufficient trajectory points")
+        print("[traj-plot] skip export due to insufficient online trajectory points")
+
+    try:
+        stats_paths = _build_online_step_stats_paths(traj_plot)
+        stats_module = _load_scene99_step_summary_module()
+        rollout_by_step = stats_module.build_step_rollout_arrays(online_rollout_rows)
+        per_step_rows, aggregate = stats_module.summarize_step_tracking(online_summary_rows, rollout_by_step)
+        stats_module._save_csv_rows(per_step_rows, stats_paths["per_step_csv"])
+        stats_module._save_csv_row(aggregate, stats_paths["aggregate_csv"])
+        _save_online_rollout_points_csv(online_rollout_rows, stats_paths["rollout_csv"])
+        stats_module._save_overlay_plot(rollout_by_step, stats_paths["overlay_svg"])
+        stats_module._save_error_hist_plot(per_step_rows, stats_paths["error_hist_svg"])
+        stats_module._save_worst_cases_plot(rollout_by_step, per_step_rows, stats_paths["worst_svg"])
+        print(f"[online-step-stats] num_steps={int(aggregate['num_steps'])}")
+        print(f"[online-step-stats] mean_first_point_plan_tracked_xy_err_m={float(aggregate['mean_first_point_plan_tracked_xy_err_m']):.9f}")
+        print(f"[online-step-stats] mean_rollout_mean_xy_err_m={float(aggregate['mean_rollout_mean_xy_err_m']):.9f}")
+        print(f"[online-step-stats] mean_expert_actual_front_xz_err_m={float(aggregate['mean_expert_actual_front_xz_err_m']):.9f}")
+        print(f"online_step_summary_saved={stats_paths['per_step_csv']}")
+        print(f"online_step_aggregate_saved={stats_paths['aggregate_csv']}")
+        print(f"online_rollout_points_saved={stats_paths['rollout_csv']}")
+        print(f"online_rollout_overlay_saved={stats_paths['overlay_svg']}")
+        print(f"online_error_hist_saved={stats_paths['error_hist_svg']}")
+        print(f"online_worst_steps_saved={stats_paths['worst_svg']}")
+    except Exception as e:
+        print(f"[online-step-stats] failed to export online stats: {e}")
 
     print(f"done={done} steps={steps} frames={frames}")
     print(f"video_saved={out_path}")

@@ -36,6 +36,28 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export TORCH_EXTENSIONS_DIR="$REPO_ROOT/.cache/torch_extensions"
 mkdir -p "$TORCH_EXTENSIONS_DIR"
 
+cleanup_stale_nvdiffrast_lock() {
+  local build_dir="$TORCH_EXTENSIONS_DIR/nvdiffrast_plugin"
+  local lock_file="$build_dir/lock"
+  local ninja_lock="$build_dir/.ninja_lock"
+  if [[ ! -f "$lock_file" ]]; then
+    return 0
+  fi
+
+  local active_build
+  active_build=$(ps -eo cmd= | grep -E '(^|[ /])(nvcc|gcc|g\+\+|c\+\+|ninja)( |$)' | grep 'nvdiffrast_plugin' || true)
+  if [[ -n "$active_build" ]]; then
+    echo "[generate_video_sparsedrive_v2.sh] nvdiffrast build lock present and active compiler process detected; keeping lock"
+    return 0
+  fi
+
+  echo "[generate_video_sparsedrive_v2.sh] removing stale nvdiffrast build lock: $lock_file"
+  rm -f "$lock_file"
+  rm -f "$ninja_lock"
+}
+
+cleanup_stale_nvdiffrast_lock
+
 # Ensure repo and SparseDriveV2 are importable
 export PYTHONPATH="$REPO_ROOT:$SPARSEDRIVE_V2_ROOT:${PYTHONPATH:-}"
 

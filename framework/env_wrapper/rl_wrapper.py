@@ -63,6 +63,18 @@ class RLReconEnv:
         self._env_cache: Dict[int, Dict[str, Any]] = {}
         self._env_cache_keys: list[int] = []
 
+    def set_external_plan_local_xyyaw(self, plan: Any) -> None:
+        if plan is None:
+            self.env._external_plan_local_xyyaw = None
+            return
+
+        arr = np.asarray(plan, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] < 3:
+            self.env._external_plan_local_xyyaw = None
+            return
+
+        self.env._external_plan_local_xyyaw = np.asarray(arr[:, :3], dtype=np.float64).copy()
+
     def reset(
         self,
         scene: int | None = None,
@@ -370,4 +382,3 @@ class RLReconEnv:
         except Exception:
             pass
         return float(reward_result.reward), reward_result.info
-

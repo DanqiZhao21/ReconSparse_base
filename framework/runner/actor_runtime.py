@@ -17,6 +17,7 @@ from framework.io.buffer import (
     wait_for_version,
 )
 from framework.rollout import collect_single_env_shard, collect_vector_env_shards
+from framework.rollout.timing import format_rollout_timing_summary
 from framework.runner.agent_factory import build_agent
 from framework.runner.env_factory import build_actor_env
 from framework.runner.logging import stage
@@ -100,11 +101,13 @@ def actor_main(
                         return
                     time.sleep(poll_s)
             reserve = 1
+            backpressure_wait_t0 = time.perf_counter()
             while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
                 if stop_requested(paths):
                     stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
                     return
                 time.sleep(poll_s)
+            backpressure_wait_s = float(time.perf_counter() - backpressure_wait_t0)
 
             cur_ver = read_int(paths.version_file, default=0)
             if cur_ver > local_ver and os.path.exists(paths.latest_ckpt):
@@ -130,8 +133,16 @@ def actor_main(
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=1):
                 break
             name = f"actor{actor_id}_e0_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
+            timing = dict(((shard.get("meta", {}) or {}).get("timing", {}) or {}))
+            timing["backpressure_wait_s"] = float(backpressure_wait_s)
+            if isinstance(shard.get("meta", None), dict):
+                shard["meta"]["timing"] = dict(timing)
+            save_t0 = time.perf_counter()
             atomic_torch_save(shard, os.path.join(paths.shards_dir, name))
-            stage(f"[actor{actor_id}] wrote shard {shard_idx} horizon={horizon} ver={local_ver}")
+            timing["save_shard_s"] = float(time.perf_counter() - save_t0)
+            timing_summary = format_rollout_timing_summary(timing)
+            suffix = f" {timing_summary}" if timing_summary else ""
+            stage(f"[actor{actor_id}] wrote shard {shard_idx} horizon={horizon} ver={local_ver}{suffix}")
             shard_idx += 1
             if mode.startswith("sync"):
                 wait_for_version(paths, min_version=int(local_ver) + 1, poll_s=poll_s, timeout_s=None, stop_file=paths.stop_file)
@@ -152,11 +163,13 @@ def actor_main(
                 stage(f"[actor{actor_id}] stop requested; exiting")
                 break
             reserve = max(1, int(num_envs_per_actor))
+            backpressure_wait_t0 = time.perf_counter()
             while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
                 if stop_requested(paths):
                     stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
                     return
                 time.sleep(poll_s)
+            backpressure_wait_s = float(time.perf_counter() - backpressure_wait_t0)
             cur_ver = read_int(paths.version_file, default=0)
             if cur_ver > local_ver and os.path.exists(paths.latest_ckpt):
                 try:
@@ -183,8 +196,16 @@ def actor_main(
                 break
             for i, shard in enumerate(shards):
                 name = f"actor{actor_id}_e{i}_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
+                timing = dict(((shard.get("meta", {}) or {}).get("timing", {}) or {}))
+                timing["backpressure_wait_s"] = float(backpressure_wait_s)
+                if isinstance(shard.get("meta", None), dict):
+                    shard["meta"]["timing"] = dict(timing)
+                save_t0 = time.perf_counter()
                 atomic_torch_save(shard, os.path.join(paths.shards_dir, name))
-                stage(f"[actor{actor_id}] wrote shard env={i} idx={shard_idx_per_env[i]} horizon={horizon} ver={local_ver}")
+                timing["save_shard_s"] = float(time.perf_counter() - save_t0)
+                timing_summary = format_rollout_timing_summary(timing)
+                suffix = f" {timing_summary}" if timing_summary else ""
+                stage(f"[actor{actor_id}] wrote shard env={i} idx={shard_idx_per_env[i]} horizon={horizon} ver={local_ver}{suffix}")
                 shard_idx_per_env[i] += 1
             if mode.startswith("sync"):
                 wait_for_version(paths, min_version=int(local_ver) + 1, poll_s=poll_s, timeout_s=None, stop_file=paths.stop_file)

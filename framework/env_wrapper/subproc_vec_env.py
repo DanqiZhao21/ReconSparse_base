@@ -85,6 +85,9 @@ class SceneSamplingEnv:
     def env(self) -> RLReconEnv:
         return self._env
 
+    def set_external_plan_local_xyyaw(self, plan: Any) -> None:
+        self._env.set_external_plan_local_xyyaw(plan)
+
     def _pick_scene_id(self) -> int:
         if len(self._scene_ids) == 0:
             return int(self._current_scene)
