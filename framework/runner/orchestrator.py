@@ -6,7 +6,7 @@ import sys
 import time
 from typing import Any, Dict, List
 
-from framework.io.buffer import BufferPaths, ensure_buffer_layout
+from framework.io.buffer import BufferPaths, actor_failure_flag_path, ensure_buffer_layout, write_actor_failure
 from framework.runner.config_normalization import resolve_actor_gpu_ids
 from framework.runner.launch_env import build_launch_env
 from framework.runner.logging import stage
@@ -58,6 +58,7 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
     learner_cmd = [py, entry, "--config", str(config_path), "--role", "learner"]
     learner_proc = subprocess.Popen(learner_cmd, env=learner_env)
     actor_procs: List[subprocess.Popen] = []
+    reported_actor_exits: set[int] = set()
     try:
         for aid in range(num_actors):
             gpu_id = int(actor_gpu_plan[aid]) if aid < len(actor_gpu_plan) else -1
@@ -86,6 +87,15 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
             for i, proc in enumerate(actor_procs):
                 pret = proc.poll()
                 if pret is not None and pret != 0:
+                    if int(i) in reported_actor_exits:
+                        continue
+                    reported_actor_exits.add(int(i))
+                    if not os.path.exists(actor_failure_flag_path(paths, int(i))):
+                        write_actor_failure(
+                            paths,
+                            int(i),
+                            message=f"orchestrator observed actor exit code={int(pret)}",
+                        )
                     stage(f"[orchestrator] actor{i} exited early code={pret}")
             time.sleep(2.0)
     finally:

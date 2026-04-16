@@ -86,6 +86,20 @@ def normalize_actor_learner_cfg(cfg: Dict[str, Any]) -> None:
     if auto_inflight is None:
         auto_inflight = bool(len(actor_gpu_pool) > 0 and actors_per_gpu_i > 0)
 
+    num_envs_per_actor = int(al_cfg.get("num_envs_per_actor", 1))
+    if num_envs_per_actor <= 0:
+        raise ValueError(f"num_envs_per_actor must be >= 1, got {num_envs_per_actor}")
+    al_cfg["num_envs_per_actor"] = int(num_envs_per_actor)
+
+    vec_env_mode = str(al_cfg.get("vec_env_mode", "serial")).strip().lower()
+    if vec_env_mode not in {"serial", "subproc"}:
+        raise ValueError(f"vec_env_mode must be 'serial' or 'subproc', got {vec_env_mode!r}")
+    al_cfg["vec_env_mode"] = str(vec_env_mode)
+
+    cur_inflight = al_cfg.get("max_inflight_per_actor", None)
+    if cur_inflight is not None and int(cur_inflight) < int(num_envs_per_actor):
+        al_cfg["max_inflight_per_actor"] = int(num_envs_per_actor)
+
     if bool(auto_inflight):
         shards_per_update = int(al_cfg.get("shards_per_update", al_cfg.get("num_actors", 1)))
         num_actors = int(al_cfg.get("num_actors", 0))
@@ -93,7 +107,9 @@ def normalize_actor_learner_cfg(cfg: Dict[str, Any]) -> None:
             ids = _list_int(al_cfg.get("actor_gpu_ids", None))
             num_actors = int(len(ids)) if len(ids) > 0 else 1
             al_cfg["num_actors"] = int(num_actors)
-        required = max(1, int(math.ceil(float(shards_per_update) / float(max(1, int(num_actors))))))
+        per_actor_target = max(1, int(math.ceil(float(shards_per_update) / float(max(1, int(num_actors))))))
+        env_batch = max(1, int(num_envs_per_actor))
+        required = int(env_batch * math.ceil(float(per_actor_target) / float(env_batch)))
         cur = al_cfg.get("max_inflight_per_actor", None)
         if cur is None or int(cur) < int(required):
             al_cfg["max_inflight_per_actor"] = int(required)

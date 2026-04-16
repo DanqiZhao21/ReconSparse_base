@@ -79,25 +79,25 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
 
         if self.rank == 0:
             training_lock_file = os.path.join(self.paths.root, "TRAINING_LOCK")
-            if os.path.exists(training_lock_file):
-                try:
-                    os.remove(training_lock_file)
-                except Exception:
-                    pass
-
             save_t0 = time.time()
             selected = list(getattr(datamodule, "current_selected", []))
             loaded = getattr(datamodule, "current_loaded", None)
-            for fp in selected:
-                move_to_consumed(self.paths, fp)
-            prune_consumed(self.paths, keep_basenames={os.path.basename(fp) for fp in selected})
             cur_v = read_int(self.paths.version_file, default=1)
             new_v = int(cur_v) + 1
             try:
                 self.agent.save_checkpoint(self.paths.latest_ckpt)
                 write_int(self.paths.version_file, new_v)
+                for fp in selected:
+                    move_to_consumed(self.paths, fp)
+                prune_consumed(self.paths, keep_basenames={os.path.basename(fp) for fp in selected})
+                if os.path.exists(training_lock_file):
+                    try:
+                        os.remove(training_lock_file)
+                    except Exception:
+                        pass
             except Exception as exc:
                 self.stage_fn(f"[learner] save/bump failed: {exc}")
+                raise
             save_broadcast_s = float(time.time() - save_t0)
 
             train_time_s = float(time.time() - self._update_train_t0)

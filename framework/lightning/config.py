@@ -24,6 +24,18 @@ class ActorLearnerLightningConfig:
     reverse_kl_coef: float = 0.0
     distill_temperature: float = 1.0
     teacher_ckpt: str | None = None
+    grpo_enabled: bool = False
+    grpo_config_path: str | None = None
+    grpo_coef: float = 0.0
+    grpo_num_candidates: int = 0
+    grpo_candidate_select: str = "topk"
+    grpo_norm_eps: float = 1e-6
+    grpo_use_rank_adv: bool = False
+    grpo_score_clip: float | None = None
+    grpo_debug_visualize: bool = False
+    grpo_debug_dir: str | None = None
+    grpo_debug_max_batches: int = 0
+    grpo_debug_top_k: int = 4
     dual_clip: float | None = None
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -34,8 +46,9 @@ class ActorLearnerLightningConfig:
     mode: str = "async"
     num_actors: int = 1
     shards_per_update: int = 1
+    max_inflight_per_actor: int = 1
     poll_s: float = 0.2
-    max_shard_version_gap: int = 2
+    max_shard_version_lag: int = 2
     norm_eps: float = 1e-8
     inner_epochs: int = 1
     accumulate_grad_batches: int = 1
@@ -51,6 +64,65 @@ def optimizer_config_from_algorithm(algo: Any, train_cfg: Dict[str, Any]) -> Lea
     )
 
 
+def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    shared_cfg = train_cfg.get("grpo", {}) or {}
+    if not isinstance(shared_cfg, dict):
+        shared_cfg = {}
+
+    reinforce_cfg = train_cfg.get("reinforce", {}) or {}
+    if not isinstance(reinforce_cfg, dict):
+        reinforce_cfg = {}
+    reinforcepp_cfg = train_cfg.get("reinforcepp", {}) or {}
+    if not isinstance(reinforcepp_cfg, dict):
+        reinforcepp_cfg = {}
+
+    legacy = {
+        "coef": float(reinforce_cfg.get("grpo_coef", reinforcepp_cfg.get("grpo_coef", 0.0))),
+        "num_candidates": int(reinforce_cfg.get("grpo_num_candidates", reinforcepp_cfg.get("grpo_num_candidates", 0))),
+        "candidate_select": str(
+            reinforce_cfg.get("grpo_candidate_select", reinforcepp_cfg.get("grpo_candidate_select", "topk"))
+        ),
+        "norm_eps": float(reinforce_cfg.get("grpo_norm_eps", reinforcepp_cfg.get("grpo_norm_eps", 1e-6))),
+        "use_rank_adv": bool(
+            reinforce_cfg.get("grpo_use_rank_adv", reinforcepp_cfg.get("grpo_use_rank_adv", False))
+        ),
+        "score_clip": reinforce_cfg.get("grpo_score_clip", reinforcepp_cfg.get("grpo_score_clip", None)),
+        "debug_visualize": bool(
+            reinforce_cfg.get("grpo_debug_visualize", reinforcepp_cfg.get("grpo_debug_visualize", False))
+        ),
+        "debug_dir": reinforce_cfg.get("grpo_debug_dir", reinforcepp_cfg.get("grpo_debug_dir", None)),
+        "debug_max_batches": int(
+            reinforce_cfg.get("grpo_debug_max_batches", reinforcepp_cfg.get("grpo_debug_max_batches", 0))
+        ),
+        "debug_top_k": int(reinforce_cfg.get("grpo_debug_top_k", reinforcepp_cfg.get("grpo_debug_top_k", 4))),
+    }
+
+    config_path = shared_cfg.get("config_path", None)
+    if config_path is not None and str(config_path).strip() != "":
+        raise NotImplementedError(
+            "train.grpo.config_path is reserved for future external-yaml merging and is not supported yet"
+        )
+
+    shared_present = len(shared_cfg) > 0
+    resolved = {
+        "enabled": bool(shared_cfg.get("enable", legacy["coef"] > 0.0)) if shared_present else bool(legacy["coef"] > 0.0),
+        "config_path": None if config_path is None else str(config_path),
+        "coef": float(shared_cfg.get("coef", legacy["coef"])) if shared_present else float(legacy["coef"]),
+        "num_candidates": int(shared_cfg.get("num_candidates", legacy["num_candidates"])) if shared_present else int(legacy["num_candidates"]),
+        "candidate_select": str(shared_cfg.get("candidate_select", legacy["candidate_select"])) if shared_present else str(legacy["candidate_select"]),
+        "norm_eps": float(shared_cfg.get("norm_eps", legacy["norm_eps"])) if shared_present else float(legacy["norm_eps"]),
+        "use_rank_adv": bool(shared_cfg.get("use_rank_adv", legacy["use_rank_adv"])) if shared_present else bool(legacy["use_rank_adv"]),
+        "score_clip": shared_cfg.get("score_clip", legacy["score_clip"]) if shared_present else legacy["score_clip"],
+        "debug_visualize": bool(shared_cfg.get("debug_visualize", legacy["debug_visualize"])) if shared_present else bool(legacy["debug_visualize"]),
+        "debug_dir": shared_cfg.get("debug_dir", legacy["debug_dir"]) if shared_present else legacy["debug_dir"],
+        "debug_max_batches": int(shared_cfg.get("debug_max_batches", legacy["debug_max_batches"])) if shared_present else int(legacy["debug_max_batches"]),
+        "debug_top_k": int(shared_cfg.get("debug_top_k", legacy["debug_top_k"])) if shared_present else int(legacy["debug_top_k"]),
+    }
+    if not bool(resolved["enabled"]):
+        resolved["coef"] = 0.0
+    return resolved
+
+
 def actor_learner_lightning_config_from_algorithm(
     algo: Any,
     *,
@@ -59,6 +131,8 @@ def actor_learner_lightning_config_from_algorithm(
     algo_meta: Dict[str, Any],
 ) -> ActorLearnerLightningConfig:
     algo_kind = str(algo_meta.get("algo_key", getattr(algo, "variant", "ppo")))
+    grpo_cfg = resolve_grpo_config(train_cfg)
+    raw_max_shard_version_lag = actor_learner_cfg.get("max_shard_version_lag", 2)
     raw_max_updates = actor_learner_cfg.get("max_updates", train_cfg.get("updates", 50))
     inner_epochs = int(
         getattr(
@@ -80,6 +154,18 @@ def actor_learner_lightning_config_from_algorithm(
         reverse_kl_coef=float(getattr(algo, "reverse_kl_coef", 0.0)),
         distill_temperature=float(getattr(algo, "distill_temperature", 1.0)),
         teacher_ckpt=getattr(algo, "teacher_ckpt", None),
+        grpo_enabled=bool(grpo_cfg["enabled"]),
+        grpo_config_path=grpo_cfg["config_path"],
+        grpo_coef=float(grpo_cfg["coef"]),
+        grpo_num_candidates=int(grpo_cfg["num_candidates"]),
+        grpo_candidate_select=str(grpo_cfg["candidate_select"]),
+        grpo_norm_eps=float(grpo_cfg["norm_eps"]),
+        grpo_use_rank_adv=bool(grpo_cfg["use_rank_adv"]),
+        grpo_score_clip=grpo_cfg["score_clip"],
+        grpo_debug_visualize=bool(grpo_cfg["debug_visualize"]),
+        grpo_debug_dir=grpo_cfg["debug_dir"],
+        grpo_debug_max_batches=int(grpo_cfg["debug_max_batches"]),
+        grpo_debug_top_k=int(grpo_cfg["debug_top_k"]),
         dual_clip=getattr(algo, "dual_clip", None),
         gamma=float(train_cfg.get("gamma", 0.99)),
         gae_lambda=float(train_cfg.get("gae_lambda", 0.95)),
@@ -90,8 +176,9 @@ def actor_learner_lightning_config_from_algorithm(
         mode=str(actor_learner_cfg.get("mode", "async")).strip().lower(),
         num_actors=int(actor_learner_cfg.get("num_actors", 1)),
         shards_per_update=int(actor_learner_cfg.get("shards_per_update", actor_learner_cfg.get("num_actors", 1))),
+        max_inflight_per_actor=int(actor_learner_cfg.get("max_inflight_per_actor", 1)),
         poll_s=float(actor_learner_cfg.get("poll_interval_s", 0.2)),
-        max_shard_version_gap=int(actor_learner_cfg.get("max_shard_version_gap", 2)),
+        max_shard_version_lag=int(raw_max_shard_version_lag),
         norm_eps=float(algo_meta.get("rpp_norm_eps", 1e-8)),
         inner_epochs=max(1, int(inner_epochs)),
         accumulate_grad_batches=int(
@@ -132,5 +219,6 @@ __all__ = [
     "LearnerOptimizerConfig",
     "actor_learner_lightning_config_from_algorithm",
     "optimizer_config_from_algorithm",
+    "resolve_grpo_config",
     "trainer_kwargs_from_learner_config",
 ]

@@ -25,6 +25,16 @@ class ReinforcePP(Algorithm):
         reverse_kl_coef: float = 0.0,
         distill_temperature: float = 1.0,
         teacher_ckpt: str | None = None,
+        grpo_coef: float = 0.0,
+        grpo_num_candidates: int = 0,
+        grpo_candidate_select: str = "topk",
+        grpo_norm_eps: float = 1e-6,
+        grpo_use_rank_adv: bool = False,
+        grpo_score_clip: float | None = None,
+        grpo_debug_visualize: bool = False,
+        grpo_debug_dir: str | None = None,
+        grpo_debug_max_batches: int = 0,
+        grpo_debug_top_k: int = 4,
     ):
         self.clip_eps = float(clip_eps)
         self.kl_coef = float(kl_coef)
@@ -42,3 +52,13 @@ class ReinforcePP(Algorithm):
         self.reverse_kl_coef = float(reverse_kl_coef)
         self.distill_temperature = float(distill_temperature)
         self.teacher_ckpt = None if teacher_ckpt is None else str(teacher_ckpt)
+        self.grpo_coef = float(grpo_coef)
+        self.grpo_num_candidates = int(grpo_num_candidates)
+        self.grpo_candidate_select = str(grpo_candidate_select)
+        self.grpo_norm_eps = float(grpo_norm_eps)
+        self.grpo_use_rank_adv = bool(grpo_use_rank_adv)
+        self.grpo_score_clip = None if grpo_score_clip is None else float(grpo_score_clip)
+        self.grpo_debug_visualize = bool(grpo_debug_visualize)
+        self.grpo_debug_dir = None if grpo_debug_dir is None else str(grpo_debug_dir)
+        self.grpo_debug_max_batches = int(grpo_debug_max_batches)
+        self.grpo_debug_top_k = int(grpo_debug_top_k)

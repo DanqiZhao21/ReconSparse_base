@@ -7,10 +7,11 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from framework.batch import build_training_batch
-from framework.io.buffer import BufferPaths, list_shards, read_int, stop_requested
+from framework.io.buffer import BufferPaths, list_failed_actor_ids, list_shards, read_int, stop_requested
 from framework.io.shard_policy import (
     discard_incompatible_shards,
     discard_stale_shards,
+    resolve_async_shards_per_update,
     select_shards_for_update,
 )
 from framework.lightning.config import ActorLearnerLightningConfig
@@ -65,8 +66,9 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
         self.mode = str(learner_config.mode).strip().lower()
         self.num_actors = int(learner_config.num_actors)
         self.shards_per_update = int(learner_config.shards_per_update)
+        self.max_inflight_per_actor = int(getattr(learner_config, "max_inflight_per_actor", 1))
         self.poll_s = float(learner_config.poll_s)
-        self.max_shard_version_gap = int(learner_config.max_shard_version_gap)
+        self.max_shard_version_lag = int(learner_config.max_shard_version_lag)
         self.norm_eps = float(learner_config.norm_eps)
         self.inner_epochs = max(1, int(learner_config.inner_epochs))
         self.stage_fn = stage_fn
@@ -104,13 +106,14 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
             while True:
                 if stop_requested(self.paths):
                     break
+                failed_actor_ids = list_failed_actor_ids(self.paths) if self.mode.startswith("async") else []
                 cur_ver_now = read_int(self.paths.version_file, default=self.start_version)
                 self.current_weights_version = int(cur_ver_now)
                 files = discard_stale_shards(
                     self.paths,
                     list_shards(self.paths),
                     cur_weights_version=int(cur_ver_now),
-                    max_version_gap=int(self.max_shard_version_gap),
+                    max_version_lag=int(self.max_shard_version_lag),
                 )
                 files = discard_incompatible_shards(
                     self.paths,
@@ -118,18 +121,33 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                     agent=self.agent,
                     stage_fn=self.stage_fn,
                 )
+                effective_shards_per_update = int(self.shards_per_update)
+                if self.mode.startswith("async"):
+                    effective_shards_per_update = resolve_async_shards_per_update(
+                        requested_shards_per_update=int(self.shards_per_update),
+                        num_actors=int(self.num_actors),
+                        max_inflight_per_actor=int(self.max_inflight_per_actor),
+                        failed_actor_ids=list(failed_actor_ids),
+                    )
+                    if effective_shards_per_update <= 0:
+                        selected = []
+                        break
                 selected = select_shards_for_update(
                     files,
                     mode=self.mode,
                     num_actors=self.num_actors,
-                    shards_per_update=self.shards_per_update,
+                    shards_per_update=effective_shards_per_update,
                 )
                 if len(selected) > 0:
                     break
                 if time.time() - float(last_progress_t) >= 300.0:
                     last_progress_t = float(time.time())
+                    failed_suffix = ""
+                    if len(failed_actor_ids) > 0:
+                        failed_suffix = f" failed_actors={failed_actor_ids}"
                     self.stage_fn(
-                        f"[learner] stage1 collect: have_shards={len(files)}/{max(1, int(self.shards_per_update))} (dir={self.paths.shards_dir})"
+                        f"[learner] stage1 collect: have_shards={len(files)}/{max(1, int(effective_shards_per_update))}"
+                        f"{failed_suffix} (dir={self.paths.shards_dir})"
                     )
                 time.sleep(self.poll_s)
             self.current_wait_shards_s = float(time.time() - wait_t0)

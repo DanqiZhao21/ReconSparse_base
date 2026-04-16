@@ -117,11 +117,7 @@ def get_splat(device: str, scene: int, *, use_cache: bool = True):
 
 
 # ----------------------------- 视锥采样 ----------------------------- #
-def get_sky_view(c2w: torch.Tensor,
-                 intrinsics: torch.Tensor,
-                 device: str,
-                 img_height: int,
-                 img_width: int):
+def _pixel_grid(device: str, img_height: int, img_width: int) -> tuple[torch.Tensor, torch.Tensor]:
     try:
         x, y = torch.meshgrid(
             torch.arange(img_width, device=device),
@@ -132,15 +128,62 @@ def get_sky_view(c2w: torch.Tensor,
         x = torch.arange(img_width, device=device)
         y = torch.arange(img_height, device=device)
         x, y = torch.meshgrid(x, y)
+    return x.flatten(), y.flatten()
 
-    x = x.flatten()
-    y = y.flatten()
 
-    origins, viewdirs, direction_norm = get_rays(x, y, c2w, intrinsics)
+def build_sky_view_template(
+    intrinsics: torch.Tensor,
+    device: str,
+    img_height: int,
+    img_width: int,
+) -> dict[str, torch.Tensor]:
+    x, y = _pixel_grid(device, img_height, img_width)
+    if len(intrinsics.shape) == 3:
+        intrinsics = intrinsics[0]
+    camera_dirs = torch.nn.functional.pad(
+        torch.stack(
+            [
+                (x - intrinsics[0, 2] + 0.5) / intrinsics[0, 0],
+                (y - intrinsics[1, 2] + 0.5) / intrinsics[1, 1],
+            ],
+            dim=-1,
+        ),
+        (0, 1),
+        value=1.0,
+    )
+    direction_norm = torch.linalg.norm(camera_dirs, dim=-1, keepdims=True)
+    return {
+        "camera_dirs": camera_dirs,
+        "direction_norm": direction_norm,
+    }
+
+
+def get_sky_view_from_template(
+    c2w: torch.Tensor,
+    template: dict[str, torch.Tensor],
+    img_height: int,
+    img_width: int,
+):
+    camera_dirs = template["camera_dirs"]
+    direction_norm = template["direction_norm"]
+    if len(c2w.shape) == 3:
+        c2w = c2w[0]
+    directions = torch.matmul(camera_dirs, c2w[:3, :3].transpose(0, 1))
+    origins = torch.broadcast_to(c2w[:3, 3], directions.shape)
+    viewdirs = directions / (direction_norm + 1e-8)
     origins = origins.reshape(img_height, img_width, 3)
     viewdirs = viewdirs.reshape(img_height, img_width, 3)
     direction_norm = direction_norm.reshape(img_height, img_width, 1)
     return origins, viewdirs, direction_norm
+
+
+def get_sky_view(c2w: torch.Tensor,
+                 intrinsics: torch.Tensor,
+                 device: str,
+                 img_height: int,
+                 img_width: int):
+    template = build_sky_view_template(intrinsics, device, img_height, img_width)
+    return get_sky_view_from_template(c2w, template, img_height, img_width)
 
 
 def get_rays(

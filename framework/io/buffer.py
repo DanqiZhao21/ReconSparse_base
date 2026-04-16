@@ -57,6 +57,10 @@ class BufferPaths:
         return os.path.join(self.root, "weights")
 
     @property
+    def actors_dir(self) -> str:
+        return os.path.join(self.root, "actors")
+
+    @property
     def latest_ckpt(self) -> str:
         return os.path.join(self.weights_dir, "latest.ckpt")
 
@@ -80,6 +84,68 @@ def ensure_buffer_layout(paths: BufferPaths) -> None:
     _mkdir(paths.shards_dir)
     _mkdir(paths.consumed_dir)
     _mkdir(paths.weights_dir)
+    _mkdir(paths.actors_dir)
+
+
+def actor_failure_flag_path(paths: BufferPaths, actor_id: int) -> str:
+    ensure_buffer_layout(paths)
+    return os.path.join(paths.actors_dir, f"actor{int(actor_id)}.failed")
+
+
+def actor_failure_log_path(paths: BufferPaths, actor_id: int) -> str:
+    ensure_buffer_layout(paths)
+    return os.path.join(paths.actors_dir, f"actor{int(actor_id)}.log")
+
+
+def clear_actor_failure(paths: BufferPaths, actor_id: int) -> None:
+    for path in [actor_failure_flag_path(paths, actor_id), actor_failure_log_path(paths, actor_id)]:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
+def write_actor_failure(
+    paths: BufferPaths,
+    actor_id: int,
+    *,
+    message: str,
+    traceback_text: str | None = None,
+) -> str:
+    ensure_buffer_layout(paths)
+    flag_path = actor_failure_flag_path(paths, actor_id)
+    log_path = actor_failure_log_path(paths, actor_id)
+    write_ts = time.time()
+    text = f"time={write_ts:.6f}\nactor_id={int(actor_id)}\nmessage={str(message).strip()}\n"
+    if traceback_text is not None and str(traceback_text).strip():
+        text += "\ntraceback:\n"
+        text += str(traceback_text).rstrip() + "\n"
+    _mkdir(os.path.dirname(os.path.abspath(flag_path)))
+    with open(flag_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    with open(log_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return flag_path
+
+
+def list_failed_actor_ids(paths: BufferPaths) -> List[int]:
+    ensure_buffer_layout(paths)
+    failed: List[int] = []
+    try:
+        names = os.listdir(paths.actors_dir)
+    except Exception:
+        return failed
+    for name in names:
+        if not name.startswith("actor") or not name.endswith(".failed"):
+            continue
+        middle = name[len("actor") : -len(".failed")]
+        try:
+            failed.append(int(middle))
+        except Exception:
+            continue
+    failed.sort()
+    return failed
 
 
 def list_shards(paths: BufferPaths, *, suffix: str = ".pt") -> List[str]:
@@ -207,11 +273,16 @@ __all__ = [
     "atomic_torch_save",
     "count_inflight",
     "ensure_buffer_layout",
+    "actor_failure_flag_path",
+    "actor_failure_log_path",
+    "clear_actor_failure",
     "list_shards",
+    "list_failed_actor_ids",
     "move_to_consumed",
     "prune_consumed",
     "read_int",
     "stop_requested",
     "wait_for_version",
     "write_int",
+    "write_actor_failure",
 ]

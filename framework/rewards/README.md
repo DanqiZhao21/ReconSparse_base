@@ -15,9 +15,13 @@
 
 当前训练主流程使用的奖励计算核心。
 
-- 根据位置偏差、航向误差、静态和动态碰撞、纵向 jerk、航向 jerk 计算 step reward。
+- 统一使用 path-based smooth reward 计算，不再保留旧的 legacy reward 分支。
+- 把 expert clip 视作 path，而不是严格的逐时刻监督点。
+- 计算 ego 在 densify 后 path 上的投影进度 `progress_s` 和增量 `progress_delta_s`。
+- 对横向偏移 `lateral_error_m` 和路径朝向误差 `yaw_path_err_deg` 使用带死区的平滑惩罚。
+- 对纵向 jerk 和 yaw jerk 使用带死区的舒适度惩罚。
 - 在 episode 结束时，可根据 failure、timeout 或 env_done 再施加 terminal penalty。
-- 奖励输出不仅有 reward，还会把各个惩罚项写回 info，方便调试和记录。
+- 奖励输出不仅有 reward，还会把各个分项、路径指标和碰撞指标写回 info，方便调试和记录。
 
 ## 训练时如何经过这里
 

@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import torch
+
+from framework.io.buffer import BufferPaths, ensure_buffer_layout
+from framework.runner.actor_runtime import _actor_main_impl
+
+
+class _StopVectorActor(RuntimeError):
+    pass
+
+
+class _DummyAgent:
+    pass
+
+
+def test_vector_actor_env_builds_receive_total_actors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BufferPaths(root=str(tmp_path / "buffer_root"))
+    ensure_buffer_layout(paths)
+
+    cfg = {
+        "train": {
+            "eta": 1.0,
+            "mode_idx": -1,
+            "policy_mode_select": "sample",
+            "actor_learner": {
+                "mode": "async",
+                "buffer_dir": str(paths.root),
+                "actor_horizon": 4,
+                "poll_interval_s": 0.0,
+                "max_inflight_per_actor": 2,
+                "num_envs_per_actor": 2,
+                "vec_env_mode": "serial",
+                "num_actors": 6,
+            },
+        },
+        "agent": {
+            "type": "dummy",
+        },
+    }
+
+    calls: list[dict[str, int | None]] = []
+
+    def _fake_build_actor_env(_cfg, *, cuda, actor_id, worker_id=None, total_actors=1):
+        calls.append(
+            {
+                "cuda": int(cuda),
+                "actor_id": int(actor_id),
+                "worker_id": None if worker_id is None else int(worker_id),
+                "total_actors": int(total_actors),
+            }
+        )
+        return object()
+
+    class _FakeVecEnv:
+        def __init__(self, env_fns):
+            self._envs = [fn() for fn in env_fns]
+
+        def reset(self):
+            raise _StopVectorActor("stop after env construction")
+
+    fake_env_wrapper = types.ModuleType("framework.env_wrapper")
+    fake_env_wrapper.SerialVecEnv = _FakeVecEnv
+    fake_env_wrapper.SubprocVecEnv = _FakeVecEnv
+
+    monkeypatch.setitem(sys.modules, "framework.env_wrapper", fake_env_wrapper)
+    monkeypatch.setattr("framework.runner.actor_runtime.build_agent", lambda *_args, **_kwargs: _DummyAgent())
+    monkeypatch.setattr("framework.runner.actor_runtime.build_actor_env", _fake_build_actor_env)
+    monkeypatch.setattr("framework.runner.actor_runtime.torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(_StopVectorActor):
+        _actor_main_impl(
+            cfg,
+            actor_id=2,
+            gpu_id=None,
+            total_actors=6,
+            paths=paths,
+        )
+
+    assert len(calls) == 2
+    assert {int(call["total_actors"]) for call in calls} == {6}
+    assert {int(call["worker_id"]) for call in calls} == {2000, 2001}

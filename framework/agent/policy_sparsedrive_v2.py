@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .base import Agent
+from reconsimulator.envs import nus_config as nus_cfg
+from framework.utils.nuscenes_token import resolve_sample_token
 from framework.utils.repo_paths import resolve_ego_ads_subdir
 
 
@@ -177,6 +179,7 @@ class SparseDriveV2Policy(Agent):
 
         self._last_missing_feature_fields: List[str] = []
         self._teacher_model: torch.nn.Module | None = None
+        self._nuscenes_token_scorer: Any | None = None
 
     @property
     def device(self) -> torch.device:
@@ -628,6 +631,29 @@ class SparseDriveV2Policy(Agent):
                 out[key] = value.detach().cpu().clone()
         return out
 
+    @staticmethod
+    def _update_replay_with_observation_metadata(replay: Dict[str, Any], observation: Dict[str, Any]) -> None:
+        token = observation.get("sample_token", observation.get("token", None))
+        if token is None:
+            token = resolve_sample_token(
+                scene_id=observation.get("scene_id", None),
+                frame_idx=observation.get("frame_idx", None),
+            )
+        if token is not None:
+            replay["sample_token"] = str(token)
+        try:
+            replay["scene_id"] = int(observation.get("scene_id", 0))
+        except Exception:
+            pass
+        try:
+            replay["frame_idx"] = int(observation.get("frame_idx", 0))
+        except Exception:
+            pass
+        try:
+            replay["timestamp_s"] = float(observation.get("timestamp", 0.0))
+        except Exception:
+            pass
+
 #TODO:这里的sample仍然是伪batchshi'xian
     def sample_sparsedrivev2_with_replay(
         self,
@@ -704,6 +730,7 @@ class SparseDriveV2Policy(Agent):
                     "feature_missing_fields": list(features.get("feature_missing_fields", [])),
                 }
             )
+            self._update_replay_with_observation_metadata(replay, observations[idx])
             actions.append(self._build_env_action(traj_xyyaw))
             logps.append(logp)
             replays.append(replay)
@@ -753,6 +780,68 @@ class SparseDriveV2Policy(Agent):
         )
         logp_all = torch.log_softmax(score_logits, dim=1)
         return logp_all[torch.arange(score_logits.shape[0], device=score_logits.device), mode_indices]
+
+    def sample_counterfactual_trajectories_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        *,
+        num_candidates: int,
+        candidate_select: str = "topk",
+    ) -> Dict[str, torch.Tensor]:
+        if len(replays) == 0:
+            return {
+                "traj_xyyaw": torch.empty((0, 0, 0, 3), dtype=torch.float32),
+                "log_probs": torch.empty((0, 0), device=self.device, dtype=torch.float32),
+                "mode_indices": torch.empty((0, 0), device=self.device, dtype=torch.long),
+                "score_logits": torch.empty((0, 0), device=self.device, dtype=torch.float32),
+            }
+
+        batched_dev = self._batched_replay_features(replays)
+        model = self._unwrap_model(self._model)
+        model.eval()
+        out = self._forward_policy_on_model(model, batched_dev)
+        score_logits = out["candidate_scores"].to(dtype=torch.float32)
+        candidate_trajs = out["candidate_trajectories"]
+        if candidate_trajs.ndim != 4:
+            raise RuntimeError(
+                "SparseDriveV2 counterfactual candidates require candidate trajectories with shape "
+                f"(batch, modes, horizon, dims); got {tuple(candidate_trajs.shape)}"
+            )
+
+        batch_size, num_modes, horizon, traj_dim = tuple(candidate_trajs.shape)
+        del batch_size, horizon, traj_dim
+        k = max(1, min(int(num_candidates), int(num_modes)))
+        select = str(candidate_select).strip().lower()
+        if select not in {"topk", "all"}:
+            raise ValueError(f"Unsupported candidate_select={candidate_select!r}; expected 'topk' or 'all'")
+
+        if select == "all":
+            selected_indices = torch.argsort(score_logits, dim=1, descending=True)[:, :k]
+        else:
+            selected_indices = torch.topk(score_logits, k=k, dim=1, largest=True, sorted=True).indices
+
+        gather_idx_scores = selected_indices
+        gather_idx_traj = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, candidate_trajs.shape[2], candidate_trajs.shape[3])
+        selected_score_logits = torch.gather(score_logits, dim=1, index=gather_idx_scores)
+        selected_trajs = torch.gather(candidate_trajs, dim=1, index=gather_idx_traj)
+
+        logp_all = torch.log_softmax(score_logits, dim=1)
+        selected_log_probs = torch.gather(logp_all, dim=1, index=gather_idx_scores)
+
+        selected_trajs_flat = selected_trajs.reshape(-1, selected_trajs.shape[2], selected_trajs.shape[3])
+        traj_xyyaw = self._traj_batch_to_xyyaw(selected_trajs_flat).reshape(
+            selected_trajs.shape[0],
+            selected_trajs.shape[1],
+            selected_trajs.shape[2],
+            3,
+        )
+
+        return {
+            "traj_xyyaw": traj_xyyaw.detach().cpu(),
+            "log_probs": selected_log_probs,
+            "mode_indices": selected_indices.to(dtype=torch.long),
+            "score_logits": selected_score_logits,
+        }
 
     def init_distillation_teacher(self, *, ckpt_path: str | None = None) -> None:
         teacher_ckpt = str(ckpt_path) if ckpt_path is not None else str(self.ckpt_path)
@@ -912,6 +1001,41 @@ class SparseDriveV2Policy(Agent):
             status_encoding = model._status_encoding(batched_dev["status_feature"]).to(dtype=torch.float32)
             features = torch.cat([pooled_vision, status_encoding], dim=1)
         return features.detach().clone()
+
+    def _ensure_nuscenes_token_scorer(self):
+        if self._nuscenes_token_scorer is None:
+            from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
+
+            self._nuscenes_token_scorer = NuScenesTokenScorer(token2vad_path=nus_cfg.TOKEN2VAD_FILE)
+        return self._nuscenes_token_scorer
+
+    def pdm_score_counterfactuals_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        traj_xyyaw: torch.Tensor,
+    ) -> torch.Tensor:
+        scorer = self._ensure_nuscenes_token_scorer()
+        return scorer.score(replays, traj_xyyaw).to(device=self.device, dtype=torch.float32)
+
+    def dump_counterfactual_debug_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        traj_xyyaw: torch.Tensor,
+        candidate_scores: torch.Tensor,
+        *,
+        out_dir: str,
+        step_tag: str,
+        top_k: int,
+    ) -> None:
+        del candidate_scores
+        scorer = self._ensure_nuscenes_token_scorer()
+        scorer.dump_debug_artifacts(
+            replays,
+            traj_xyyaw,
+            out_dir=out_dir,
+            step_tag=step_tag,
+            top_k=top_k,
+        )
 
     def replay_is_compatible(self, replay: Dict[str, Any]) -> bool:
         if not isinstance(replay, dict):

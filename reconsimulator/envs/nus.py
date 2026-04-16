@@ -13,7 +13,14 @@ from typing import Any
 # NOTE: Import helpers from the concrete module to avoid a circular import:
 # - framework.env_wrapper.__init__ imports RLReconEnv -> imports ReconSimulator (this file)
 # - importing from framework.env_wrapper here would re-enter __init__ while it's initializing
-from framework.env_wrapper.tool import get_splat, get_sky_view, move_to_device, slerp
+from framework.env_wrapper.tool import (
+    build_sky_view_template,
+    get_splat,
+    get_sky_view,
+    get_sky_view_from_template,
+    move_to_device,
+    slerp,
+)
 from framework.utils.hugsim_execution import DEFAULT_HUGSIM_REPO, load_hugsim_runtime, resolve_wheelbase, solve_hugsim_execution
 from framework.utils.tracker_execution import TrackerExecutionResult, build_execution_result
 from reconsimulator.envs import nus_config as cfg
@@ -30,11 +37,21 @@ TRANSFORM_MATRIX = torch.eye(4, dtype=torch.float32)
 
 
 class ReconSimulator(gym.Env):
-    def __init__(self, cuda=0, scene=0, debug=True, *, render_w: int = 800, render_h: int = 450):
+    def __init__(
+        self,
+        cuda=0,
+        scene=0,
+        debug=True,
+        *,
+        render_w: int = 800,
+        render_h: int = 450,
+        save_tracker_debug: bool = False,
+    ):
         self.device = f"cuda:{cuda}"
         self.debug = debug
         self.scene = scene
         self.w, self.h = int(render_w), int(render_h)
+        self.save_tracker_debug = bool(save_tracker_debug)
         self._transform_matrix = TRANSFORM_MATRIX.to(self.device)
 
         # Observation space: 6 camera RGB views + ego status vectors.
@@ -62,6 +79,10 @@ class ReconSimulator(gym.Env):
         self.step_frames = 5
         self.final_frame = 186
         self.now_frame = 0
+        self._ego_pose_scene: int | None = None
+        self._ego_pose_frames: list[int] = []
+        self._ego_world_pose_by_frame: dict[int, np.ndarray] = {}
+        self._expert_ego_by_frame: dict[int, np.ndarray] = {}
 
         # Load all data
         self._load_camera_and_images()
@@ -82,6 +103,9 @@ class ReconSimulator(gym.Env):
         self._status_steering_rate = 0.0
         self._last_obs_timing: dict[str, float] = {}
         self._last_info_timing: dict[str, float] = {}
+        self._device_all_cams: list[dict[str, Any]] | None = None
+        self._device_all_images: list[dict[str, Any]] | None = None
+        self._sky_view_templates: list[dict[str, torch.Tensor]] | None = None
         self._tracked_first_step_xyyaw = np.zeros((3,), dtype=np.float64)
         self._executed_first_step_xyyaw = np.zeros((3,), dtype=np.float64)
         self._tracked_rollout_local_xyyaw = np.zeros((0, 3), dtype=np.float64)
@@ -112,6 +136,82 @@ class ReconSimulator(gym.Env):
 
     def _scene_ego_pose_dir(self) -> str:
         return os.path.join(cfg.BASE_DATA_DIR, f"{int(self.scene):03d}", "ego_pose")
+
+    def _ensure_scene_ego_pose_cache_loaded(self) -> None:
+        scene_id = int(getattr(self, "scene", 0))
+        cached_scene = getattr(self, "_ego_pose_scene", None)
+        cached_frames = getattr(self, "_ego_pose_frames", None)
+        cached_poses = getattr(self, "_ego_world_pose_by_frame", None)
+        if (
+            cached_scene == scene_id
+            and isinstance(cached_frames, list)
+            and isinstance(cached_poses, dict)
+            and len(cached_poses) > 0
+        ):
+            return
+
+        pose_dir = self._scene_ego_pose_dir()
+        pose_by_frame: dict[int, np.ndarray] = {}
+        frames: list[int] = []
+        if os.path.isdir(pose_dir):
+            try:
+                for name in sorted(os.listdir(pose_dir)):
+                    if not name.endswith(".txt"):
+                        continue
+                    try:
+                        frame_idx = int(os.path.splitext(name)[0])
+                    except Exception:
+                        continue
+                    fp = os.path.join(pose_dir, name)
+                    try:
+                        pose_by_frame[frame_idx] = np.asarray(np.loadtxt(fp), dtype=np.float64)
+                        frames.append(frame_idx)
+                    except Exception:
+                        continue
+            except Exception:
+                pose_by_frame = {}
+                frames = []
+
+        self._ego_pose_scene = scene_id
+        self._ego_world_pose_by_frame = pose_by_frame
+        self._ego_pose_frames = frames
+
+    def _world_pose_for_frame(self, frame_idx: int) -> np.ndarray | None:
+        self._ensure_scene_ego_pose_cache_loaded()
+        fidx = int(frame_idx)
+        cached = getattr(self, "_ego_world_pose_by_frame", {}).get(fidx, None)
+        if isinstance(cached, np.ndarray):
+            return np.asarray(cached, dtype=np.float64)
+
+        fp = os.path.join(self._scene_ego_pose_dir(), f"{fidx:03d}.txt")
+        if not os.path.isfile(fp):
+            return None
+        try:
+            pose = np.asarray(np.loadtxt(fp), dtype=np.float64)
+        except Exception:
+            return None
+
+        self._ego_world_pose_by_frame[fidx] = pose
+        frames = list(getattr(self, "_ego_pose_frames", []))
+        if fidx not in frames:
+            frames.append(fidx)
+            frames.sort()
+            self._ego_pose_frames = frames
+        return pose
+
+    def _expert_pose_for_frame(self, frame_idx: int) -> np.ndarray | None:
+        fidx = int(frame_idx)
+        cached = getattr(self, "_expert_ego_by_frame", {}).get(fidx, None)
+        if isinstance(cached, np.ndarray):
+            return np.asarray(cached, dtype=np.float64)
+
+        world_pose = self._world_pose_for_frame(fidx)
+        if world_pose is None:
+            return None
+
+        expert_pose = np.asarray(self._world_to_front_start @ world_pose, dtype=np.float64)
+        self._expert_ego_by_frame[fidx] = expert_pose
+        return expert_pose
 
     def _frame_to_token(self, frame_idx: int) -> str | None:
         fidx = int(frame_idx)
@@ -248,13 +348,10 @@ class ReconSimulator(gym.Env):
                 pos_t = len(frames) - 1
             tidx = int(frames[pos_t])
 
-            start_fp = os.path.join(pose_dir, f"{int(sidx):03d}.txt")
-            fut_fp = os.path.join(pose_dir, f"{int(tidx):03d}.txt")
-            if (not os.path.isfile(start_fp)) or (not os.path.isfile(fut_fp)):
+            start_world = self._world_pose_for_frame(int(sidx))
+            fut_world = self._world_pose_for_frame(int(tidx))
+            if start_world is None or fut_world is None:
                 return cmd_straight
-
-            start_world = np.asarray(np.loadtxt(start_fp), dtype=np.float64)
-            fut_world = np.asarray(np.loadtxt(fut_fp), dtype=np.float64)
             rel = np.linalg.inv(start_world) @ fut_world
             y_off = float(rel[1, 3])
             if y_off > 2.0:
@@ -266,29 +363,17 @@ class ReconSimulator(gym.Env):
             return cmd_straight
 
     def _available_pose_frames(self) -> list[int]:
-        pose_dir = self._scene_ego_pose_dir()
-        if not os.path.isdir(pose_dir):
-            return []
-        out: list[int] = []
-        try:
-            for n in os.listdir(pose_dir):
-                if not n.endswith(".txt"):
-                    continue
-                try:
-                    out.append(int(os.path.splitext(n)[0]))
-                except Exception:
-                    continue
-        except Exception:
-            return []
-        out.sort()
-        return out
+        self._ensure_scene_ego_pose_cache_loaded()
+        frames = getattr(self, "_ego_pose_frames", None)
+        if isinstance(frames, list):
+            return list(frames)
+        return []
 
     def _load_world_xy(self, frame_idx: int) -> np.ndarray | None:
         try:
-            fp = os.path.join(self._scene_ego_pose_dir(), f"{int(frame_idx):03d}.txt")
-            if not os.path.isfile(fp):
+            T = self._world_pose_for_frame(int(frame_idx))
+            if T is None:
                 return None
-            T = np.asarray(np.loadtxt(fp), dtype=np.float64)
             return np.asarray([float(T[0, 3]), float(T[1, 3])], dtype=np.float32)
         except Exception:
             return None
@@ -501,6 +586,9 @@ class ReconSimulator(gym.Env):
         tracked_rollout_local_xyyaw: np.ndarray,
         gt_local_xyyaw: np.ndarray | None = None,
     ) -> None:
+        if not bool(getattr(self, "save_tracker_debug", False)):
+            self._tracker_debug_pending = False
+            return
         if not bool(getattr(self, "_tracker_debug_pending", False)):
             return
 
@@ -808,10 +896,19 @@ class ReconSimulator(gym.Env):
             self.all_cams = pickle.load(f)
         with open(cfg.ALL_IMAGES_FILE, "rb") as f:
             self.all_images = pickle.load(f)
+        self._device_all_cams = None
+        self._device_all_images = None
+        self._sky_view_templates = None
 
     def _load_ego_and_cam_matrices(self):
+        self._ensure_scene_ego_pose_cache_loaded()
         cam2ego = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/cam2ego/0.txt"))
-        ego2world = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/000.txt"))
+        ego2world = self._world_pose_for_frame(0)
+        if ego2world is None:
+            ego2world = np.asarray(
+                np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/000.txt")),
+                dtype=np.float64,
+            )
         self.camera_front_start = ego2world @ cam2ego
         self._world_to_front_start = np.linalg.inv(self.camera_front_start)
         self.start_ego = np.linalg.inv(self.camera_front_start) @ ego2world
@@ -825,10 +922,13 @@ class ReconSimulator(gym.Env):
 
     def _load_expert_ego_frames(self):#Note:专家车辆轨迹（ground-truth trajectory）:世界坐标到前置相机起始坐标的相对变换
         self.all_expert_ego = []
+        self._expert_ego_by_frame = {}
         for i in range(0, self.final_frame + self.step_frames, self.step_frames):
-            expert_world = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{i:03d}.txt"))
-            expert_world = np.linalg.inv(self.camera_front_start) @ expert_world
-            self.all_expert_ego.append(expert_world)
+            expert_world = self._expert_pose_for_frame(i)
+            if expert_world is None:
+                continue
+            self._expert_ego_by_frame[int(i)] = np.asarray(expert_world, dtype=np.float64)
+            self.all_expert_ego.append(np.asarray(expert_world, dtype=np.float64))
 
     def _load_plan_anchors(self):
         self.plan_anchors = torch.from_numpy(np.load(cfg.PLAN_ANCHORS_FILE).astype(np.float32))
@@ -1002,6 +1102,92 @@ class ReconSimulator(gym.Env):
             info["timing"] = dict(self._last_info_timing)
         return info
 
+    def _ensure_device_camera_templates(self) -> None:
+        if isinstance(getattr(self, "_device_all_cams", None), list) and isinstance(getattr(self, "_device_all_images", None), list):
+            if len(self._device_all_cams) == len(self.all_cams) and len(self._device_all_images) == len(self.all_images):
+                return
+
+        self._device_all_cams = []
+        self._device_all_images = []
+        for cam_info, img_info in zip(self.all_cams, self.all_images):
+            self._device_all_cams.append(move_to_device(copy.deepcopy(cam_info), self.device))
+            self._device_all_images.append(move_to_device(copy.deepcopy(img_info), self.device))
+
+    def _ensure_sky_view_templates(self) -> None:
+        if isinstance(getattr(self, "_sky_view_templates", None), list):
+            if len(self._sky_view_templates) == len(self.all_cams):
+                return
+
+        self._ensure_device_camera_templates()
+        self._sky_view_templates = []
+        w, h = int(self.w), int(self.h)
+        for cam_info in self._device_all_cams:
+            self._sky_view_templates.append(
+                build_sky_view_template(cam_info["intrinsics"], self.device, h, w)
+            )
+
+    def _prepare_camera_inputs_for_current_pose(self) -> dict[str, float]:
+        self.all_camera_now = []
+        timing = {
+            "camera_template_copy_s": 0.0,
+            "image_template_copy_s": 0.0,
+            "device_transfer_s": 0.0,
+            "camera_pose_update_s": 0.0,
+            "normed_time_s": 0.0,
+            "get_sky_view_s": 0.0,
+        }
+        w, h = int(self.w), int(self.h)
+        self._ensure_device_camera_templates()
+        self._ensure_sky_view_templates()
+        for i in range(len(self.all_cams)):
+            t0 = time.perf_counter()
+            cam_info = dict(self._device_all_cams[i])
+            timing["camera_template_copy_s"] += float(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            img_info = dict(self._device_all_images[i])
+            timing["image_template_copy_s"] += float(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            cam_info["camera_to_world"] = torch.tensor(
+                self.start_ego @ self.cam2ego[i], device=self.device, dtype=torch.float32
+            )
+            cam_info["camera_to_world"] = cam_info["camera_to_world"] @ self._transform_matrix
+            timing["camera_pose_update_s"] += float(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            img_info["origins"], img_info["viewdirs"], img_info["direction_norm"] = get_sky_view_from_template(
+                cam_info["camera_to_world"], self._sky_view_templates[i], h, w
+            )
+            timing["get_sky_view_s"] += float(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            img_info["normed_time"] = torch.tensor(
+                self.trainer.normalized_timestamps[self.now_frame].item(),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            timing["normed_time_s"] += float(time.perf_counter() - t0)
+            self.all_camera_now.append((cam_info, img_info))
+
+        timing["camera_prepare_s"] = float(
+            timing["camera_template_copy_s"]
+            + timing["image_template_copy_s"]
+            + timing["device_transfer_s"]
+            + timing["camera_pose_update_s"]
+            + timing["normed_time_s"]
+            + timing["get_sky_view_s"]
+        )
+        return timing
+
+    def _finalize_obs_pipeline_timing(self, prepare_timing: dict[str, float]) -> None:
+        timing = dict(self._last_obs_timing)
+        timing.update({str(key): float(value) for key, value in dict(prepare_timing).items()})
+        camera_prepare_s = float(prepare_timing.get("camera_prepare_s", 0.0))
+        timing["camera_setup_s"] = float(camera_prepare_s)
+        timing["obs_pipeline_s"] = float(camera_prepare_s + float(self._last_obs_timing.get("render_s", 0.0)))
+        self._last_info_timing = timing
+
 #     # ------------------------- Gym API ------------------------ #
 # ------------------------- Gym API ------------------------ #
     def reset(self, seed=None, options=None):#NOTE 重置环境，重新开始一个新场景。
@@ -1032,38 +1218,16 @@ class ReconSimulator(gym.Env):
         self._tracker_debug_csv_cache = {}
         # Initialize status vectors from dataset at the selected start frame.
         self._refresh_status_from_dataset()
-        start_pose = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt"))
-        self.start_ego = np.linalg.inv(self.camera_front_start) @ start_pose
-
-        self.all_camera_now = []
-        camera_setup_t0 = time.perf_counter()
-        get_sky_view_s = 0.0
-        for i in range(6):
-            cam_info = copy.deepcopy(self.all_cams[i])
-            cam_info = move_to_device(cam_info, self.device)
-            cam_info['camera_to_world'] = torch.tensor(self.start_ego @ self.cam2ego[i], device=self.device, dtype=torch.float32)
-            cam_info['camera_to_world'] = cam_info['camera_to_world'] @ self._transform_matrix
-
-            img_info = copy.deepcopy(self.all_images[i])
-            img_info = move_to_device(img_info, self.device)
-            sky_t0 = time.perf_counter()
-            img_info['origins'], img_info['viewdirs'], img_info['direction_norm'] = get_sky_view(
-                cam_info['camera_to_world'], cam_info['intrinsics'], self.device, self.h, self.w
+        start_pose = self._expert_pose_for_frame(self.now_frame)
+        if start_pose is None:
+            start_pose = np.linalg.inv(self.camera_front_start) @ np.loadtxt(
+                os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
             )
-            get_sky_view_s += float(time.perf_counter() - sky_t0)
-            img_info['normed_time'] = torch.tensor(
-                self.trainer.normalized_timestamps[self.now_frame].item(),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            self.all_camera_now.append((cam_info, img_info))
+        self.start_ego = np.asarray(start_pose, dtype=np.float64)
 
-        camera_setup_s = float(time.perf_counter() - camera_setup_t0)
+        prepare_timing = self._prepare_camera_inputs_for_current_pose()
         obs = self._get_obs()
-        self._last_info_timing = dict(self._last_obs_timing)
-        self._last_info_timing["camera_setup_s"] = float(camera_setup_s)
-        self._last_info_timing["get_sky_view_s"] = float(get_sky_view_s)
-        self._last_info_timing["obs_pipeline_s"] = float(camera_setup_s + float(self._last_obs_timing.get("render_s", 0.0)))
+        self._finalize_obs_pipeline_timing(prepare_timing)
         return obs, self._get_info()
     
     def step(self, action):#NOT 根据动作 action 更新车辆状态（ego pose
@@ -1093,6 +1257,8 @@ class ReconSimulator(gym.Env):
 
         # Build planned trajectory in local frame for status tracking update.
         self._tracker_debug_pending = bool(
+            bool(getattr(self, "save_tracker_debug", False))
+            and
             int(flag) == 2
             and isinstance(getattr(self, "_external_plan_local_xyyaw", None), np.ndarray)
         )
@@ -1107,9 +1273,11 @@ class ReconSimulator(gym.Env):
 
         # --- 计算专家下一帧位姿（world→front-start 相对变换） ---
         #NOTE 所有 motion 都在 front_start 局部坐标系
-        expert_next_ego = np.linalg.inv(self.camera_front_start) @ np.loadtxt(
-            os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
-        )
+        expert_next_ego = self._expert_pose_for_frame(self.now_frame)
+        if expert_next_ego is None:
+            expert_next_ego = np.linalg.inv(self.camera_front_start) @ np.loadtxt(
+                os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")
+            )
         prev_pose = self.start_ego.copy()#前视摄像头front-camera坐标系
         
         
@@ -1194,35 +1362,9 @@ class ReconSimulator(gym.Env):
                 self.start_ego[1, 3] = y_ref
             except Exception:
                 pass
-        w, h = int(self.w), int(self.h)
-        camera_setup_t0 = time.perf_counter()
-        get_sky_view_s = 0.0
-        for i in range(6):#NOTE 更新相机信息
-            loaded_cam_infos = copy.deepcopy(self.all_cams[i])
-            loaded_cam_infos = move_to_device(loaded_cam_infos,self.device)
-            loaded_cam_infos['camera_to_world'] = torch.tensor(self.start_ego @ self.cam2ego[i]).to(self.device).to(torch.float32)
-            loaded_cam_infos['camera_to_world'] = loaded_cam_infos['camera_to_world'] @ self._transform_matrix
-            loaded_img_infos = copy.deepcopy(self.all_images[i])
-            loaded_img_infos = move_to_device(loaded_img_infos,self.device)
-            sky_t0 = time.perf_counter()
-            loaded_img_infos['origins'],\
-            loaded_img_infos['viewdirs'], \
-            loaded_img_infos['direction_norm'] = get_sky_view(loaded_cam_infos['camera_to_world'],\
-                                                                  loaded_cam_infos['intrinsics'],\
-                                                                    self.device,h,w)
-            get_sky_view_s += float(time.perf_counter() - sky_t0)
-            loaded_img_infos['normed_time'] = torch.tensor(
-                self.trainer.normalized_timestamps[self.now_frame].item(),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            self.all_camera_now.append((loaded_cam_infos,loaded_img_infos))
+        prepare_timing = self._prepare_camera_inputs_for_current_pose()
         observation = self._get_obs()#自动传入了self.all_camera_now
-        camera_setup_s = float(time.perf_counter() - camera_setup_t0)
-        self._last_info_timing = dict(self._last_obs_timing)
-        self._last_info_timing["camera_setup_s"] = float(camera_setup_s)
-        self._last_info_timing["get_sky_view_s"] = float(get_sky_view_s)
-        self._last_info_timing["obs_pipeline_s"] = float(camera_setup_s + float(self._last_obs_timing.get("render_s", 0.0)))
+        self._finalize_obs_pipeline_timing(prepare_timing)
 
         terminated, truncated = False, False
         if self.now_frame == self.final_frame - 1:
@@ -1267,16 +1409,20 @@ class ReconSimulator(gym.Env):
         self.trainer, self.num_timesteps = get_splat(self.device, self.scene)
         self.trainer.eval()
 
-        with open(cfg.ALL_CAMS_FILE, "rb") as f:
-            self.all_cams = pickle.load(f)
-        with open(cfg.ALL_IMAGES_FILE, "rb") as f:
-            self.all_images = pickle.load(f)
+        self._load_camera_and_images()
+        self._ensure_scene_ego_pose_cache_loaded()
 
         cam2ego_0 = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/cam2ego/0.txt"))
-        ego2world_sf = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt"))
+        ego2world_sf = self._world_pose_for_frame(self.now_frame)
+        if ego2world_sf is None:
+            ego2world_sf = np.asarray(
+                np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{self.now_frame:03d}.txt")),
+                dtype=np.float64,
+            )
         self.camera_front_start = ego2world_sf @ cam2ego_0
+        self._world_to_front_start = np.linalg.inv(self.camera_front_start)
 
-        self.start_ego = np.linalg.inv(self.camera_front_start) @ ego2world_sf
+        self.start_ego = self._world_to_front_start @ ego2world_sf
         
         self.cam2ego = []
         for i in range(6):
@@ -1285,10 +1431,13 @@ class ReconSimulator(gym.Env):
                 self.cam2ego.append(np.loadtxt(cam_path))
 
         self.all_expert_ego = []
+        self._expert_ego_by_frame = {}
         for i in range(0, self.final_frame + self.step_frames, self.step_frames):
-            expert_world = np.loadtxt(os.path.join(cfg.BASE_DATA_DIR, f"{self.scene:03d}/ego_pose/{i:03d}.txt"))
-            expert_world = np.linalg.inv(self.camera_front_start) @ expert_world
-            self.all_expert_ego.append(expert_world)
+            expert_world = self._expert_pose_for_frame(i)
+            if expert_world is None:
+                continue
+            self._expert_ego_by_frame[int(i)] = np.asarray(expert_world, dtype=np.float64)
+            self.all_expert_ego.append(np.asarray(expert_world, dtype=np.float64))
         self.get_all_point_for_expert()
 
     def get_all_point_for_expert(self):

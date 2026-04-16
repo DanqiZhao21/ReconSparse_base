@@ -30,6 +30,16 @@ class TrajectoryReinforceObjective:
     adv_mean: torch.Tensor
 
 
+@dataclass
+class TrajectoryGRPOObjective:
+    loss: torch.Tensor
+    advantages: torch.Tensor
+    score_mean: torch.Tensor
+    score_std: torch.Tensor
+    score_min: torch.Tensor
+    score_max: torch.Tensor
+
+
 def _as_logp_tensor(logp_out: Any, *, device: torch.device) -> torch.Tensor:
     if torch.is_tensor(logp_out):
         return logp_out.to(device=device, dtype=torch.float32).view(-1)
@@ -154,6 +164,51 @@ def compute_reinforce_objective(
     )
 
 
+def compute_grpo_objective(
+    *,
+    candidate_log_probs: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    score_norm_eps: float = 1e-6,
+    use_rank_adv: bool = False,
+    score_clip: float | None = None,
+) -> TrajectoryGRPOObjective:
+    if candidate_log_probs.ndim != 2 or candidate_scores.ndim != 2:
+        raise ValueError("candidate_log_probs and candidate_scores must both be 2D tensors (batch, candidates)")
+    if tuple(candidate_log_probs.shape) != tuple(candidate_scores.shape):
+        raise ValueError(
+            "candidate_log_probs and candidate_scores must have identical shapes; "
+            f"got log_probs={tuple(candidate_log_probs.shape)} scores={tuple(candidate_scores.shape)}"
+        )
+
+    scores = candidate_scores.to(device=candidate_log_probs.device, dtype=torch.float32)
+    if score_clip is not None:
+        scores = scores.clamp(min=-float(score_clip), max=float(score_clip))
+
+    if use_rank_adv:
+        order = torch.argsort(scores, dim=1, descending=False)
+        ranks = torch.argsort(order, dim=1, descending=False).to(dtype=torch.float32)
+        denom = torch.clamp(torch.as_tensor(scores.shape[1] - 1, device=scores.device, dtype=torch.float32), min=1.0)
+        advantages = (ranks / denom) - 0.5
+    else:
+        score_mean = scores.mean(dim=1, keepdim=True)
+        score_std = scores.std(dim=1, keepdim=True, unbiased=False)
+        advantages = (scores - score_mean) / (score_std + float(score_norm_eps))
+
+    loss = -(advantages.detach() * candidate_log_probs).mean()
+    score_mean = scores.mean(dim=1)
+    score_std = scores.std(dim=1, unbiased=False)
+    score_min = scores.min(dim=1).values
+    score_max = scores.max(dim=1).values
+    return TrajectoryGRPOObjective(
+        loss=loss,
+        advantages=advantages,
+        score_mean=score_mean.mean(),
+        score_std=score_std.mean(),
+        score_min=score_min.mean(),
+        score_max=score_max.mean(),
+    )
+
+
 def compute_ppo_metrics(
     *,
     new_logp: torch.Tensor,
@@ -197,7 +252,9 @@ def compute_reinforce_metrics(
 __all__ = [
     "TrajectoryPPOObjective",
     "TrajectoryReinforceObjective",
+    "TrajectoryGRPOObjective",
     "agent_logp_from_replay_batch",
+    "compute_grpo_objective",
     "compute_ppo_objective",
     "compute_reinforce_objective",
     "compute_ppo_metrics",

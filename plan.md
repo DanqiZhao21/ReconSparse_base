@@ -1,341 +1,232 @@
-# SparseDriveV2 Frozen-Backbone Value Head Implementation Plan
+# Closed-Loop Reward And GRPO Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make SparseDriveV2 PPO critic training materially more stable by reusing the agent's frozen visual backbone and frozen status encoder, while training only a lightweight value head on top.
+**Goal:** Upgrade closed-loop reward to a path-based smooth reward with progress, then add learner-side counterfactual GRPO on top of the existing ReinforcePP path.
 
-**Architecture:** Use a staged plan focused only on SparseDriveV2. First verify the current failure mode with better critic diagnostics and a reproducible baseline. Then replace the image-only critic path with a frozen-backbone feature extractor that pools SparseDriveV2 visual features, concatenates frozen status encodings, and feeds them into a trainable value head. Keep the actor-learner shard protocol stable and avoid joint backbone training in this phase.
+**Architecture:** Keep reward shaping on the actor/env side inside `framework/rewards/` and `framework/env_wrapper/`, while keeping counterfactual scoring and GRPO loss on the learner side inside `framework/agent/`, `framework/algorithms/`, and `framework/lightning/`. Preserve the current actor-learner shard protocol and add only backward-compatible replay/loss hooks.
 
-**Tech Stack:** PyTorch, PyTorch Lightning, actor-learner file buffer, PPO, SparseDriveV2 replay features.
+**Tech Stack:** Python, PyTorch, PyTorch Lightning, pytest, existing actor-learner runtime
 
 ---
 
-## Problem Statement
+## Reward Design To Implement
 
-Current SparseDriveV2 PPO instability is most likely driven by a mismatch between what the policy sees and what the value net sees:
+Target step reward:
 
-- SparseDriveV2 policy log-prob recomputation uses replay-derived `camera_feature` and `status_feature`.
-- The current learner-side `ValueNet` in `framework/runner/learner_factory.py` only sees a `(B, 18, 64, 64)` image tensor.
-- SparseDriveV2 already has a trained visual backbone and a learned `_status_encoding` layer, but the critic ignores both.
-- `status_feature` contains route/command and ego dynamics information that can change return substantially even when image appearance is similar.
-- Returns are noisy because the environment includes early termination, collision/failure conditions, and terminal penalties.
+\[
+r_t
+=
+w_{prog} r^{prog}_t
+- w_{lat} r^{lat}_t
+- w_{yaw} r^{yaw}_t
+- w_{comfort} r^{comfort}_t
+- r^{col}_t
++ r^{terminal}_t
+\]
 
-This means the current critic is being asked to fit a hard target with incomplete state information. Negative `explained_variance` is therefore plausible even when the metric code itself is correct.
+Where:
 
-## Recommended Strategy
+- `r_prog`: longitudinal progress along densified expert path
+- `r_lat`: lateral deviation penalty with deadzone
+- `r_yaw`: path-heading penalty with deadzone
+- `r_comfort`: longitudinal jerk + yaw jerk penalty with deadzone
+- `r_col`: static/dynamic collision penalties
+- `r_terminal`: existing terminal penalty logic
 
-Recommended path:
+Definitions:
 
-1. Add evidence first. Do not change the critic architecture blindly.
-2. Keep the actor-learner protocol stable. Derive critic inputs from SparseDriveV2 replay instead of changing shard schema.
-3. Reuse SparseDriveV2 `_backbone` and `_status_encoding` in frozen mode, then train only a new value head.
-4. Do not let value loss update the policy backbone in this phase.
+- Project ego pose onto expert path and compute projected arc length `s_t`
+- `delta_s_t = s_t - s_{t-1}`
+- `r_prog_t = clip(delta_s_t, -progress_backward_cap_m, progress_forward_cap_m)`
+- `r_lat_t = huber(max(0, |e_lat_t| - lateral_free_m), lateral_huber_delta_m)`
+- `r_yaw_t = huber(max(0, |e_yaw_t| - yaw_free_deg), yaw_huber_delta_deg)`
+- `r_comfort_t = huber(max(0, |jerk_t| - longitudinal_jerk_free), longitudinal_jerk_delta) + huber(max(0, |yaw_jerk_t| - yaw_jerk_free), yaw_jerk_delta)`
 
-## Success Criteria
+Optional auxiliary first-step anchor:
 
-- `explained_variance` becomes consistently positive after warmup instead of staying heavily negative.
-- `loss_v` stops diverging or oscillating violently across adjacent updates.
-- PPO policy metrics remain stable: no new `approx_kl` spikes or `clip_frac` blow-ups caused by the critic change.
-- The actor-learner shard contract remains backward-compatible during phase 1.
-- A small smoke training run completes with the SparseDriveV2 frozen-backbone critic path enabled.
+\[
+r^{anchor}_t
+=
+w_{anchor\_progress} \cdot clip(s^{plan0}_t - s_t, 0, anchor_cap_m)
+- w_{anchor\_lateral} \cdot huber(max(0, |e^{plan0}_{lat,t}| - anchor_free_m), anchor_free_m)
+\]
 
-## Non-Goals
+First implementation round will add the config and plumbing for anchor terms but may leave the anchor reward disabled by default until the base path reward is verified.
 
-- No broad refactor of actor-learner runtime ownership.
-- No immediate redesign of replay schema.
-- No policy architecture rewrite.
-- No DiffusionDriveV2 work in this phase.
-
-## File Map
-
-Likely files for phase 1:
-
-- Modify: `framework/runner/learner_factory.py`
-- Modify: `framework/lightning/trajectory_module.py`
-- Modify: `framework/lightning/actor_learner_module.py`
-- Modify: `framework/agent/base.py`
-- Modify: `script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml`
-- Modify: `framework/agent/policy_sparsedrive_v2.py`
-
-Likely tests:
-
-- Modify or add: `tests/framework/test_trajectory_objectives.py`
-- Add: `tests/framework/test_value_net_inputs.py`
-
-## Phase 0 Decisions
-
-Before implementation, keep these guardrails:
-
-- Prefer optional new batch fields over changing required shard fields.
-- Reuse replay data that already exists; do not add new actor-side writes in phase 1.
-- Keep the current PPO loss contract intact while changing value inputs.
-- Make the SparseDriveV2 frozen-backbone critic gated by config so rollback is easy.
-
-### Task 1: Capture a Reproducible Critic Baseline
+## Task 1: Add Failing Reward Tests
 
 **Files:**
+- Create: `tests/test_tracking_reward_path_mode.py`
+- Modify: `/root/clone/ReconDreamer-RL/plan.md`
+
+- [x] **Step 1: Write failing tests for path progress reward**
+
+Test cases:
+- Progress increases when ego moves forward along a straight expert path
+- Lateral penalty stays zero inside deadzone and increases outside it
+- Yaw penalty uses wrapped angle and stays smooth around +/-180 degrees
+- Terminal penalty behavior remains unchanged
+
+- [x] **Step 2: Run the targeted reward tests to verify they fail**
+
+Run: `pytest tests/test_tracking_reward_path_mode.py -q`
+Expected: FAIL because path-based reward helpers/config are not implemented yet.
+
+## Task 2: Implement Path-Based Smooth Reward
+
+**Files:**
+- Modify: `framework/rewards/tracking.py`
+- Modify: `framework/rewards/README.md`
+
+- [x] **Step 1: Add path helper utilities**
+
+Helpers to add:
+- densify expert polyline
+- cumulative arc-length cache
+- point-to-polyline projection
+- path tangent heading lookup
+- scalar Huber penalty helper
+
+- [x] **Step 2: Extend `TrackingRewardComputer` state**
+
+Add cached state for:
+- reference path points
+- cumulative path lengths
+- previous projected progress `s_{t-1}`
+
+- [x] **Step 3: Replace old threshold-only position reward**
+
+Implement path-based:
+- progress reward
+- lateral penalty
+- yaw penalty against path heading
+- comfort penalty with deadzones
+- collision penalty passthrough
+
+- [x] **Step 4: Preserve and enrich logging fields**
+
+Expose metrics such as:
+- `progress_s`
+- `progress_delta_s`
+- `lateral_error_m`
+- `path_heading_deg`
+- `yaw_path_err_deg`
+- per-term weighted contributions
+
+- [x] **Step 5: Run targeted tests to verify they pass**
+
+Run: `pytest tests/test_tracking_reward_path_mode.py -q`
+Expected: PASS
+
+## Task 3: Wire Reward Config
+
+**Files:**
+- Modify: `script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml`
 - Modify: `script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml`
-- Add: `tests/framework/test_value_net_inputs.py`
+- Modify: `script/configs/sparsedrive/ppo_closed_loop_sparsedrive.yaml`
+- Modify: `script/configs/diffusiondrive_v2/ppo_closed_loop.yaml`
 
-- [ ] **Step 1: Define a short, repeatable PPO baseline run**
+- [x] **Step 1: Add backward-compatible nested config structure**
 
-Use a tiny debug profile derived from the existing PPO config:
-- low `max_updates`
-- fixed seed
-- stable `shards_per_update`
-- no unrelated config changes
+Add sections:
+- `reward.path`
+- `reward.comfort`
+- `reward.collision`
+- retain existing `reward.terminal`
 
-- [ ] **Step 2: Record baseline critic metrics to compare against later**
+- [x] **Step 2: Keep defaults backward compatible**
 
-Track at minimum:
-- `explained_variance`
-- `loss_v`
-- `ret_mean`
-- `ret_std`
-- `done_rate`
-- `reward_mean`
+Existing flat keys should still work when nested keys are absent.
 
-- [ ] **Step 3: Add a regression test for value input shape assumptions**
+- [x] **Step 3: Smoke-check config loading**
 
-Test cases should verify:
-- image-only critic input shape stays valid
-- optional future status input shape can be added without breaking existing batch code
+Run a narrow import/config normalization smoke check after config edits.
 
-- [ ] **Step 4: Run targeted tests**
+## Task 4: Review And Visual Logging Pass
+
+**Files:**
+- Modify: `framework/env_wrapper/rl_wrapper.py` (only if extra info propagation is needed)
+
+- [x] **Step 1: Review reward outputs**
+
+Verify logs now include enough per-step decomposition to inspect whether the reward matches human preferences.
+
+- [x] **Step 2: Keep actor-learner protocol unchanged**
+
+No shard schema change in this round.
+
+## Task 5: Add Learner-Side Counterfactual Candidate Hook
+
+**Files:**
+- Modify: `framework/agent/policy_sparsedrive_v2.py`
+- Add: `tests/test_sparsedrive_v2_counterfactual_candidates.py`
+
+- [x] **Step 1: Write failing tests for counterfactual candidate extraction**
+- [x] **Step 2: Add learner-side batch API returning candidate trajectories and candidate log-probs**
+- [x] **Step 3: Verify targeted tests pass**
+
+## Task 6: Add PDM/GRPO Objective
+
+**Files:**
+- Add: `framework/algorithms/pdm_scorer.py`
+- Modify: `framework/algorithms/trajectory_policy_core.py`
+- Modify: `framework/algorithms/reinforcepp.py`
+- Modify: `framework/runner/learner_factory.py`
+- Modify: `framework/lightning/config.py`
+- Modify: `framework/lightning/trajectory_module.py`
+- Add: `tests/test_reinforce_grpo_objective.py`
+
+- [x] **Step 1: Write failing tests for GRPO objective math**
+- [x] **Step 2: Implement group-relative normalized advantages from PDM scores**
+- [x] **Step 3: Add `loss_total = loss_base + grpo_coef * loss_grpo` on ReinforcePP path only**
+- [x] **Step 4: Add metrics/logging for group score stats and GRPO loss**
+- [x] **Step 5: Verify targeted tests pass**
+
+## Task 6b: Add NuScenes Direct Counterfactual Scorer
+
+**Files:**
+- Add: `framework/algorithms/nuscenes_token_scorer.py`
+- Modify: `framework/agent/policy_sparsedrive_v2.py`
+- Modify: `reconsimulator/envs/nus0331.py`
+- Add: `tests/test_nuscenes_token_scorer.py`
+- Modify: `tests/test_sparsedrive_v2_counterfactual_candidates.py`
+
+- [x] **Step 1: Write failing tests for NuScenes token scorer and replay metadata**
+- [x] **Step 2: Expose `sample_token` in observation/replay metadata**
+- [x] **Step 3: Implement direct NuScenes scorer backed by `assets/nus/information/token2vad.pkl`**
+- [x] **Step 4: Verify targeted tests pass**
+
+## Task 6c: Add NuScenes GRPO Debug Visualization
+
+**Files:**
+- Modify: `framework/algorithms/nuscenes_token_scorer.py`
+- Modify: `framework/agent/policy_sparsedrive_v2.py`
+- Modify: `framework/algorithms/reinforcepp.py`
+- Modify: `framework/runner/learner_factory.py`
+- Modify: `framework/lightning/config.py`
+- Modify: `framework/lightning/trajectory_module.py`
+- Modify: `script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml`
+- Modify: `tests/test_nuscenes_token_scorer.py`
+- Modify: `tests/test_trajectory_module_grpo.py`
+
+- [x] **Step 1: Write failing tests for debug artifact dumping and learner hook triggering**
+- [x] **Step 2: Add scorer-side score breakdown export and top-k trajectory visualization dumping**
+- [x] **Step 3: Add learner config plumbing and optional debug dump hook call**
+- [x] **Step 4: Verify targeted tests pass and run a real token2vad smoke check**
+
+## Task 7: Final Verification
+
+**Files:**
+- Modify: `plan.md`
+
+- [x] **Step 1: Run targeted reward and GRPO tests**
 
 Run:
-```bash
-pytest tests/framework/test_actor_learner_batch_contract.py -q
-pytest tests/framework/test_trajectory_objectives.py -q
-```
+- `pytest tests/test_tracking_reward_path_mode.py -q`
+- `pytest tests/test_sparsedrive_v2_counterfactual_candidates.py -q`
+- `pytest tests/test_reinforce_grpo_objective.py -q`
 
-- [ ] **Step 5: Save baseline notes**
+- [x] **Step 2: Run any additional narrow smoke tests needed for touched code paths**
 
-Write down:
-- config used
-- average sign/range of `explained_variance`
-- whether instability is immediate or appears after a few updates
-
-### Task 2: Add Critic Diagnostics Before Changing Architecture
-
-**Files:**
-- Modify: `framework/lightning/actor_learner_module.py`
-- Modify: `framework/lightning/trajectory_module.py`
-- Modify: `framework/batch/actor_learner.py`
-- Modify: `tests/framework/test_trajectory_objectives.py`
-
-- [ ] **Step 1: Extend logged critic statistics**
-
-Add W&B/stage metrics for:
-- `value_pred_mean`
-- `value_pred_std`
-- `old_value_mean`
-- `old_value_std`
-- `ret_abs_mean`
-- `value_error_mean`
-- `value_error_std`
-
-- [ ] **Step 2: Expose enough batch stats to explain value failure**
-
-Extend `LoadedShardBatch` with optional aggregate stats needed for debugging, while keeping existing fields compatible.
-
-- [ ] **Step 3: Add tests for new diagnostics**
-
-Verify:
-- metrics are numeric
-- empty batches still behave safely
-- PPO path still logs existing metrics
-
-- [ ] **Step 4: Re-run baseline PPO and compare**
-
-Hypothesis to test:
-- if `value_pred_*` stays low-variance while `ret_std` is large, the critic is under-informed
-- if `value_pred_mean` moves wildly relative to `ret_mean`, critic optimization may be unstable
-
-- [ ] **Step 5: Commit diagnostics only**
-
-```bash
-git add framework/lightning/actor_learner_module.py framework/lightning/trajectory_module.py framework/batch/actor_learner.py tests/framework/test_trajectory_objectives.py
-git commit -m "chore: add critic diagnostics for PPO debugging"
-```
-
-### Task 3: Add a SparseDriveV2 Value Feature Interface Without Changing Shard Schema
-
-**Files:**
-- Modify: `framework/agent/base.py`
-- Modify: `framework/agent/policy_sparsedrive_v2.py`
-- Modify: `framework/lightning/trajectory_module.py`
-- Add: `tests/framework/test_value_net_inputs.py`
-
-- [ ] **Step 1: Define an optional agent interface for critic features**
-
-Add an optional agent method such as `value_features_from_replay_batch(replays)` and a feature-dimension hook. Do not make it mandatory for non-SparseDrive agents.
-
-- [ ] **Step 2: Implement SparseDriveV2 frozen feature extraction**
-
-For SparseDriveV2:
-- build batched replay features from `camera_feature` and `status_feature`
-- run `_backbone` in eval/no-grad mode
-- global-pool the last feature map to a fixed vector
-- run `_status_encoding` in eval/no-grad mode
-- concatenate pooled vision features and status encoding
-- return detached critic features
-
-- [ ] **Step 3: Keep compatibility checks strict**
-
-If replay is malformed or missing required SparseDriveV2 fields, fail loudly instead of silently using bad value features.
-
-- [ ] **Step 4: Add tests**
-
-Cover:
-- extracted feature shape is stable
-- returned features do not require gradients
-- replay shape mismatches fail loudly
-
-- [ ] **Step 5: Verify existing trajectory tests still pass**
-
-Run:
-```bash
-pytest tests/framework/test_trajectory_objectives.py -q
-pytest tests/framework/test_value_net_inputs.py -q
-```
-
-### Task 4: Replace the Current Image-Only Critic with a Frozen-Backbone Value Head
-
-**Files:**
-- Modify: `framework/runner/learner_factory.py`
-- Modify: `framework/lightning/trajectory_module.py`
-- Modify: `framework/agent/base.py`
-- Modify: `framework/agent/policy_sparsedrive_v2.py`
-- Add: `tests/framework/test_value_net_inputs.py`
-
-- [ ] **Step 1: Replace the current CNN critic with a value head**
-
-The new module should take precomputed SparseDriveV2 value features as input. It should not own a vision backbone.
-
-- [ ] **Step 2: Keep the value head lightweight**
-
-Recommended first version:
-- input dim = `pooled_backbone_dim + status_encoding_dim`
-- 1-2 linear layers
-- ReLU
-- scalar value output
-
-- [ ] **Step 3: Update PPO training_step to prefer agent value features**
-
-Behavior:
-- if agent exposes `value_features_from_replay_batch`, use that path
-- otherwise keep the existing obs-based fallback for compatibility
-
-- [ ] **Step 4: Gate the new critic by config**
-
-Suggested config flags:
-- `critic_use_agent_features: true/false`
-- `critic_hidden_dim`
-
-Default recommendation:
-- enable for `sparsedrive_v2` PPO configs under active training
-
-- [ ] **Step 5: Add shape and forward-pass tests**
-
-Verify:
-- obs-based fallback still works
-- SparseDriveV2 feature-head mode works
-- batch size 0/1/N cases are safe
-
-- [ ] **Step 6: Commit the frozen-backbone value head**
-
-```bash
-git add framework/runner/learner_factory.py framework/lightning/trajectory_module.py framework/agent/base.py framework/agent/policy_sparsedrive_v2.py tests/framework/test_value_net_inputs.py
-git commit -m "feat: add SparseDriveV2 frozen-backbone value head"
-```
-
-### Task 5: Tune Critic Optimization Separately from Policy
-
-**Files:**
-- Modify: `framework/runner/config_normalization.py`
-- Modify: `script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml`
-
-- [ ] **Step 1: Expose critic-specific knobs clearly**
-
-Make sure the config surface is explicit for:
-- `lr_value`
-- `vf_coef`
-- `critic_use_agent_features`
-- optional critic hidden dim if needed
-
-- [ ] **Step 2: Run the narrowest useful sweep**
-
-Recommended order:
-1. keep architecture fixed, lower `lr_value` if value overshoots
-2. if `loss_v` dominates, reduce `vf_coef`
-3. only then widen the critic hidden size
-
-- [ ] **Step 3: Compare against phase 0 baseline**
-
-Require improvement on:
-- median `explained_variance`
-- volatility of `loss_v`
-- no regression in `reward_mean`
-
-- [ ] **Step 4: Keep one winning config only**
-
-Do not land multiple speculative PPO configs in parallel. Preserve one clear default.
-
-### Task 6: Verify SparseDriveV2 End-to-End
-
-**Files:**
-- Use: `tests/framework/fixtures/tiny_actor_learner_smoke.yaml`
-
-- [ ] **Step 1: Run targeted tests**
-
-```bash
-pytest tests/framework/test_trajectory_objectives.py -q
-pytest tests/framework/test_value_net_inputs.py -q
-```
-
-- [ ] **Step 2: Run a tiny smoke actor-learner PPO job**
-
-Use the smallest practical config derived from:
-- `tests/framework/fixtures/tiny_actor_learner_smoke.yaml`
-
-Goal:
-- verify the learner can consume shards
-- verify the SparseDriveV2 frozen-backbone critic path runs
-- verify no protocol breakage
-
-- [ ] **Step 3: Compare baseline vs upgraded critic**
-
-Required summary:
-- before/after `explained_variance`
-- before/after `loss_v`
-- before/after `reward_mean`
-- whether instability shifted from critic to policy metrics
-
-## Recommendation Summary
-
-Implement in this order:
-
-1. diagnostics
-2. SparseDriveV2 frozen feature interface
-3. frozen-backbone value head
-4. critic-only hyperparameter sweep
-
-This ordering is recommended because it attacks the most likely root cause first: critic information mismatch. It also keeps risk low by preserving the actor-learner protocol and by preventing value loss from perturbing the policy backbone.
-
-## Verification Checklist
-
-- `explained_variance` no longer stays heavily negative for most updates
-- `loss_v` magnitude and variance are both lower than baseline
-- PPO policy metrics remain within normal range
-- tests covering the objective path and SparseDriveV2 critic feature path still pass
-- tiny smoke training run completes without shard/schema regression
-
-## Rollback Plan
-
-If the new critic path destabilizes learner execution:
-
-- disable `critic_use_agent_features`
-- fall back to the original image-only critic
-- keep diagnostics logging enabled
-- investigate whether the failure is feature shape mismatch, optimization instability, or SparseDriveV2 replay incompatibility
+- [x] **Step 3: Perform a review pass before declaring completion**

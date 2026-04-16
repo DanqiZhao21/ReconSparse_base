@@ -94,3 +94,20 @@ if __name__ == "__main__":
 
 
 # python script/train_actor_learner_v2.py --role orchestrator --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml
+
+'''
+cd /root/clone/ReconDreamer-RL
+python script/train_actor_learner_v2.py \
+  --role orchestrator \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml
+
+
+20260407
+cd /root/clone/ReconDreamer-RL
+
+PYTHONPATH=/root/clone/ReconDreamer-RL \
+/root/miniconda3/envs/recondreamerNew-rl/bin/python -u script/train_actor_learner_v2.py \
+  --role orchestrator \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml
+
+'''

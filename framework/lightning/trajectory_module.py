@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
 
+from framework.algorithms.pdm_scorer import score_counterfactual_trajectories
 from framework.algorithms.trajectory_policy_core import (
     agent_logp_from_replay_batch,
+    compute_grpo_objective,
     compute_ppo_metrics,
     compute_ppo_objective,
     compute_reinforce_metrics,
@@ -103,7 +106,102 @@ class TrajectoryLightningModule(L.LightningModule):
         self.policy_module = getattr(agent, "trainable_module", None)
         self.value_net = value_net
         self.latest_metrics: Dict[str, float] = {}
+        self._grpo_debug_dump_count = 0
         self._reset_update_metric_aggregates()
+
+    def _maybe_apply_grpo_loss(
+        self,
+        *,
+        replay: list[Dict[str, Any]],
+        device: torch.device,
+        batch_idx: int,
+        loss: torch.Tensor,
+        metrics: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        grpo_coef = float(self.learner_config.grpo_coef)
+        grpo_enabled = bool(getattr(self.learner_config, "grpo_enabled", False)) or (grpo_coef > 0.0)
+        debug_requested = bool(getattr(self.learner_config, "grpo_debug_visualize", False))
+        loss_requested = bool(grpo_enabled and grpo_coef > 0.0)
+        if not loss_requested and not debug_requested:
+            return loss, metrics
+
+        candidate_fn = getattr(self.agent, "sample_counterfactual_trajectories_from_replay_batch", None)
+        if not callable(candidate_fn):
+            if not loss_requested:
+                return loss, metrics
+            raise RuntimeError(
+                "GRPO is enabled but the agent does not expose "
+                "`sample_counterfactual_trajectories_from_replay_batch`."
+            )
+        candidates = candidate_fn(
+            replay,
+            num_candidates=int(self.learner_config.grpo_num_candidates),
+            candidate_select=str(self.learner_config.grpo_candidate_select),
+        )
+        candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
+        candidate_scores = score_counterfactual_trajectories(
+            self.agent,
+            replay,
+            candidates["traj_xyyaw"],
+            device=device,
+        )
+        self._maybe_dump_grpo_debug(
+            replay=replay,
+            traj_xyyaw=candidates["traj_xyyaw"],
+            candidate_scores=candidate_scores,
+            batch_idx=batch_idx,
+        )
+        if not loss_requested:
+            return loss, metrics
+        grpo_loss = compute_grpo_objective(
+            candidate_log_probs=candidate_log_probs,
+            candidate_scores=candidate_scores,
+            score_norm_eps=float(self.learner_config.grpo_norm_eps),
+            use_rank_adv=bool(self.learner_config.grpo_use_rank_adv),
+            score_clip=self.learner_config.grpo_score_clip,
+        )
+        out_loss = loss + grpo_coef * grpo_loss.loss
+        out_metrics = {
+            **metrics,
+            "grpo_loss": grpo_loss.loss.detach(),
+            "grpo_score_mean": grpo_loss.score_mean.detach(),
+            "grpo_score_std": grpo_loss.score_std.detach(),
+            "grpo_score_min": grpo_loss.score_min.detach(),
+            "grpo_score_max": grpo_loss.score_max.detach(),
+        }
+        return out_loss, out_metrics
+
+    def _maybe_dump_grpo_debug(
+        self,
+        *,
+        replay: list[Dict[str, Any]],
+        traj_xyyaw: torch.Tensor,
+        candidate_scores: torch.Tensor,
+        batch_idx: int,
+    ) -> None:
+        if not bool(self.learner_config.grpo_debug_visualize):
+            return
+        out_dir = self.learner_config.grpo_debug_dir
+        if out_dir is None or str(out_dir).strip() == "":
+            return
+        max_batches = int(self.learner_config.grpo_debug_max_batches)
+        if max_batches > 0 and self._grpo_debug_dump_count >= max_batches:
+            return
+        dump_fn = getattr(self.agent, "dump_counterfactual_debug_from_replay_batch", None)
+        if not callable(dump_fn):
+            return
+
+        step_tag = f"step{int(getattr(self, 'global_step', 0)):06d}_batch{int(batch_idx):04d}"
+        os.makedirs(str(out_dir), exist_ok=True)
+        dump_fn(
+            replay,
+            traj_xyyaw.detach(),
+            candidate_scores.detach(),
+            out_dir=str(out_dir),
+            step_tag=step_tag,
+            top_k=max(1, int(self.learner_config.grpo_debug_top_k)),
+        )
+        self._grpo_debug_dump_count += 1
 
     def _maybe_log_train_seen_samples(
         self,
@@ -280,6 +378,14 @@ class TrajectoryLightningModule(L.LightningModule):
                     loss=r_loss,
                 )
                 loss = r_loss.loss
+
+            loss, metrics = self._maybe_apply_grpo_loss(
+                replay=replay,
+                device=device,
+                batch_idx=batch_idx,
+                loss=loss,
+                metrics=metrics,
+            )
 
             distill_metrics = _maybe_compute_distillation_metrics(
                 self.agent,

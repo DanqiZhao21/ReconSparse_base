@@ -12,17 +12,34 @@ env:
     allow_short_tail: false
     min: 0
   reward:
-    mode: step
-    dmax: 2.0
-    psi_max_deg: 30.0
-    w_dynamic: 5.0
-    w_static: 5.0
-    w_pos: 2.0
-    w_heading: 1.0
-    w_longitudinal_jerk: 0.05
-    w_yaw_jerk: 0.05
-    jerk_clip: 50.0
+    mode: step_path
     dt: 0.5
+    path:
+      interp_ds_m: 0.25
+      w_progress: 1.0
+      progress_forward_cap_m: 2.0
+      progress_backward_cap_m: 0.5
+      w_lateral: 2.0
+      lateral_free_m: 0.3
+      lateral_huber_delta_m: 0.5
+      w_yaw: 1.0
+      yaw_free_deg: 5.0
+      yaw_huber_delta_deg: 10.0
+      w_anchor_progress: 0.0
+      w_anchor_lateral: 0.0
+      anchor_free_m: 0.2
+      anchor_cap_m: 1.0
+    comfort:
+      w_longitudinal_jerk: 0.05
+      longitudinal_jerk_free: 1.5
+      longitudinal_jerk_delta: 2.0
+      w_yaw_jerk: 0.05
+      yaw_jerk_free: 0.2
+      yaw_jerk_delta: 0.3
+      jerk_clip: 50.0
+    collision:
+      w_static: 5.0
+      w_dynamic: 5.0
     logging:
       wandb:
         enable: true
@@ -64,13 +81,14 @@ train:
     buffer_dir: outputs/actor_learner
     learner_gpu_id: 0
     actor_gpu_pool: [0, 1, 2, 3]
-    actors_per_gpu: 8
+    actors_per_gpu: 2
     auto_max_inflight_per_actor: true
     pause_actor_on_learner_gpu: true
     scene_shard_by_actor: true
     scene_shard_strategy: round_robin
     actor_horizon: 32
-    num_envs_per_actor: 1
+    num_envs_per_actor: 2
+    vec_env_mode: serial
     shards_per_update: 128
     poll_interval_s: 0.2
     max_updates: 50
@@ -82,6 +100,20 @@ train:
   clip_eps: 0.2
   gamma: 0.99
   gae_lambda: 0.95
+  grpo:
+    enable: false
+    config_path: null
+    coef: 0.0
+    num_candidates: 8
+    candidate_select: topk
+    norm_eps: 1.0e-6
+    use_rank_adv: false
+    score_clip: null
+    # debug_visualize: false
+    debug_visualize: true #FIXME:
+    debug_dir: outputs/visualize/grpo_nuscenes
+    debug_max_batches: 0
+    debug_top_k: 4
 
   ddp:
     grad_accum_steps: 1

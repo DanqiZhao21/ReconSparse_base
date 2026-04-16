@@ -30,11 +30,10 @@ def discard_stale_shards(
     shard_files: List[str],
     *,
     cur_weights_version: int,
-    max_version_gap: int,
+    max_version_lag: int,
 ) -> List[str]:
-    max_gap = max(0, min(2, int(max_version_gap)))
-    upcoming = int(cur_weights_version) + 1
-    min_ok = int(upcoming - max_gap)
+    max_lag = max(0, int(max_version_lag))
+    min_ok = int(cur_weights_version) - int(max_lag)
     kept: List[str] = []
     stale: List[str] = []
     for fp in shard_files:
@@ -125,9 +124,25 @@ def select_shards_for_update(
     return files[:need]
 
 
+def resolve_async_shards_per_update(
+    *,
+    requested_shards_per_update: int,
+    num_actors: int,
+    max_inflight_per_actor: int,
+    failed_actor_ids: List[int] | None = None,
+) -> int:
+    failed = {int(actor_id) for actor_id in (failed_actor_ids or [])}
+    alive_actors = max(0, int(num_actors) - len(failed))
+    if alive_actors <= 0:
+        return 0
+    live_capacity = max(1, int(alive_actors)) * max(1, int(max_inflight_per_actor))
+    return min(max(1, int(requested_shards_per_update)), int(live_capacity))
+
+
 __all__ = [
     "discard_incompatible_shards",
     "discard_stale_shards",
     "parse_shard_weights_version",
+    "resolve_async_shards_per_update",
     "select_shards_for_update",
 ]

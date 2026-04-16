@@ -1,0 +1,11 @@
+{
+  "exclude": [
+    "assets",
+    "outputs",
+    "egoADs",
+    "wandb",
+    ".cache",
+    ".pytest_cache",
+    "nuscenes-devkit"
+  ]
+}

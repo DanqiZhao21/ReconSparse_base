@@ -672,6 +672,12 @@ class ReconSimulator(gym.Env):
             out["timestamp"] = np.float32(float(out["frame_idx"]) * 0.1)
         except Exception:
             out["timestamp"] = np.float32(0.0)
+        try:
+            sample_token = self._frame_to_token(int(getattr(self, "now_frame", 0)))
+            if sample_token is not None:
+                out["sample_token"] = str(sample_token)
+        except Exception:
+            pass
         # Ego pose in the simulator's local (front-start) frame.
         try:
             out["ego_pose"] = np.asarray(self.start_ego, dtype=np.float32)

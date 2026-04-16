@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import traceback
 import uuid
 from typing import Any, Dict, Optional
 
@@ -10,11 +11,13 @@ import torch
 from framework.io.buffer import (
     BufferPaths,
     atomic_torch_save,
+    clear_actor_failure,
     count_inflight,
     ensure_buffer_layout,
     read_int,
     stop_requested,
     wait_for_version,
+    write_actor_failure,
 )
 from framework.rollout import collect_single_env_shard, collect_vector_env_shards
 from framework.rollout.timing import format_rollout_timing_summary
@@ -30,6 +33,22 @@ def _stop_before_writing_shard(paths: BufferPaths, *, actor_id: int, shard_count
     return True
 
 
+def resolve_actor_env_runtime(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    train_cfg = cfg.get("train", {}) or {}
+    al_cfg = train_cfg.get("actor_learner", {}) or {}
+    num_envs_per_actor = int(al_cfg.get("num_envs_per_actor", 1))
+    if num_envs_per_actor <= 0:
+        raise ValueError(f"num_envs_per_actor must be >= 1, got {num_envs_per_actor}")
+    vec_env_mode = str(al_cfg.get("vec_env_mode", "serial")).strip().lower()
+    if vec_env_mode not in {"serial", "subproc"}:
+        raise ValueError(f"vec_env_mode must be 'serial' or 'subproc', got {vec_env_mode!r}")
+    return {
+        "num_envs_per_actor": int(num_envs_per_actor),
+        "vec_env_mode": str(vec_env_mode),
+        "use_vector_env": bool(num_envs_per_actor > 1),
+    }
+
+
 def actor_main(
     cfg: Dict[str, Any],
     *,
@@ -37,20 +56,47 @@ def actor_main(
     gpu_id: Optional[int] = None,
     total_actors: Optional[int] = None,
 ) -> None:
+    paths = BufferPaths(root=str(((cfg.get("train", {}) or {}).get("actor_learner", {}) or {}).get("buffer_dir", "outputs/actor_learner")))
+    ensure_buffer_layout(paths)
+    clear_actor_failure(paths, int(actor_id))
+    try:
+        _actor_main_impl(
+            cfg,
+            actor_id=actor_id,
+            gpu_id=gpu_id,
+            total_actors=total_actors,
+            paths=paths,
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        marker_path = write_actor_failure(
+            paths,
+            int(actor_id),
+            message=f"{type(exc).__name__}: {exc}",
+            traceback_text=tb,
+        )
+        stage(f"[actor{actor_id}] fatal error recorded at {marker_path}: {type(exc).__name__}: {exc}")
+        raise
+
+
+def _actor_main_impl(
+    cfg: Dict[str, Any],
+    *,
+    actor_id: int,
+    gpu_id: Optional[int],
+    total_actors: Optional[int],
+    paths: BufferPaths,
+) -> None:
     train_cfg = cfg.get("train", {}) or {}
     al_cfg = train_cfg.get("actor_learner", {}) or {}
-    paths = BufferPaths(root=str(al_cfg.get("buffer_dir", "outputs/actor_learner")))
-    ensure_buffer_layout(paths)
 
     mode = str(al_cfg.get("mode", "sync")).strip().lower()
     horizon = int(al_cfg.get("actor_horizon", 32))
     max_inflight = int(al_cfg.get("max_inflight_per_actor", 2))
     poll_s = float(al_cfg.get("poll_interval_s", 0.2))
-    num_envs_per_actor = max(1, int(al_cfg.get("num_envs_per_actor", 1)))
-    vec_env_mode = str(al_cfg.get("vec_env_mode", "serial")).strip().lower()
-    if num_envs_per_actor != 1:
-        stage(f"[actor{actor_id}] forcing num_envs_per_actor=1 (process-level parallel only)")
-        num_envs_per_actor = 1
+    runtime_cfg = resolve_actor_env_runtime(cfg)
+    num_envs_per_actor = int(runtime_cfg["num_envs_per_actor"])
+    vec_env_mode = str(runtime_cfg["vec_env_mode"])
 
     if torch.cuda.is_available():
         if gpu_id is None:
@@ -81,6 +127,8 @@ def actor_main(
     mode_select = str(train_cfg.get("policy_mode_select", train_cfg.get("ddv2_mode_select", "sample"))).strip().lower()
     shard_idx = 0
     shard_idx_per_env = [0 for _ in range(int(num_envs_per_actor))]
+    if bool(runtime_cfg["use_vector_env"]):
+        stage(f"[actor{actor_id}] batched actor mode enabled num_envs_per_actor={num_envs_per_actor} vec_env_mode={vec_env_mode}")
 
     if num_envs_per_actor == 1:
         env = build_actor_env(
@@ -155,13 +203,31 @@ def actor_main(
         env_fns = []
         for i in range(int(num_envs_per_actor)):
             wid = int(actor_id) * 1000 + int(i)
-            env_fns.append(lambda i=i: build_actor_env(cfg, cuda=int(cuda if cuda >= 0 else 0), actor_id=int(actor_id), worker_id=int(wid)))
+            env_fns.append(
+                lambda i=i, wid=wid: build_actor_env(
+                    cfg,
+                    cuda=int(cuda if cuda >= 0 else 0),
+                    actor_id=int(actor_id),
+                    worker_id=int(wid),
+                    total_actors=(
+                        int(total_actors)
+                        if total_actors is not None
+                        else max(1, int(al_cfg.get("num_actors", 1)))
+                    ),
+                )
+            )
         vec_env = SerialVecEnv(env_fns) if not vec_env_mode.startswith("sub") else SubprocVecEnv(env_fns)
         obs_list, _info = vec_env.reset()
         while True:
             if stop_requested(paths):
                 stage(f"[actor{actor_id}] stop requested; exiting")
                 break
+            if pause_actor_on_learner_gpu and int(cuda) >= 0 and int(cuda) == int(learner_gpu_id):
+                while os.path.exists(training_lock_file):
+                    if stop_requested(paths):
+                        stage(f"[actor{actor_id}] stop requested during learner-train pause; exiting")
+                        return
+                    time.sleep(poll_s)
             reserve = max(1, int(num_envs_per_actor))
             backpressure_wait_t0 = time.perf_counter()
             while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
@@ -213,5 +279,4 @@ def actor_main(
                     stage(f"[actor{actor_id}] stop requested after sync wait; exiting")
                     break
 
-
-__all__ = ["actor_main"]
+__all__ = ["actor_main", "resolve_actor_env_runtime"]
