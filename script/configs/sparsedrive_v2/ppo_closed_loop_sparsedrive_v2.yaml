@@ -96,16 +96,18 @@ train:
   lr_value: 1.0e-4
   critic_use_agent_features: true
   critic_hidden_dim: 256
+
+
   epochs: 2
-  # minibatch_size: 64
-  minibatch_size: 4
+  # minibatch_size: 4 // 64
+  minibatch_size: 16
   clip_eps: 0.2
   gamma: 0.99
   gae_lambda: 0.95
   grpo:
     enable: true
     config_path: null
-    coef: 0.0
+    coef: 0.1 #FIXME:
     num_candidates: 8
     candidate_select: topk
     norm_eps: 1.0e-6
@@ -113,16 +115,16 @@ train:
     score_clip: null
     # debug_visualize: false
     debug_visualize: true #FIXME:
-    debug_dir: outputs/visualize/grpo_nuscenes
-    debug_max_batches: 0
-    debug_top_k: 24
+    debug_dir: outputs/visualize/grpo_nuscenes_ppo
+    debug_max_batches: 24
+    debug_top_k: 8
   ppo:
     forward_kl_coef: 0.2
     reverse_kl_coef: 0.5
     distill_temperature: 1.0
 
   ddp:
-    grad_accum_steps: 16
+    grad_accum_steps: 8
     seed: 42
 
 agent:

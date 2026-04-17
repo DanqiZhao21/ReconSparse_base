@@ -86,7 +86,7 @@ train:
 
   actor_learner:
     mode: async
-    buffer_dir: outputs/actor_learner
+    buffer_dir: outputs/actor_learner_reinfroce
     learner_gpu_id: 0
     # actor_gpu_pool: [0, 1, 2, 3]#FIXME:之后更新热插拔
     actor_gpu_pool: [1, 2, 3]
@@ -107,12 +107,12 @@ train:
   gamma: 0.99
 
   ddp:
-    grad_accum_steps: 16 #FIXME:minibatch_size*grad_accum_steps should equal total steps per update 
+    grad_accum_steps: 8 #FIXME:minibatch_size*grad_accum_steps should equal total steps per update 
 
   grpo:
     enable: true
     config_path: null
-    coef: 0.0
+    coef: 0.1
     num_candidates: 8
     candidate_select: topk
     norm_eps: 1.0e-6
@@ -120,9 +120,9 @@ train:
     score_clip: null
     # debug_visualize: false
     debug_visualize: true #FIXME:
-    debug_dir: outputs/visualize/grpo_nuscenes
-    debug_max_batches: 0
-    debug_top_k: 24
+    debug_dir: outputs/visualize/grpo_nuscenes_reinforce
+    debug_max_batches: 24
+    debug_top_k: 8
 
   reinforcepp:
     norm_eps: 1.0e-8

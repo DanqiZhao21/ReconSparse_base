@@ -837,7 +837,7 @@ class SparseDriveV2Policy(Agent):
         )
 
         return {
-            "traj_xyyaw": traj_xyyaw.detach().cpu(),
+            "traj_xyyaw": traj_xyyaw.detach(),
             "log_probs": selected_log_probs,
             "mode_indices": selected_indices.to(dtype=torch.long),
             "score_logits": selected_score_logits,

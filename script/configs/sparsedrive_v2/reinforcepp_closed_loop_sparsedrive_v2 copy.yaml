@@ -120,7 +120,7 @@ train:
     score_clip: null
     # debug_visualize: false
     debug_visualize: true #FIXME:
-    debug_dir: outputs/visualize/grpo_nuscenes
+    debug_dir: outputs/visualize/grpo_nuscenes_reinforce
     debug_max_batches: 0
     debug_top_k: 24
 
