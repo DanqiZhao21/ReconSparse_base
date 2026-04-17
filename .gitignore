@@ -46,6 +46,8 @@ outputs/
 wandb/
 .worktrees/
 
+tmp/
+
 /root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0311.py
 /root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0307.py
 

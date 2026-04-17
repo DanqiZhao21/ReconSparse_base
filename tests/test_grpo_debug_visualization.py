@@ -103,7 +103,7 @@ def test_grpo_debug_dump_runs_without_aux_loss_and_zero_max_batches_is_unlimited
     assert sorted(path.name for path in tmp_path.iterdir()) == ["step000000_batch0000.txt", "step000000_batch0001.txt"]
 
 
-def test_nuscenes_debug_dump_rebases_gt_and_exports_bev_scene_context(
+def test_nuscenes_debug_dump_exports_cumulative_gt_and_bev_scene_context(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -196,15 +196,16 @@ def test_nuscenes_debug_dump_rebases_gt_and_exports_bev_scene_context(
     assert len(artifacts) == 1
     payload = json.loads(Path(artifacts[0]["json_path"]).read_text())
     assert Path(artifacts[0]["png_path"]).exists()
-    assert payload["gt_xy"][0] == pytest.approx([0.0, 0.0])
-    assert payload["gt_history_xy"][-1][0] < 0.0
+    assert payload["gt_xy"][0] == pytest.approx([3.0, 1.0])
+    assert payload["gt_xy"][-1] == pytest.approx([10.0, 3.6])
+    assert payload["gt_history_xy"][-1][0] > 0.0
     assert payload["scene_objects"][0]["category"] == "car"
     assert payload["scene_objects"][1]["category"] == "pedestrian"
     assert payload["map_layers"]["drivable_area"]
     assert payload["map_layers"]["lane_centerline"]
 
 
-def test_nuscenes_scorer_prefers_candidates_aligned_with_rebased_gt(
+def test_nuscenes_scorer_prefers_candidates_aligned_with_cumulative_gt(
     tmp_path: Path,
 ) -> None:
     token = "tok-score"
@@ -230,22 +231,22 @@ def test_nuscenes_scorer_prefers_candidates_aligned_with_rebased_gt(
     scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
     aligned = np.asarray(
         [
+            [3.0, 1.0, 0.0],
+            [6.3, 2.2, 0.0],
+            [10.0, 3.6, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    misaligned = np.asarray(
+        [
             [0.0, 0.0, 0.0],
             [0.3, 0.2, 0.0],
             [0.7, 0.4, 0.0],
         ],
         dtype=np.float32,
     )
-    raw_offset = np.asarray(
-        [
-            [3.0, 1.0, 0.0],
-            [3.3, 1.2, 0.0],
-            [3.7, 1.4, 0.0],
-        ],
-        dtype=np.float32,
-    )
     candidate_batch = torch.from_numpy(
-        np.stack([aligned, raw_offset], axis=0)[None, ...]
+        np.stack([aligned, misaligned], axis=0)[None, ...]
     )
 
     scores = scorer.score(
@@ -254,6 +255,66 @@ def test_nuscenes_scorer_prefers_candidates_aligned_with_rebased_gt(
     )
 
     assert float(scores[0, 0]) > float(scores[0, 1])
+
+
+def test_nuscenes_debug_dump_trims_zero_padded_gt_future(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token = "tok-padded"
+    token2vad_path = tmp_path / "token2vad.pkl"
+    with token2vad_path.open("wb") as f:
+        pickle.dump(
+            {
+                token: {
+                    "token": token,
+                    "gt_ego_fut_trajs": np.asarray(
+                        [
+                            [1.0, 3.0],
+                            [1.2, 3.3],
+                            [1.4, 3.7],
+                            [0.0, 0.0],
+                            [0.0, 0.0],
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+            },
+            f,
+        )
+
+    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    monkeypatch.setattr(
+        scorer,
+        "_lookup_map_layers",
+        lambda row, *, patch_radius=30.0: {
+            "patch_radius": float(patch_radius),
+            "layers": {},
+        },
+        raising=False,
+    )
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.3, 0.2, 0.0], [0.7, 0.4, 0.0], [1.0, 0.5, 0.0], [1.2, 0.6, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    artifacts = scorer.dump_debug_artifacts(
+        [{"sample_token": token}],
+        traj_xyyaw,
+        out_dir=tmp_path,
+        step_tag="step000001_batch0000",
+        top_k=1,
+    )
+
+    assert len(artifacts) == 1
+    payload = json.loads(Path(artifacts[0]["json_path"]).read_text())
+    assert len(payload["gt_xy"]) == 3
+    assert payload["gt_xy"][-1] == pytest.approx([10.0, 3.6])
 
 
 def test_nuscenes_render_layers_builds_filled_road_and_lane_guides() -> None:

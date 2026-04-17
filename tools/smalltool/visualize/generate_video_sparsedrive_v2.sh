@@ -177,4 +177,4 @@ exec "${CMD[@]}"
 # bash tools/smalltool/visualize/generate_video_sparsedrive_v2.sh --scene=99
 # bash tools/smalltool/visualize/generate_video_sparsedrive_v2.sh --scene 99 --cuda 0
 # bash tools/smalltool/visualize/generate_video_sparsedrive_v2.sh --scene 99 --duration-s 20
-# bash tools/smalltool/visualize/generate_video_sparsedrive_v2.sh --scene 99 --ckpt /abs/path/to/sparsedrive_navsimv2.ckpt
+# bash tools/smalltool/visualize/generate_video_sparsedrive_v2.sh --scene 99 --ckpt /root/clone/ReconDreamer-RL/outputs/weight/20260417_ppo_grpo_ver14_latest.ckpt

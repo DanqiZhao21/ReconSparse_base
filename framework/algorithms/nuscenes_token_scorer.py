@@ -140,15 +140,65 @@ class NuScenesTokenScorer:
         return self._token2vad
 
     @staticmethod
-    def _gt_to_env_xy(gt_ego_fut_trajs: np.ndarray) -> np.ndarray:
+    def _gt_to_env_xy(gt_ego_fut_trajs: np.ndarray, *, cumulative: bool = True) -> np.ndarray:
         gt = np.asarray(gt_ego_fut_trajs, dtype=np.float32)
         if gt.ndim != 2 or gt.shape[1] < 2:
             raise RuntimeError(f"Expected gt_ego_fut_trajs with shape (T, 2+), got {gt.shape}")
-        # token2vad stores local future as (lateral, forward); simulator/policy uses (forward, left).
+        # token2vad stores local future as (lateral, forward) step deltas.
+        # Policy candidates are cumulative future waypoints in (forward, left), so convert here.
         out = np.zeros((gt.shape[0], 2), dtype=np.float32)
         out[:, 0] = gt[:, 1]
         out[:, 1] = gt[:, 0]
+        if bool(cumulative) and int(out.shape[0]) > 0:
+            out = np.cumsum(out, axis=0, dtype=np.float32)
         return out
+
+    @staticmethod
+    def _normalize_traj_valid_mask(mask_like: Any, expected_len: int) -> np.ndarray | None:
+        if mask_like is None:
+            return None
+        mask_arr = np.asarray(mask_like).reshape(-1)
+        if mask_arr.size <= 0:
+            return None
+        mask_bool = (mask_arr[:expected_len] > 0).astype(bool, copy=False)
+        if mask_bool.size <= 0 or int(np.count_nonzero(mask_bool)) <= 0:
+            return None
+        return mask_bool
+
+    @classmethod
+    def _sanitize_local_traj_xy(
+        cls,
+        traj_any: Any,
+        *,
+        valid_mask_any: Any = None,
+        min_trailing_zero_pad: int = 2,
+    ) -> np.ndarray:
+        traj = np.asarray(traj_any, dtype=np.float32)
+        if traj.ndim != 2 or traj.shape[1] < 2:
+            return np.zeros((0, 2), dtype=np.float32)
+        xy = traj[:, :2]
+        finite = np.isfinite(xy).all(axis=1)
+        if int(np.count_nonzero(finite)) <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        valid_mask = cls._normalize_traj_valid_mask(valid_mask_any, expected_len=int(xy.shape[0]))
+        if valid_mask is not None:
+            keep = finite & valid_mask
+            if int(np.count_nonzero(keep)) <= 0:
+                return np.zeros((0, 2), dtype=np.float32)
+            return xy[keep].astype(np.float32, copy=False)
+
+        finite_idx = np.where(finite)[0]
+        xy_finite = xy[: int(finite_idx[-1]) + 1]
+        nonzero = np.linalg.norm(xy_finite, axis=1) > 1.0e-6
+        if int(np.count_nonzero(nonzero)) <= 0:
+            return xy_finite.astype(np.float32, copy=False)
+
+        last_nonzero = int(np.where(nonzero)[0][-1])
+        trailing = int(xy_finite.shape[0]) - (last_nonzero + 1)
+        if trailing >= int(min_trailing_zero_pad):
+            return xy_finite[: last_nonzero + 1].astype(np.float32, copy=False)
+        return xy_finite.astype(np.float32, copy=False)
 
     def _lookup_row(self, sample_token: str) -> dict[str, Any]:
         token2vad = self._ensure_loaded()
@@ -162,7 +212,11 @@ class NuScenesTokenScorer:
         gt = row.get("gt_ego_fut_trajs", None)
         if gt is None:
             raise RuntimeError(f"sample_token={sample_token!r} missing gt_ego_fut_trajs")
-        return self._gt_to_env_xy(np.asarray(gt, dtype=np.float32))
+        gt_local = self._sanitize_local_traj_xy(
+            gt,
+            valid_mask_any=row.get("gt_ego_fut_masks", row.get("gt_ego_fut_mask", row.get("gt_ego_fut_valid", None))),
+        )
+        return self._gt_to_env_xy(gt_local, cumulative=True)
 
     @staticmethod
     def _rebase_xy(points_xy: np.ndarray, origin_xy: np.ndarray | None) -> np.ndarray:
@@ -202,7 +256,11 @@ class NuScenesTokenScorer:
         history = row.get("gt_ego_his_trajs", None)
         if history is None:
             return np.zeros((0, 2), dtype=np.float32)
-        history_xy = self._gt_to_env_xy(np.asarray(history, dtype=np.float32))
+        history_local = self._sanitize_local_traj_xy(
+            history,
+            valid_mask_any=row.get("gt_ego_his_masks", row.get("gt_ego_his_mask", row.get("gt_ego_his_valid", None))),
+        )
+        history_xy = self._gt_to_env_xy(history_local, cumulative=False)
         return self._rebase_xy(history_xy, origin_xy)
 
     @staticmethod
@@ -629,12 +687,12 @@ class NuScenesTokenScorer:
                 raise RuntimeError("NuScenesTokenScorer requires replay['sample_token']")
             row = self._lookup_row(str(sample_token))
             gt_xy_raw = self._lookup_gt(str(sample_token))
-            gt_origin_xy = gt_xy_raw[0].copy() if int(gt_xy_raw.shape[0]) > 0 else np.zeros((2,), dtype=np.float32)
-            gt_xy = self._rebase_xy(gt_xy_raw, gt_origin_xy)
+            gt_origin_xy = np.zeros((2,), dtype=np.float32)
+            gt_xy = gt_xy_raw.copy()
             gt_yaw = _path_yaw_from_xy(gt_xy)
             gt_s = _polyline_arclength(gt_xy)#给 GT 轨迹加一个“里程表”
             gt_total_len = float(max(1e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
-            gt_history_xy = self._lookup_gt_history(row, origin_xy=gt_origin_xy) if include_debug_context else np.zeros((0, 2), dtype=np.float32)
+            gt_history_xy = self._lookup_gt_history(row, origin_xy=None) if include_debug_context else np.zeros((0, 2), dtype=np.float32)
             map_context = (
                 self._lookup_map_layers(row, patch_radius=_DEFAULT_PATCH_RADIUS_M)
                 if include_debug_context
@@ -814,8 +872,7 @@ class NuScenesTokenScorer:
             if sample_token is None:
                 raise RuntimeError("NuScenesTokenScorer requires replay['sample_token']")
             gt_xy_raw = self._lookup_gt(str(sample_token))
-            gt_origin_xy = gt_xy_raw[0].copy() if int(gt_xy_raw.shape[0]) > 0 else np.zeros((2,), dtype=np.float32)
-            gt_arrays.append(self._rebase_xy(gt_xy_raw, gt_origin_xy))
+            gt_arrays.append(gt_xy_raw)
 
         batch_size = len(gt_arrays)
         max_gt_horizon = max([1, *[int(arr.shape[0]) for arr in gt_arrays]])
