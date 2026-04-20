@@ -17,9 +17,11 @@ except Exception:
 
 try:
     from shapely import affinity as shapely_affinity
+    from shapely.geometry import Point as ShapelyPoint
     from shapely.geometry import Polygon as ShapelyPolygon
 except Exception:
     shapely_affinity = None
+    ShapelyPoint = None
     ShapelyPolygon = None
 
 
@@ -49,6 +51,11 @@ _MAP_LINE_LAYERS = (
     "road_divider",
 )
 _DEFAULT_PATCH_RADIUS_M = 20.0
+_DEFAULT_SCENE_CACHE_ROOT = Path(__file__).resolve().parents[2] / "assets" / "nus" / "data"
+_DEFAULT_TTC_FUTURE_OFFSETS_S = (0.0, 0.3, 0.6, 0.9)
+_DEFAULT_TTC_STOPPED_SPEED_THRESHOLD_MPS = 5.0e-3
+_DEFAULT_DIRECTION_COMPLIANCE_THRESHOLD_M = 2.0
+_DEFAULT_DIRECTION_VIOLATION_THRESHOLD_M = 6.0
 
 
 def _wrap_angle(angle: np.ndarray) -> np.ndarray:
@@ -98,6 +105,15 @@ def _project_progress(point_xy: np.ndarray, path_xy: np.ndarray, path_s: np.ndar
     return best_s
 
 
+def _linear_decay_score(value: float, *, good_threshold: float, bad_threshold: float) -> float:
+    if value <= good_threshold:
+        return 1.0
+    if value >= bad_threshold:
+        return 0.0
+    span = max(1.0e-6, bad_threshold - good_threshold)
+    return float(np.clip((bad_threshold - value) / span, 0.0, 1.0))
+
+
 class NuScenesTokenScorer:
     def __init__(
         self,
@@ -105,13 +121,16 @@ class NuScenesTokenScorer:
         token2vad_path: str | Path,
         nuscenes_dataroot: str | Path | None = None,
         nuscenes_version: str = _DEFAULT_NUSCENES_VERSION,
+        scene_cache_root: str | Path | None = None,
     ) -> None:
         self.token2vad_path = Path(token2vad_path)
         self._token2vad: dict[str, dict[str, Any]] | None = None
         self.nuscenes_version = str(nuscenes_version)
         self.nuscenes_dataroot = self._resolve_nuscenes_dataroot(nuscenes_dataroot)
+        self.scene_cache_root = Path(scene_cache_root) if scene_cache_root is not None else _DEFAULT_SCENE_CACHE_ROOT
         self._nusc: Any | None = None
         self._map_cache: dict[str, Any] = {}
+        self._scene_env_cache: dict[int, dict[int, dict[str, Any]]] = {}
 
     @staticmethod
     def _resolve_nuscenes_dataroot(explicit_root: str | Path | None) -> Path | None:
@@ -346,10 +365,13 @@ class NuScenesTokenScorer:
             sample_token = str(row.get("token", ""))
             if sample_token == "":
                 return {"patch_radius": float(patch_radius), "layers": {}}
-            sample_record = nusc.get("sample", sample_token)
-            scene_record = nusc.get("scene", sample_record["scene_token"])
-            log_record = nusc.get("log", scene_record["log_token"])
-            location = log_record["location"]
+            try:
+                sample_record = nusc.get("sample", sample_token)
+                scene_record = nusc.get("scene", sample_record["scene_token"])
+                log_record = nusc.get("log", scene_record["log_token"])
+                location = log_record["location"]
+            except Exception:
+                return {"patch_radius": float(patch_radius), "layers": {}}
         location = str(location)
         if location not in self._map_cache:
             try:
@@ -436,6 +458,187 @@ class NuScenesTokenScorer:
             layers["lane_centerline"] = centerlines
 
         return {"patch_radius": float(patch_radius), "layers": layers}
+
+    def _scene_env_cache_path(self, scene_id: int) -> Path:
+        return self.scene_cache_root / f"{int(scene_id):03d}" / "env_cache.json"
+
+    def _load_scene_env_cache(self, scene_id: int) -> dict[int, dict[str, Any]]:
+        scene_key = int(scene_id)
+        cached = self._scene_env_cache.get(scene_key, None)
+        if cached is not None:
+            return cached
+        path = self._scene_env_cache_path(scene_key)
+        if not path.exists():
+            self._scene_env_cache[scene_key] = {}
+            return self._scene_env_cache[scene_key]
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict) and "meta" in loaded:
+            loaded = {key: value for key, value in loaded.items() if key != "meta"}
+        cache = {int(key): value for key, value in dict(loaded).items()}
+        self._scene_env_cache[scene_key] = cache
+        return cache
+
+    def _lookup_scene_snapshot(self, replay: dict[str, Any]) -> dict[str, Any] | None:
+        scene_id = replay.get("scene_id", None)
+        frame_idx = replay.get("frame_idx", None)
+        if scene_id is None or frame_idx is None:
+            return None
+        try:
+            cache = self._load_scene_env_cache(int(scene_id))
+        except Exception:
+            return None
+        return cache.get(int(frame_idx), None)
+
+    @staticmethod
+    def _global_xy_to_snapshot_local(points_xy: np.ndarray, snapshot: dict[str, Any]) -> np.ndarray:
+        pts = np.asarray(points_xy, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[1] < 2:
+            return np.zeros((0, 2), dtype=np.float32)
+        ego_pose = dict(snapshot.get("ego_pose", {}))
+        center = np.asarray([ego_pose.get("x", 0.0), ego_pose.get("y", 0.0)], dtype=np.float32)
+        yaw = float(ego_pose.get("yaw", 0.0))
+        delta = pts[:, :2] - center.reshape(1, 2)
+        c = math.cos(-yaw)
+        s = math.sin(-yaw)
+        rot = np.asarray([[c, -s], [s, c]], dtype=np.float32)
+        return delta @ rot.T
+
+    def _lookup_cached_map_layers(
+        self,
+        replay: dict[str, Any],
+        *,
+        patch_radius: float = _DEFAULT_PATCH_RADIUS_M,
+    ) -> dict[str, Any] | None:
+        snapshot = self._lookup_scene_snapshot(replay)
+        if snapshot is None:
+            return None
+
+        layers: dict[str, list[list[list[float]]]] = {}
+        drivable = []
+        for polygon in snapshot.get("drivable_polygons", []) or []:
+            local = self._global_xy_to_snapshot_local(np.asarray(polygon, dtype=np.float32), snapshot)
+            if local.shape[0] >= 3:
+                drivable.append(local.astype(np.float32).tolist())
+        if drivable:
+            layers["drivable_area"] = drivable
+
+        centerlines = []
+        for line in snapshot.get("lanes_centerlines", []) or []:
+            local = self._global_xy_to_snapshot_local(np.asarray(line, dtype=np.float32), snapshot)
+            if local.shape[0] >= 2:
+                centerlines.append(local.astype(np.float32).tolist())
+        if centerlines:
+            layers["lane_centerline"] = centerlines
+
+        return {"patch_radius": float(patch_radius), "layers": layers}
+
+    @staticmethod
+    def _safe_float_list(values: Any) -> list[float]:
+        arr = np.asarray(values, dtype=np.float32).reshape(-1)
+        return [float(item) for item in arr.tolist()]
+
+    @staticmethod
+    def _point_in_polygon(point_xy: np.ndarray, polygon_xy: np.ndarray) -> bool:
+        point = np.asarray(point_xy, dtype=np.float32).reshape(-1)
+        polygon = np.asarray(polygon_xy, dtype=np.float32)
+        if point.shape[0] < 2 or polygon.ndim != 2 or polygon.shape[0] < 3:
+            return False
+        if ShapelyPolygon is not None and ShapelyPoint is not None:
+            try:
+                poly = ShapelyPolygon(polygon[:, :2])
+                return bool(poly.buffer(1.0e-6).contains(ShapelyPoint(float(point[0]), float(point[1]))))
+            except Exception:
+                pass
+
+        inside = False
+        x = float(point[0])
+        y = float(point[1])
+        for idx in range(int(polygon.shape[0])):
+            x0, y0 = [float(item) for item in polygon[idx - 1, :2]]
+            x1, y1 = [float(item) for item in polygon[idx, :2]]
+            intersects = ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / max(1.0e-8, (y1 - y0)) + x0)
+            if intersects:
+                inside = not inside
+        return bool(inside)
+
+    @classmethod
+    def _point_in_polygons(cls, point_xy: np.ndarray, polygons: Sequence[Any]) -> bool:
+        for polygon in polygons or []:
+            if cls._point_in_polygon(point_xy, np.asarray(polygon, dtype=np.float32)):
+                return True
+        return False
+
+    @staticmethod
+    def _nearest_centerline_stats(point_xy: np.ndarray, centerlines: Sequence[Any]) -> tuple[float, np.ndarray]:
+        point = np.asarray(point_xy, dtype=np.float32).reshape(2)
+        best_dist = float("inf")
+        best_tangent = np.asarray([1.0, 0.0], dtype=np.float32)
+        for line in centerlines or []:
+            pts = np.asarray(line, dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[0] < 2:
+                continue
+            for idx in range(int(pts.shape[0]) - 1):
+                p0 = pts[idx, :2]
+                p1 = pts[idx + 1, :2]
+                seg = p1 - p0
+                seg_len_sq = float(np.dot(seg, seg))
+                if seg_len_sq <= 1.0e-8:
+                    continue
+                alpha = float(np.dot(point - p0, seg) / seg_len_sq)
+                alpha = max(0.0, min(1.0, alpha))
+                proj = p0 + alpha * seg
+                dist = float(np.linalg.norm(point - proj))
+                if dist < best_dist:
+                    best_dist = dist
+                    norm = float(np.linalg.norm(seg))
+                    if norm > 1.0e-8:
+                        best_tangent = (seg / norm).astype(np.float32)
+        return best_dist, best_tangent
+
+    @classmethod
+    def _collect_scene_objects(
+        cls,
+        row: dict[str, Any],
+        *,
+        patch_radius: float,
+    ) -> list[dict[str, Any]]:
+        boxes = np.asarray(row.get("gt_boxes", np.zeros((0, 7), dtype=np.float32)), dtype=np.float32)
+        if boxes.ndim != 2 or boxes.shape[0] <= 0:
+            return []
+        velocities = np.asarray(row.get("gt_velocity", np.zeros((boxes.shape[0], 2), dtype=np.float32)), dtype=np.float32)
+        names = np.asarray(row.get("gt_names", np.asarray([], dtype=object)))
+        valid = np.asarray(row.get("valid_flag", np.ones((boxes.shape[0],), dtype=bool)))
+        lidar_pts = np.asarray(row.get("num_lidar_pts", np.zeros((boxes.shape[0],), dtype=np.int64)))
+        radar_pts = np.asarray(row.get("num_radar_pts", np.zeros((boxes.shape[0],), dtype=np.int64)))
+        objects: list[dict[str, Any]] = []
+        for idx, box in enumerate(boxes):
+            if idx < valid.shape[0] and not bool(valid[idx]):
+                continue
+            center = np.asarray(box[:2], dtype=np.float32)
+            if float(np.linalg.norm(center)) > float(patch_radius) * 1.5:
+                continue
+            width = float(abs(box[3])) if box.shape[0] > 3 else 1.0
+            length = float(abs(box[4])) if box.shape[0] > 4 else 1.0
+            yaw = float(box[6]) if box.shape[0] > 6 else 0.0
+            category = str(names[idx]) if idx < names.shape[0] else "unknown"
+            velocity_xy = velocities[idx, :2].astype(np.float32) if idx < velocities.shape[0] else np.zeros((2,), dtype=np.float32)
+            corners = cls._box_corners_xy(center[0], center[1], length, width, yaw).astype(np.float32)
+            objects.append(
+                {
+                    "category": category,
+                    "center_xy": center.astype(np.float32),
+                    "velocity_xy": velocity_xy,
+                    "length_m": length,
+                    "width_m": width,
+                    "yaw_rad": yaw,
+                    "speed_mps": float(np.linalg.norm(velocity_xy)),
+                    "num_lidar_pts": int(lidar_pts[idx]) if idx < lidar_pts.shape[0] else 0,
+                    "num_radar_pts": int(radar_pts[idx]) if idx < radar_pts.shape[0] else 0,
+                    "corners_xy": corners,
+                }
+            )
+        return objects
 
     @staticmethod
     def _category_color(category: str) -> str:
@@ -663,12 +866,211 @@ class NuScenesTokenScorer:
             "lane_direction_arrows": cls._centerline_arrows(lane_centerlines),
         }
 
-    def _score_batch(
+    @staticmethod
+    def _ego_corners_from_state(xy: np.ndarray, yaw: float) -> np.ndarray:
+        return NuScenesTokenScorer._box_corners_xy(
+            float(xy[0]),
+            float(xy[1]),
+            length=4.9,
+            width=2.1,
+            yaw=float(yaw),
+        )
+
+    @staticmethod
+    def _polygon_intersects(poly_a: np.ndarray, poly_b: np.ndarray) -> bool:
+        arr_a = np.asarray(poly_a, dtype=np.float32)
+        arr_b = np.asarray(poly_b, dtype=np.float32)
+        if ShapelyPolygon is not None:
+            try:
+                return bool(ShapelyPolygon(arr_a[:, :2]).intersects(ShapelyPolygon(arr_b[:, :2])))
+            except Exception:
+                pass
+        min_a = arr_a[:, :2].min(axis=0)
+        max_a = arr_a[:, :2].max(axis=0)
+        min_b = arr_b[:, :2].min(axis=0)
+        max_b = arr_b[:, :2].max(axis=0)
+        overlap = np.logical_and(max_a >= min_b, max_b >= min_a)
+        return bool(np.all(overlap))
+
+    def _score_candidate_pdm_like(
+        self,
+        *,
+        cand_xy: np.ndarray,
+        cand_yaw: np.ndarray,
+        gt_xy_cmp: np.ndarray,
+        gt_yaw_cmp: np.ndarray,
+        gt_xy_full: np.ndarray,
+        gt_s_full: np.ndarray,
+        gt_total_len: float,
+        centerlines: Sequence[Any],
+        drivable_polygons: Sequence[Any],
+        scene_objects: Sequence[dict[str, Any]],
+        dt_s: float,
+    ) -> dict[str, Any]:
+        horizon = int(cand_xy.shape[0])
+        if horizon <= 0:
+            return {
+                "score": 0.0,
+                "weighted_score": 0.0,
+                "multiplicative_product": 0.0,
+                "multiplicative_metrics": {
+                    "no_collision": 0.0,
+                    "drivable_area": 0.0,
+                    "driving_direction": 1.0,
+                },
+                "weighted_metrics": {
+                    "progress": 0.0,
+                    "ttc": 0.0,
+                    "lane_keeping": 0.0,
+                    "history_comfort": 0.0,
+                },
+            }
+
+        pos_err = np.linalg.norm(cand_xy - gt_xy_cmp, axis=1) if gt_xy_cmp.size else np.zeros((horizon,), dtype=np.float32)
+        first_err = float(pos_err[0]) if pos_err.size else 0.0
+        final_err = float(pos_err[-1]) if pos_err.size else 0.0
+        mean_err = float(pos_err.mean()) if pos_err.size else 0.0
+        yaw_err = np.abs(_wrap_angle(cand_yaw - gt_yaw_cmp)) if gt_yaw_cmp.size else np.zeros((horizon,), dtype=np.float32)
+        mean_yaw_err = float(yaw_err.mean()) if yaw_err.size else 0.0
+
+        cand_progress = _project_progress(cand_xy[-1], gt_xy_full, gt_s_full) if gt_xy_full.shape[0] > 0 else 0.0
+        progress_ratio = float(np.clip(cand_progress / max(1.0e-6, gt_total_len), 0.0, 1.0))
+
+        cand_prev = np.concatenate([np.zeros((1, 2), dtype=np.float32), cand_xy[:-1]], axis=0)
+        cand_vel = cand_xy - cand_prev
+        cand_acc = cand_vel[1:] - cand_vel[:-1] if cand_vel.shape[0] > 1 else np.zeros((0, 2), dtype=np.float32)
+        cand_speed = np.linalg.norm(cand_vel, axis=1) / max(1.0e-6, float(dt_s))
+        cand_yaw_prev = np.concatenate([cand_yaw[:1], cand_yaw[:-1]], axis=0)
+        cand_yaw_rate = np.abs(_wrap_angle(cand_yaw - cand_yaw_prev)) / max(1.0e-6, float(dt_s))
+        smooth_pen = float(np.linalg.norm(cand_acc, axis=1).mean()) if cand_acc.size else 0.0
+        comfort_cost = smooth_pen + 0.25 * float(cand_yaw_rate.mean()) if cand_yaw_rate.size else smooth_pen
+        history_comfort = float(np.clip(1.0 - 0.08 * comfort_cost, 0.0, 1.0))
+
+        lateral_errors: list[float] = []
+        oncoming_progress_m = 0.0
+        for step_idx in range(horizon):
+            lateral_dist, tangent = self._nearest_centerline_stats(cand_xy[step_idx], centerlines)
+            lateral_errors.append(lateral_dist)
+            move_vec = cand_vel[step_idx]
+            move_norm = float(np.linalg.norm(move_vec))
+            if move_norm > 1.0e-6:
+                move_dir = (move_vec / move_norm).astype(np.float32)
+                reverse_alignment = max(0.0, -float(np.dot(move_dir, tangent)))
+                oncoming_progress_m += move_norm * reverse_alignment
+        mean_lateral = float(np.mean(lateral_errors)) if lateral_errors else 0.0
+        lane_keeping = float(np.clip(1.0 - (mean_lateral / 2.0), 0.0, 1.0)) if centerlines else float(
+            np.clip(1.0 - 0.25 * mean_err, 0.0, 1.0)
+        )
+        driving_direction = _linear_decay_score(
+            oncoming_progress_m,
+            good_threshold=_DEFAULT_DIRECTION_COMPLIANCE_THRESHOLD_M,
+            bad_threshold=_DEFAULT_DIRECTION_VIOLATION_THRESHOLD_M,
+        )
+
+        offroad = any(not self._point_in_polygons(cand_xy[step_idx], drivable_polygons) for step_idx in range(horizon)) if drivable_polygons else False
+        drivable_area = 0.0 if offroad else 1.0
+
+        collision = False
+        earliest_ttc_risk_s = float("inf")
+        for obj in scene_objects:
+            obj_center = np.asarray(obj["center_xy"], dtype=np.float32).reshape(2)
+            obj_velocity = np.asarray(obj.get("velocity_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+            obj_length = float(obj.get("length_m", 1.0))
+            obj_width = float(obj.get("width_m", 1.0))
+            obj_yaw = float(obj.get("yaw_rad", 0.0))
+            for step_idx in range(horizon):
+                cand_box = self._ego_corners_from_state(cand_xy[step_idx], float(cand_yaw[step_idx]))
+                proj_center = obj_center + obj_velocity * (float(step_idx) * float(dt_s))
+                obj_box = self._box_corners_xy(proj_center[0], proj_center[1], obj_length, obj_width, obj_yaw)
+                if self._polygon_intersects(cand_box, obj_box):
+                    collision = True
+                    break
+                if float(cand_speed[step_idx]) < _DEFAULT_TTC_STOPPED_SPEED_THRESHOLD_MPS:
+                    continue
+
+                heading_vec = np.asarray(
+                    [math.cos(float(cand_yaw[step_idx])), math.sin(float(cand_yaw[step_idx]))],
+                    dtype=np.float32,
+                )
+                rel_center = proj_center - cand_xy[step_idx]
+                longitudinal = float(np.dot(rel_center, heading_vec))
+                if longitudinal <= 0.0:
+                    continue
+
+                for future_offset_s in _DEFAULT_TTC_FUTURE_OFFSETS_S:
+                    proj_ego_xy = cand_xy[step_idx] + heading_vec * float(cand_speed[step_idx]) * float(future_offset_s)
+                    proj_ego_box = self._ego_corners_from_state(proj_ego_xy, float(cand_yaw[step_idx]))
+                    proj_obj_center = proj_center + obj_velocity * float(future_offset_s)
+                    proj_obj_box = self._box_corners_xy(proj_obj_center[0], proj_obj_center[1], obj_length, obj_width, obj_yaw)
+                    if self._polygon_intersects(proj_ego_box, proj_obj_box):
+                        earliest_ttc_risk_s = min(earliest_ttc_risk_s, float(future_offset_s))
+                        break
+            if collision:
+                break
+        no_collision = 0.0 if collision else 1.0
+        ttc_horizon_s = float(_DEFAULT_TTC_FUTURE_OFFSETS_S[-1]) if _DEFAULT_TTC_FUTURE_OFFSETS_S else 1.0
+        if math.isfinite(earliest_ttc_risk_s):
+            ttc_score = float(np.clip(earliest_ttc_risk_s / max(1.0e-6, ttc_horizon_s), 0.0, 1.0))
+        else:
+            ttc_score = 1.0
+
+        weighted_metrics = {
+            "progress": progress_ratio,
+            "ttc": float(ttc_score),
+            "lane_keeping": float(lane_keeping),
+            "history_comfort": float(history_comfort),
+        }
+        weighted_weights = {
+            "progress": 5.0,
+            "ttc": 5.0,
+            "lane_keeping": 2.0,
+            "history_comfort": 2.0,
+        }
+        weighted_score = float(
+            sum(weighted_metrics[key] * weighted_weights[key] for key in weighted_metrics)
+            / max(1.0, sum(weighted_weights.values()))
+        )
+        multiplicative_metrics = {
+            "no_collision": float(no_collision),
+            "drivable_area": float(drivable_area),
+            "driving_direction": float(driving_direction),
+        }
+        multiplicative_product = float(np.prod(np.asarray(list(multiplicative_metrics.values()), dtype=np.float32)))
+        score = float(weighted_score * multiplicative_product)
+
+        score_terms = {
+            "progress_reward": 2.0 * progress_ratio,
+            "mean_error_penalty": -0.35 * mean_err,
+            "final_error_penalty": -0.50 * final_err,
+            "first_error_penalty": -0.35 * first_err,
+            "yaw_error_penalty": -0.20 * mean_yaw_err,
+            "smoothness_penalty": -0.05 * smooth_pen,
+            "weighted_score": weighted_score,
+            "multiplicative_product": multiplicative_product,
+        }
+        return {
+            "score": score,
+            "weighted_score": weighted_score,
+            "multiplicative_product": multiplicative_product,
+            "multiplicative_metrics": multiplicative_metrics,
+            "weighted_metrics": weighted_metrics,
+            "progress_ratio": progress_ratio,
+            "mean_error_m": mean_err,
+            "final_error_m": final_err,
+            "first_error_m": first_err,
+            "mean_yaw_error_rad": mean_yaw_err,
+            "smoothness_penalty_raw": smooth_pen,
+            "ttc_earliest_risk_time_s": float(earliest_ttc_risk_s),
+            "driving_direction_oncoming_progress_m": float(oncoming_progress_m),
+            "score_terms": score_terms,
+        }
+
+    def _score_batch_common(
         self,
         replays: Sequence[dict[str, Any]],
         traj_xyyaw: torch.Tensor,
         *,
-        include_debug_context: bool = False,
+        include_debug_context: bool,
     ) -> tuple[np.ndarray, list[dict[str, Any]]]:
         if traj_xyyaw.ndim != 4 or traj_xyyaw.shape[-1] < 2:
             raise RuntimeError(
@@ -686,36 +1088,30 @@ class NuScenesTokenScorer:
             if sample_token is None:
                 raise RuntimeError("NuScenesTokenScorer requires replay['sample_token']")
             row = self._lookup_row(str(sample_token))
-            gt_xy_raw = self._lookup_gt(str(sample_token))
-            gt_origin_xy = np.zeros((2,), dtype=np.float32)
-            gt_xy = gt_xy_raw.copy()
+            gt_xy = self._lookup_gt(str(sample_token)).copy()
             gt_yaw = _path_yaw_from_xy(gt_xy)
-            gt_s = _polyline_arclength(gt_xy)#给 GT 轨迹加一个“里程表”
-            gt_total_len = float(max(1e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
+            gt_s = _polyline_arclength(gt_xy)
+            gt_total_len = float(max(1.0e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
+            cached_map_context = self._lookup_cached_map_layers(replay, patch_radius=_DEFAULT_PATCH_RADIUS_M)
+            map_context = cached_map_context if cached_map_context is not None else self._lookup_map_layers(row, patch_radius=_DEFAULT_PATCH_RADIUS_M)
             gt_history_xy = self._lookup_gt_history(row, origin_xy=None) if include_debug_context else np.zeros((0, 2), dtype=np.float32)
-            map_context = (
-                self._lookup_map_layers(row, patch_radius=_DEFAULT_PATCH_RADIUS_M)
-                if include_debug_context
-                else {"patch_radius": float(_DEFAULT_PATCH_RADIUS_M), "layers": {}}
-            )
-            scene_objects = (
-                self._extract_scene_objects(row, patch_radius=float(map_context.get("patch_radius", _DEFAULT_PATCH_RADIUS_M)))
-                if include_debug_context
-                else []
-            )
+            scene_objects = self._collect_scene_objects(row, patch_radius=float(map_context.get("patch_radius", _DEFAULT_PATCH_RADIUS_M)))
 
             horizon = min(int(gt_xy.shape[0]), int(traj_np.shape[2]))
             gt_xy_cmp = gt_xy[:horizon]
             gt_yaw_cmp = gt_yaw[:horizon]
+            lane_centerlines = list(map_context.get("layers", {}).get("lane_centerline", []))
+            drivable_polygons = list(map_context.get("layers", {}).get("drivable_area", []))
+
             sample_detail: dict[str, Any] = {
                 "batch_index": int(batch_idx),
                 "sample_token": str(sample_token),
-                "gt_origin_shift_xy": gt_origin_xy.astype(np.float32).tolist(),
+                "gt_origin_shift_xy": [0.0, 0.0],
                 "gt_xy": gt_xy_cmp.copy(),
                 "gt_yaw": gt_yaw_cmp.copy(),
                 "gt_history_xy": gt_history_xy.copy(),
-                "scene_objects": scene_objects,
-                "map_layers": dict(map_context.get("layers", {})),
+                "scene_objects": scene_objects if include_debug_context else [],
+                "map_layers": dict(map_context.get("layers", {})) if include_debug_context else dict(map_context.get("layers", {})),
                 "map_patch_radius_m": float(map_context.get("patch_radius", _DEFAULT_PATCH_RADIUS_M)),
                 "candidates": [],
             }
@@ -723,48 +1119,39 @@ class NuScenesTokenScorer:
                 cand = traj_np[batch_idx, cand_idx, :horizon, :]
                 cand_xy = cand[:, :2]
                 cand_yaw = cand[:, 2] if cand.shape[1] >= 3 else _path_yaw_from_xy(cand_xy)
-
-                pos_err = np.linalg.norm(cand_xy - gt_xy_cmp, axis=1)
-                first_err = float(pos_err[0]) if pos_err.size else 0.0
-                final_err = float(pos_err[-1]) if pos_err.size else 0.0
-                mean_err = float(pos_err.mean()) if pos_err.size else 0.0
-                yaw_err = np.abs(_wrap_angle(cand_yaw - gt_yaw_cmp))
-                mean_yaw_err = float(yaw_err.mean()) if yaw_err.size else 0.0
-
-                cand_progress = _project_progress(cand_xy[-1], gt_xy, gt_s) if cand_xy.shape[0] > 0 else 0.0
-                progress_ratio = float(np.clip(cand_progress / gt_total_len, 0.0, 1.5))
-
-                cand_prev = np.concatenate([np.zeros((1, 2), dtype=np.float32), cand_xy[:-1]], axis=0)
-                cand_vel = cand_xy - cand_prev
-                cand_acc = cand_vel[1:] - cand_vel[:-1] if cand_vel.shape[0] > 1 else np.zeros((0, 2), dtype=np.float32)
-                smooth_pen = float(np.linalg.norm(cand_acc, axis=1).mean()) if cand_acc.size else 0.0
-
-                score_terms = {
-                    "progress_reward": 2.0 * progress_ratio,
-                    "mean_error_penalty": -0.35 * mean_err,
-                    "final_error_penalty": -0.50 * final_err,
-                    "first_error_penalty": -0.35 * first_err,
-                    "yaw_error_penalty": -0.20 * mean_yaw_err,
-                    "smoothness_penalty": -0.05 * smooth_pen,
-                }
-                score = float(sum(score_terms.values()))
+                candidate_result = self._score_candidate_pdm_like(
+                    cand_xy=cand_xy,
+                    cand_yaw=cand_yaw,
+                    gt_xy_cmp=gt_xy_cmp,
+                    gt_yaw_cmp=gt_yaw_cmp,
+                    gt_xy_full=gt_xy,
+                    gt_s_full=gt_s,
+                    gt_total_len=gt_total_len,
+                    centerlines=lane_centerlines,
+                    drivable_polygons=drivable_polygons,
+                    scene_objects=scene_objects,
+                    dt_s=0.5,
+                )
+                score = float(candidate_result["score"])
                 scores[batch_idx, cand_idx] = np.float32(score)
                 sample_detail["candidates"].append(
                     {
                         "candidate_index": int(cand_idx),
                         "traj_xyyaw": cand.copy(),
-                        "score": score,
-                        "progress_ratio": progress_ratio,
-                        "mean_error_m": mean_err,
-                        "final_error_m": final_err,
-                        "first_error_m": first_err,
-                        "mean_yaw_error_rad": mean_yaw_err,
-                        "smoothness_penalty_raw": smooth_pen,
-                        "score_terms": score_terms,
+                        **candidate_result,
                     }
                 )
             details.append(sample_detail)
         return scores, details
+
+    def _score_batch(
+        self,
+        replays: Sequence[dict[str, Any]],
+        traj_xyyaw: torch.Tensor,
+        *,
+        include_debug_context: bool = False,
+    ) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        return self._score_batch_common(replays, traj_xyyaw, include_debug_context=bool(include_debug_context))
 
     @staticmethod
     def _path_yaw_from_xy_torch(points_xy: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
@@ -963,78 +1350,8 @@ class NuScenesTokenScorer:
         replays: Sequence[dict[str, Any]],
         traj_xyyaw: torch.Tensor,
     ) -> torch.Tensor:
-        if traj_xyyaw.ndim != 4 or traj_xyyaw.shape[-1] < 2:
-            raise RuntimeError(
-                "NuScenesTokenScorer expects traj_xyyaw with shape (batch, candidates, horizon, 3); "
-                f"got {tuple(traj_xyyaw.shape)}"
-            )
-        if len(replays) != int(traj_xyyaw.shape[0]):
-            raise RuntimeError(f"Replay batch length mismatch: replays={len(replays)} traj_batch={int(traj_xyyaw.shape[0])}")
-
-        batch_size, num_candidates, horizon, traj_dim = tuple(traj_xyyaw.shape)
-        del traj_dim
-        if horizon <= 0:
-            return torch.zeros((batch_size, num_candidates), device=traj_xyyaw.device, dtype=torch.float32)
-
-        traj = traj_xyyaw.to(device=traj_xyyaw.device, dtype=torch.float32)
-        gt_batch = self._prepare_torch_gt_batch(replays, traj_horizon=int(horizon), device=traj.device)
-        cmp_valid = gt_batch["cmp_valid"]
-        cmp_mask = cmp_valid.unsqueeze(1)
-        cand_xy = traj[..., :2]
-
-        if traj.shape[-1] >= 3:
-            cand_yaw = traj[..., 2]
-        else:
-            cand_valid = cmp_mask.expand(-1, num_candidates, -1).reshape(-1, horizon)
-            cand_yaw = self._path_yaw_from_xy_torch(
-                cand_xy.reshape(-1, horizon, 2),
-                cand_valid,
-            ).reshape(batch_size, num_candidates, horizon)
-
-        pos_err = torch.linalg.norm(cand_xy - gt_batch["gt_cmp_xy"].unsqueeze(1), dim=-1).to(dtype=torch.float32)
-        first_err = torch.where(
-            cmp_valid[:, :1],
-            pos_err[:, :, 0],
-            torch.zeros((batch_size, num_candidates), device=traj.device, dtype=torch.float32),
-        )
-        final_err = self._gather_last_valid(pos_err, gt_batch["cmp_lengths"])
-        mean_err = self._masked_mean(pos_err, cmp_mask, dim=2)
-
-        yaw_err = torch.atan2(
-            torch.sin(cand_yaw - gt_batch["gt_cmp_yaw"].unsqueeze(1)),
-            torch.cos(cand_yaw - gt_batch["gt_cmp_yaw"].unsqueeze(1)),
-        ).abs().to(dtype=torch.float32)
-        mean_yaw_err = self._masked_mean(yaw_err, cmp_mask, dim=2)
-
-        cand_last_xy = self._gather_last_valid_xy(cand_xy, gt_batch["cmp_lengths"])
-        cand_progress = self._project_progress_torch(
-            cand_last_xy,
-            gt_batch["gt_full_xy"],
-            gt_batch["gt_full_s"],
-            gt_batch["gt_full_mask"],
-        )
-        progress_ratio = (cand_progress / gt_batch["gt_total_len"].unsqueeze(1)).clamp(0.0, 1.5)
-
-        cand_prev = torch.cat(
-            [
-                torch.zeros((batch_size, num_candidates, 1, 2), device=traj.device, dtype=torch.float32),
-                cand_xy[:, :, :-1, :],
-            ],
-            dim=2,
-        )
-        cand_vel = cand_xy - cand_prev
-        cand_acc = cand_vel[:, :, 1:, :] - cand_vel[:, :, :-1, :]
-        acc_valid = (cmp_valid[:, 1:] & cmp_valid[:, :-1]).unsqueeze(1)
-        smooth_pen = self._masked_mean(torch.linalg.norm(cand_acc, dim=-1).to(dtype=torch.float32), acc_valid, dim=2)
-
-        return (
-            (2.0 * progress_ratio)
-            - (0.35 * mean_err)
-            - (0.50 * final_err)
-            - (0.35 * first_err)
-            - (0.20 * mean_yaw_err)
-            - (0.05 * smooth_pen)
-        ).to(dtype=torch.float32)
+        scores, _ = self._score_batch_common(replays, traj_xyyaw, include_debug_context=False)
+        return torch.from_numpy(scores).to(device=traj_xyyaw.device, dtype=torch.float32)
 
     def score_with_details(
         self,
@@ -1119,6 +1436,12 @@ class NuScenesTokenScorer:
                         "first_error_m": float(item["first_error_m"]),
                         "mean_yaw_error_rad": float(item["mean_yaw_error_rad"]),
                         "smoothness_penalty_raw": float(item["smoothness_penalty_raw"]),
+                        "ttc_earliest_risk_time_s": (
+                            float(item["ttc_earliest_risk_time_s"])
+                            if math.isfinite(float(item["ttc_earliest_risk_time_s"]))
+                            else None
+                        ),
+                        "driving_direction_oncoming_progress_m": float(item["driving_direction_oncoming_progress_m"]),
                         "score_terms": {key: float(val) for key, val in item["score_terms"].items()},
                         "traj_xyyaw": np.asarray(item["traj_xyyaw"], dtype=np.float32).tolist(),
                     }
