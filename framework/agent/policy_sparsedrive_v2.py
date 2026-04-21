@@ -127,6 +127,7 @@ class SparseDriveV2Policy(Agent):
         rl_lr: float = 1e-5,
         execute_mode: str = "first_step",
         trainable_prefixes: Sequence[str] | None = None,
+        nuscenes_scorer_config: Dict[str, Any] | None = None,
     ) -> None:
         try:
             SparseDriveConfig, SparseDriveModel = _force_import_sparsedrive_v2_modules()
@@ -144,6 +145,7 @@ class SparseDriveV2Policy(Agent):
         self._device_override = device
         self._execute_mode = "first_step"
         self._trainable_prefixes = _normalize_trainable_prefixes(trainable_prefixes)
+        self._nuscenes_scorer_config = dict(nuscenes_scorer_config or {})
 
         self._cfg = self._SparseDriveConfig()
         self._cfg.bkb_path = os.path.join(_SPARSEDRIVE_V2_ROOT, "ckpt", "resnet34.bin")
@@ -1006,7 +1008,10 @@ class SparseDriveV2Policy(Agent):
         if self._nuscenes_token_scorer is None:
             from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
 
-            self._nuscenes_token_scorer = NuScenesTokenScorer(token2vad_path=nus_cfg.TOKEN2VAD_FILE)
+            self._nuscenes_token_scorer = NuScenesTokenScorer(
+                token2vad_path=nus_cfg.TOKEN2VAD_FILE,
+                **self._nuscenes_scorer_config,
+            )
         return self._nuscenes_token_scorer
 
     def pdm_score_counterfactuals_from_replay_batch(

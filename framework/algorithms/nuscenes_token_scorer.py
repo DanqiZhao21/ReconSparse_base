@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import pickle
+import re
+import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -56,6 +60,13 @@ _DEFAULT_TTC_FUTURE_OFFSETS_S = (0.0, 0.3, 0.6, 0.9)
 _DEFAULT_TTC_STOPPED_SPEED_THRESHOLD_MPS = 5.0e-3
 _DEFAULT_DIRECTION_COMPLIANCE_THRESHOLD_M = 2.0
 _DEFAULT_DIRECTION_VIOLATION_THRESHOLD_M = 6.0
+_DEFAULT_EA_PROJECT_SRC = Path("/root/clone/EA/src")
+_DEFAULT_EA_GOOD_THRESHOLD = 0.0
+_DEFAULT_EA_BAD_THRESHOLD = 8.0
+_DEFAULT_EA_MAX_AGENTS = 4
+_DEFAULT_EA_HORIZON_S = 4.0
+_DEFAULT_EA_DT_COARSE_S = 0.1
+_DEFAULT_EA_DT_FINE_S = 0.02
 
 
 def _wrap_angle(angle: np.ndarray) -> np.ndarray:
@@ -67,6 +78,8 @@ def _path_yaw_from_xy(points_xy: np.ndarray) -> np.ndarray:
     if int(points_xy.shape[0]) <= 0:
         return np.zeros((0,), dtype=np.float32)
     prev = np.concatenate([np.zeros((1, 2), dtype=np.float32), points_xy[:-1]], axis=0)
+    # points_xy:   [p0, p1, p2, p3, ...]
+    # prev:        [0 , p0, p1, p2, ...]
     delta = points_xy - prev
     yaw = np.arctan2(delta[:, 1], delta[:, 0]).astype(np.float32)
     if int(yaw.shape[0]) > 1:
@@ -122,15 +135,53 @@ class NuScenesTokenScorer:
         nuscenes_dataroot: str | Path | None = None,
         nuscenes_version: str = _DEFAULT_NUSCENES_VERSION,
         scene_cache_root: str | Path | None = None,
+        agent_state_cache_root: str | Path | None = None,
+        #ea指标相关
+        ea_project_src: str | Path | None = None,
+        ea_gate_enabled: bool = False,
+        ea_gate_good_threshold: float = _DEFAULT_EA_GOOD_THRESHOLD,
+        ea_gate_bad_threshold: float = _DEFAULT_EA_BAD_THRESHOLD,
+        ea_gate_max_agents: int = _DEFAULT_EA_MAX_AGENTS,
+        ea_gate_horizon_s: float = _DEFAULT_EA_HORIZON_S,
+        ea_gate_dt_coarse_s: float = _DEFAULT_EA_DT_COARSE_S,
+        ea_gate_dt_fine_s: float = _DEFAULT_EA_DT_FINE_S,
+        #weight评分权重
+        progress_weight: float = 8.0,
+        ttc_weight: float = 5.0,
+        lane_keeping_weight: float = 2.0,
+        history_comfort_weight: float = 2.0,
     ) -> None:
         self.token2vad_path = Path(token2vad_path)
         self._token2vad: dict[str, dict[str, Any]] | None = None
         self.nuscenes_version = str(nuscenes_version)
         self.nuscenes_dataroot = self._resolve_nuscenes_dataroot(nuscenes_dataroot)
         self.scene_cache_root = Path(scene_cache_root) if scene_cache_root is not None else _DEFAULT_SCENE_CACHE_ROOT
+        self.agent_state_cache_root = (
+            Path(agent_state_cache_root) if agent_state_cache_root is not None else self.scene_cache_root
+        )
+        self.sample_context_cache_root = self.scene_cache_root / "_sample_score_context"
+        self.ea_project_src = (
+            Path(ea_project_src)
+            if ea_project_src is not None
+            else Path(os.environ.get("EA_PROJECT_SRC", str(_DEFAULT_EA_PROJECT_SRC)))
+        )
+        self.ea_gate_enabled = bool(ea_gate_enabled)
+        self.ea_gate_good_threshold = float(ea_gate_good_threshold)
+        self.ea_gate_bad_threshold = float(ea_gate_bad_threshold)
+        self.ea_gate_max_agents = max(1, int(ea_gate_max_agents))
+        self.ea_gate_horizon_s = float(ea_gate_horizon_s)
+        self.ea_gate_dt_coarse_s = float(ea_gate_dt_coarse_s)
+        self.ea_gate_dt_fine_s = float(ea_gate_dt_fine_s)
+        self.progress_weight = float(progress_weight)
+        self.ttc_weight = float(ttc_weight)
+        self.lane_keeping_weight = float(lane_keeping_weight)
+        self.history_comfort_weight = float(history_comfort_weight)
         self._nusc: Any | None = None
         self._map_cache: dict[str, Any] = {}
         self._scene_env_cache: dict[int, dict[int, dict[str, Any]]] = {}
+        self._scene_agent_state_cache: dict[int, dict[str, Any]] = {}
+        self._sample_static_context_cache: dict[str, dict[str, Any]] = {}
+        self._ea_compute_fn: Callable[..., float] | None | bool = None
 
     @staticmethod
     def _resolve_nuscenes_dataroot(explicit_root: str | Path | None) -> Path | None:
@@ -281,6 +332,140 @@ class NuScenesTokenScorer:
         )
         history_xy = self._gt_to_env_xy(history_local, cumulative=False)
         return self._rebase_xy(history_xy, origin_xy)
+
+    @staticmethod
+    def _normalize_agent_future_traj(agent_traj_any: Any) -> np.ndarray:
+        arr = np.asarray(agent_traj_any, dtype=np.float32)
+        if arr.ndim == 1:
+            if int(arr.size) < 2 or int(arr.size) % 2 != 0:
+                return np.zeros((0, 2), dtype=np.float32)
+            arr = arr.reshape(-1, 2)
+        if arr.ndim != 2 or int(arr.shape[1]) < 2:
+            return np.zeros((0, 2), dtype=np.float32)
+        return arr[:, :2].astype(np.float32, copy=False)
+
+    @staticmethod
+    def _interp_angle(time_s: float, times_s: np.ndarray, yaw_rad: np.ndarray) -> float:
+        if int(times_s.shape[0]) <= 0 or int(yaw_rad.shape[0]) <= 0:
+            return 0.0
+        yaw_unwrapped = np.unwrap(np.asarray(yaw_rad, dtype=np.float64))
+        return float(np.interp(float(time_s), np.asarray(times_s, dtype=np.float64), yaw_unwrapped))
+
+    @staticmethod
+    def _sample_state_at_time(
+        *,
+        current_state: dict[str, Any],
+        future_xy: np.ndarray,
+        future_yaw: np.ndarray | None,
+        time_s: float,
+        dt_s: float,
+    ) -> dict[str, Any] | None:
+        query_t = float(time_s)
+        if query_t <= 0.0:
+            return dict(current_state)
+
+        future_xy_arr = np.asarray(future_xy, dtype=np.float32)
+        if future_xy_arr.ndim != 2 or int(future_xy_arr.shape[0]) <= 0 or int(future_xy_arr.shape[1]) < 2:
+            return None
+
+        sample_dt = max(1.0e-6, float(dt_s))
+        times = np.arange(1, int(future_xy_arr.shape[0]) + 1, dtype=np.float64) * sample_dt
+        if query_t > float(times[-1]) + 1.0e-6:
+            return None
+
+        current_xy = np.asarray(
+            [float(current_state.get("x", 0.0)), float(current_state.get("y", 0.0))],
+            dtype=np.float32,
+        ).reshape(1, 2)
+        series_xy = np.concatenate([current_xy, future_xy_arr[:, :2]], axis=0).astype(np.float64, copy=False)
+        series_times = np.concatenate([np.asarray([0.0], dtype=np.float64), times], axis=0)
+        right_idx = int(np.searchsorted(series_times, query_t, side="right"))
+        seg_hi = min(max(1, right_idx), int(series_times.shape[0]) - 1)
+        seg_lo = max(0, seg_hi - 1)
+        t0 = float(series_times[seg_lo])
+        t1 = float(series_times[seg_hi])
+        alpha = 0.0 if t1 <= t0 + 1.0e-9 else float((query_t - t0) / (t1 - t0))
+        p0 = series_xy[seg_lo]
+        p1 = series_xy[seg_hi]
+        interp_xy = (1.0 - alpha) * p0 + alpha * p1
+        x = float(interp_xy[0])
+        y = float(interp_xy[1])
+        seg_dt = max(1.0e-6, t1 - t0)
+        speed = float(np.linalg.norm(p1 - p0) / seg_dt)
+
+        yaw_series = np.asarray(future_yaw if future_yaw is not None else [], dtype=np.float32).reshape(-1)
+        if int(yaw_series.shape[0]) == int(future_xy_arr.shape[0]):
+            series_yaw = np.concatenate(
+                [np.asarray([float(current_state.get("yaw_rad", 0.0))], dtype=np.float64), yaw_series.astype(np.float64)],
+                axis=0,
+            )
+        else:
+            derived_yaw = _path_yaw_from_xy(series_xy.astype(np.float32))
+            series_yaw = np.asarray(derived_yaw, dtype=np.float64)
+            if int(series_yaw.shape[0]) > 0:
+                series_yaw[0] = float(current_state.get("yaw_rad", series_yaw[0]))
+        yaw_lo = float(series_yaw[seg_lo]) if seg_lo < int(series_yaw.shape[0]) else float(current_state.get("yaw_rad", 0.0))
+        yaw_hi = float(series_yaw[seg_hi]) if seg_hi < int(series_yaw.shape[0]) else yaw_lo
+        yaw_delta = float(math.atan2(math.sin(yaw_hi - yaw_lo), math.cos(yaw_hi - yaw_lo)))
+        yaw = float(yaw_lo + alpha * yaw_delta)
+        sampled_yaw_rate = float(yaw_delta / seg_dt)
+
+        return {
+            **current_state,
+            "x": float(x),
+            "y": float(y),
+            "speed_mps": float(speed),
+            "yaw_rad": float(math.atan2(math.sin(yaw), math.cos(yaw))),
+            "yaw_rate_rps": float(sampled_yaw_rate),
+        }
+
+    def _lookup_ea_agent_future_truth(
+        self,
+        row: dict[str, Any],
+        *,
+        patch_radius: float,
+    ) -> list[dict[str, Any]]:
+        boxes = np.asarray(row.get("gt_boxes", np.zeros((0, 7), dtype=np.float32)), dtype=np.float32)
+        if boxes.ndim != 2 or int(boxes.shape[0]) <= 0:
+            return []
+        velocities = np.asarray(row.get("gt_velocity", np.zeros((boxes.shape[0], 2), dtype=np.float32)), dtype=np.float32)
+        names = np.asarray(row.get("gt_names", np.asarray([], dtype=object)))
+        valid = np.asarray(row.get("valid_flag", np.ones((boxes.shape[0],), dtype=bool)))
+        fut_trajs = np.asarray(row.get("gt_agent_fut_trajs", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+        fut_masks = np.asarray(row.get("gt_agent_fut_masks", np.zeros((0,), dtype=np.float32)))
+        fut_yaw = np.asarray(row.get("gt_agent_fut_yaw", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+
+        out: list[dict[str, Any]] = []
+        for idx, box in enumerate(boxes):
+            if idx < valid.shape[0] and not bool(valid[idx]):
+                continue
+            center = np.asarray(box[:2], dtype=np.float32).reshape(-1)
+            if center.size < 2 or float(np.linalg.norm(center[:2])) > float(patch_radius) * 1.8:
+                continue
+            velocity_xy = velocities[idx, :2].astype(np.float32) if idx < velocities.shape[0] else np.zeros((2,), dtype=np.float32)
+            item: dict[str, Any] = {
+                "category": str(names[idx]) if idx < names.shape[0] else "unknown",
+                "center_xy": center[:2].astype(np.float32),
+                "velocity_xy": velocity_xy.reshape(2),
+                "yaw_rad": float(box[6]) if box.shape[0] > 6 else 0.0,
+                "speed_mps": float(np.linalg.norm(velocity_xy)),
+                "length_m": float(abs(box[4])) if box.shape[0] > 4 else 1.0,
+                "width_m": float(abs(box[3])) if box.shape[0] > 3 else 1.0,
+            }
+            if fut_trajs.ndim >= 2 and idx < fut_trajs.shape[0]:
+                traj_local = self._sanitize_local_traj_xy(
+                    self._normalize_agent_future_traj(fut_trajs[idx]),
+                    valid_mask_any=fut_masks[idx] if fut_masks.ndim >= 2 and idx < fut_masks.shape[0] else None,
+                )
+                if int(traj_local.shape[0]) > 0:
+                    item["future_xy"] = (self._gt_to_env_xy(traj_local, cumulative=True) + center[:2].reshape(1, 2)).astype(np.float32, copy=False)
+                    item["future_dt_s"] = 0.5
+                    if fut_yaw.ndim >= 2 and idx < fut_yaw.shape[0]:
+                        yaw_series = np.asarray(fut_yaw[idx], dtype=np.float32).reshape(-1)
+                        if int(yaw_series.shape[0]) >= int(traj_local.shape[0]):
+                            item["future_yaw"] = yaw_series[: int(traj_local.shape[0])].astype(np.float32, copy=False)
+            out.append(item)
+        return out
 
     @staticmethod
     def _box_corners_xy(center_x: float, center_y: float, length: float, width: float, yaw: float) -> np.ndarray:
@@ -479,6 +664,31 @@ class NuScenesTokenScorer:
         self._scene_env_cache[scene_key] = cache
         return cache
 
+    def _scene_agent_state_cache_path(self, scene_id: int) -> Path:
+        return self.agent_state_cache_root / f"{int(scene_id):03d}" / "agent_state_cache.json"
+
+    def _load_scene_agent_state_cache(self, scene_id: int) -> dict[str, Any]:
+        scene_key = int(scene_id)
+        cached = self._scene_agent_state_cache.get(scene_key, None)
+        if cached is not None:
+            return cached
+        path = self._scene_agent_state_cache_path(scene_key)
+        if not path.exists():
+            empty = {"meta": {}, "frames": {}}
+            self._scene_agent_state_cache[scene_key] = empty
+            return empty
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        meta = dict(loaded.get("meta", {})) if isinstance(loaded, dict) else {}
+        frames = {
+            int(key): value
+            for key, value in dict(loaded).items()
+            if key != "meta"
+        }
+        payload = {"meta": meta, "frames": frames}
+        self._scene_agent_state_cache[scene_key] = payload
+        return payload
+
     def _lookup_scene_snapshot(self, replay: dict[str, Any]) -> dict[str, Any] | None:
         scene_id = replay.get("scene_id", None)
         frame_idx = replay.get("frame_idx", None)
@@ -489,6 +699,27 @@ class NuScenesTokenScorer:
         except Exception:
             return None
         return cache.get(int(frame_idx), None)
+
+    def _lookup_agent_state_snapshot(self, replay: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        scene_id = replay.get("scene_id", None)
+        frame_idx = replay.get("frame_idx", None)
+        if scene_id is None or frame_idx is None:
+            return None, {}
+        try:
+            payload = self._load_scene_agent_state_cache(int(scene_id))
+        except Exception:
+            return None, {}
+        frames = dict(payload.get("frames", {}))
+        if not frames:
+            return None, dict(payload.get("meta", {}))
+        fidx = int(frame_idx)
+        if fidx in frames:
+            return frames.get(fidx), dict(payload.get("meta", {}))
+        keys = sorted(frames.keys())
+        for key in reversed(keys):
+            if key <= fidx:
+                return frames.get(key), dict(payload.get("meta", {}))
+        return None, dict(payload.get("meta", {}))
 
     @staticmethod
     def _global_xy_to_snapshot_local(points_xy: np.ndarray, snapshot: dict[str, Any]) -> np.ndarray:
@@ -503,6 +734,76 @@ class NuScenesTokenScorer:
         s = math.sin(-yaw)
         rot = np.asarray([[c, -s], [s, c]], dtype=np.float32)
         return delta @ rot.T
+
+    @staticmethod
+    def _rotate_world_vec_to_snapshot_local(vec_xy: np.ndarray, snapshot: dict[str, Any]) -> np.ndarray:
+        vec = np.asarray(vec_xy, dtype=np.float32).reshape(-1)
+        if vec.size < 2:
+            return np.zeros((2,), dtype=np.float32)
+        ego_pose = dict(snapshot.get("ego_pose", {}))
+        yaw = float(ego_pose.get("yaw", 0.0))
+        c = math.cos(-yaw)
+        s = math.sin(-yaw)
+        rot = np.asarray([[c, -s], [s, c]], dtype=np.float32)
+        return (np.asarray([[float(vec[0]), float(vec[1])]], dtype=np.float32) @ rot.T).reshape(2)
+
+    @classmethod
+    def _agent_state_to_snapshot_local(cls, agent_state: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+        center_local = cls._global_xy_to_snapshot_local(
+            np.asarray([agent_state.get("center_xy", [0.0, 0.0])], dtype=np.float32),
+            snapshot,
+        )
+        velocity_local = cls._rotate_world_vec_to_snapshot_local(
+            np.asarray(agent_state.get("velocity_xy", [0.0, 0.0]), dtype=np.float32),
+            snapshot,
+        )
+        ego_pose = dict(snapshot.get("ego_pose", {}))
+        ego_yaw = float(ego_pose.get("yaw", 0.0))
+        yaw_local = float(np.arctan2(np.sin(float(agent_state.get("yaw_rad", 0.0)) - ego_yaw), np.cos(float(agent_state.get("yaw_rad", 0.0)) - ego_yaw)))
+        return {
+            **agent_state,
+            "center_xy": center_local.reshape(2).astype(np.float32),
+            "velocity_xy": velocity_local.astype(np.float32),
+            "yaw_rad": yaw_local,
+        }
+
+    def _collect_ea_agent_states(
+        self,
+        replay: dict[str, Any],
+        *,
+        patch_radius: float,
+        row: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.ea_gate_enabled:
+            return []
+        if isinstance(row, dict):
+            truth_states = self._lookup_ea_agent_future_truth(row, patch_radius=float(patch_radius))
+            if len(truth_states) > 0:
+                return truth_states
+        snapshot, meta = self._lookup_agent_state_snapshot(replay)
+        if not isinstance(snapshot, dict):
+            return []
+        agents = list(snapshot.get("agents", []) or [])
+        if len(agents) <= 0:
+            return []
+        coordinate_frame = str(meta.get("coordinate_frame", "")).strip().lower()
+        scene_snapshot = self._lookup_scene_snapshot(replay)
+        if coordinate_frame == "world" and not isinstance(scene_snapshot, dict):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in agents:
+            agent_state = dict(item)
+            if coordinate_frame == "world" and isinstance(scene_snapshot, dict):
+                agent_state = self._agent_state_to_snapshot_local(agent_state, scene_snapshot)
+            center = np.asarray(agent_state.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+            if center.size < 2:
+                continue
+            if float(np.linalg.norm(center[:2])) > float(patch_radius) * 1.8:
+                continue
+            agent_state["center_xy"] = center[:2].astype(np.float32)
+            agent_state["velocity_xy"] = np.asarray(agent_state.get("velocity_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+            out.append(agent_state)
+        return out
 
     def _lookup_cached_map_layers(
         self,
@@ -537,6 +838,51 @@ class NuScenesTokenScorer:
     def _safe_float_list(values: Any) -> list[float]:
         arr = np.asarray(values, dtype=np.float32).reshape(-1)
         return [float(item) for item in arr.tolist()]
+
+    @staticmethod
+    def _sample_context_cache_filename(sample_token: str, *, cache_variant: str = "default") -> str:
+        token = str(sample_token).strip()
+        safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", token)[:64] or "sample"
+        digest = hashlib.sha1(f"{token}|{str(cache_variant).strip()}".encode("utf-8")).hexdigest()[:16]
+        return f"{safe_prefix}_{digest}.pkl"
+
+    def _sample_context_cache_path(self, sample_token: str, *, cache_variant: str = "default") -> Path:
+        return self.sample_context_cache_root / self._sample_context_cache_filename(sample_token, cache_variant=cache_variant)
+
+    def _sample_context_cache_variant(self) -> str:
+        return f"ea-{int(bool(self.ea_gate_enabled))}"
+
+    def _load_persisted_static_sample_context(self, sample_token: str) -> dict[str, Any] | None:
+        path = self._sample_context_cache_path(sample_token, cache_variant=self._sample_context_cache_variant())
+        if not path.exists():
+            return None
+        try:
+            with path.open("rb") as handle:
+                payload = pickle.load(handle)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _save_persisted_static_sample_context(self, sample_token: str, payload: dict[str, Any]) -> None:
+        path = self._sample_context_cache_path(sample_token, cache_variant=self._sample_context_cache_variant())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path_str = tempfile.mkstemp(
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(tmp_fd, "wb") as handle:
+                pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path_str, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path_str)
+            except FileNotFoundError:
+                pass
+            raise
 
     @staticmethod
     def _point_in_polygon(point_xy: np.ndarray, polygon_xy: np.ndarray) -> bool:
@@ -639,6 +985,236 @@ class NuScenesTokenScorer:
                 }
             )
         return objects
+
+    def _build_static_sample_context(
+        self,
+        replay: dict[str, Any],
+        *,
+        patch_radius: float,
+    ) -> dict[str, Any]:
+        sample_token = replay.get("sample_token", None)
+        if sample_token is None:
+            raise RuntimeError("NuScenesTokenScorer requires replay['sample_token']")
+        sample_token_str = str(sample_token)
+        cached = self._sample_static_context_cache.get(sample_token_str, None)
+        if cached is not None:
+            return cached
+
+        persisted = self._load_persisted_static_sample_context(sample_token_str)
+        if persisted is not None:
+            self._sample_static_context_cache[sample_token_str] = persisted
+            return persisted
+
+        row = self._lookup_row(sample_token_str)
+        gt_xy = self._lookup_gt(sample_token_str).copy()
+        gt_yaw = _path_yaw_from_xy(gt_xy)
+        gt_s = _polyline_arclength(gt_xy)
+        gt_total_len = float(max(1.0e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
+
+        cached_map_context = self._lookup_cached_map_layers(replay, patch_radius=float(patch_radius))
+        map_context = (
+            cached_map_context
+            if cached_map_context is not None
+            else self._lookup_map_layers(row, patch_radius=float(patch_radius))
+        )
+        patch_radius_resolved = float(map_context.get("patch_radius", patch_radius))
+        scene_objects = self._collect_scene_objects(row, patch_radius=patch_radius_resolved)
+        ea_agent_states = self._collect_ea_agent_states(
+            replay,
+            patch_radius=patch_radius_resolved,
+            row=row,
+        )
+
+        payload = {
+            "row": row,
+            "gt_xy": gt_xy,
+            "gt_yaw": gt_yaw,
+            "gt_s": gt_s,
+            "gt_total_len": gt_total_len,
+            "map_context": map_context,
+            "scene_objects": scene_objects,
+            "ea_agent_states": ea_agent_states,
+        }
+        self._sample_static_context_cache[sample_token_str] = payload
+        self._save_persisted_static_sample_context(sample_token_str, payload)
+        return payload
+
+    def _ensure_ea_compute_fn(self) -> Callable[..., float] | None:
+        if self._ea_compute_fn is False:
+            return None
+        if callable(self._ea_compute_fn):
+            return self._ea_compute_fn
+        try:
+            src = Path(self.ea_project_src)
+            if src.exists():
+                src_text = str(src)
+                if src_text not in sys.path:
+                    sys.path.insert(0, src_text)
+            from ea_project.core_ea import compute_final_ea
+
+            self._ea_compute_fn = compute_final_ea
+            return compute_final_ea
+        except Exception:
+            self._ea_compute_fn = False
+            return None
+
+    def _compute_ea_value_for_pair(self, ego_state: dict[str, Any], agent_state: dict[str, Any]) -> float:
+        compute_fn = self._ensure_ea_compute_fn()
+        if compute_fn is None:
+            raise RuntimeError("EA project is unavailable")
+        return float(
+            compute_fn(
+                xA=float(ego_state["x"]),
+                yA=float(ego_state["y"]),
+                vA=float(ego_state["speed_mps"]),
+                hA=float(ego_state["yaw_rad"]),
+                lA=float(ego_state["length_m"]),
+                wA=float(ego_state["width_m"]),
+                yawA=float(ego_state["yaw_rate_rps"]),
+                xB=float(agent_state["x"]),
+                yB=float(agent_state["y"]),
+                vB=float(agent_state["speed_mps"]),
+                hB=float(agent_state["yaw_rad"]),
+                lB=float(agent_state["length_m"]),
+                wB=float(agent_state["width_m"]),
+                yawB=float(agent_state["yaw_rate_rps"]),
+                T_total=float(self.ea_gate_horizon_s),
+                dt_coarse=float(self.ea_gate_dt_coarse_s),
+                dt_fine=float(self.ea_gate_dt_fine_s),
+            )
+        )
+
+    @staticmethod
+    def _propagate_ctrv_state(state: dict[str, Any], *, time_s: float) -> dict[str, Any]:
+        t = max(0.0, float(time_s))
+        x = float(state.get("x", 0.0))
+        y = float(state.get("y", 0.0))
+        speed = float(state.get("speed_mps", 0.0))
+        yaw = float(state.get("yaw_rad", 0.0))
+        yaw_rate = float(state.get("yaw_rate_rps", 0.0))
+        if abs(yaw_rate) <= 1.0e-6:
+            x = x + speed * math.cos(yaw) * t
+            y = y + speed * math.sin(yaw) * t
+        else:
+            radius = speed / yaw_rate
+            delta_yaw = yaw_rate * t
+            x = x + radius * (math.sin(yaw + delta_yaw) - math.sin(yaw))
+            y = y - radius * (math.cos(yaw + delta_yaw) - math.cos(yaw))
+            yaw = yaw + delta_yaw
+        return {**state, "x": float(x), "y": float(y), "yaw_rad": float(yaw)}
+
+    @staticmethod
+    def _candidate_speed_and_yaw_rate(cand_xy: np.ndarray, cand_yaw: np.ndarray, *, dt_s: float) -> tuple[np.ndarray, np.ndarray]:
+        if int(cand_xy.shape[0]) <= 0:
+            return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+        prev_xy = np.concatenate([np.zeros((1, 2), dtype=np.float32), cand_xy[:-1]], axis=0)
+        vel_xy = (cand_xy - prev_xy) / max(1.0e-6, float(dt_s))
+        speed = np.linalg.norm(vel_xy, axis=1).astype(np.float32, copy=False)
+        prev_yaw = np.concatenate([cand_yaw[:1], cand_yaw[:-1]], axis=0)
+        yaw_rate = (_wrap_angle(cand_yaw - prev_yaw) / max(1.0e-6, float(dt_s))).astype(np.float32, copy=False)
+        return speed, yaw_rate
+
+    def _score_ea_safety_gate(
+        self,
+        *,
+        cand_xy: np.ndarray,
+        cand_yaw: np.ndarray,
+        agent_states: Sequence[dict[str, Any]],
+        dt_s: float,
+    ) -> dict[str, float]:
+        if not self.ea_gate_enabled:
+            return {"gate": 1.0, "max_ea": 0.0, "evaluated_pairs": 0.0}
+        if len(agent_states) <= 0:
+            return {"gate": 1.0, "max_ea": 0.0, "evaluated_pairs": 0.0}
+        if not callable(getattr(self, "_compute_ea_value_for_pair", None)):
+            return {"gate": 1.0, "max_ea": 0.0, "evaluated_pairs": 0.0}
+
+        horizon = int(cand_xy.shape[0])
+        if horizon <= 0:
+            return {"gate": 0.0, "max_ea": 0.0, "evaluated_pairs": 0.0}
+
+        candidate_path = np.asarray(cand_xy, dtype=np.float32)
+        ranked_agents = sorted(
+            (
+                dict(item)
+                for item in agent_states
+                if "vehicle" in str(item.get("category", "")).strip().lower()
+            ),
+            key=lambda item: float(
+                np.min(np.linalg.norm(candidate_path - np.asarray(item.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(1, 2), axis=1))
+            ),
+        )
+        selected_agents = ranked_agents[: self.ea_gate_max_agents]
+        if len(selected_agents) <= 0:
+            return {"gate": 1.0, "max_ea": 0.0, "evaluated_pairs": 0.0}
+
+        step_indices = sorted({0, max(0, horizon // 2), horizon - 1})
+        min_gate = 1.0
+        max_ea = 0.0
+        pair_count = 0
+        for step_idx in step_indices:
+            time_offset_s = float(step_idx + 1) * float(dt_s)
+            ego_state = self._sample_state_at_time(
+                current_state={
+                    "x": 0.0,
+                    "y": 0.0,
+                    "speed_mps": 0.0,
+                    "yaw_rad": 0.0,
+                    "yaw_rate_rps": 0.0,
+                    "length_m": 4.9,
+                    "width_m": 2.1,
+                },
+                future_xy=candidate_path,
+                future_yaw=np.asarray(cand_yaw, dtype=np.float32),
+                time_s=time_offset_s,
+                dt_s=float(dt_s),
+            )
+            if ego_state is None:
+                continue
+            for agent in selected_agents:
+                agent_velocity = np.asarray(agent.get("velocity_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+                agent_current_state = {
+                    "x": float(np.asarray(agent.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)[0]),
+                    "y": float(np.asarray(agent.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)[1]),
+                    "speed_mps": float(agent.get("speed_mps", np.linalg.norm(agent_velocity))),
+                    "yaw_rad": float(agent.get("yaw_rad", 0.0)),
+                    "yaw_rate_rps": float(agent.get("yaw_rate_rps", 0.0)),
+                    "length_m": float(agent.get("length_m", 1.0)),
+                    "width_m": float(agent.get("width_m", 1.0)),
+                }
+                agent_state = self._sample_state_at_time(
+                    current_state=agent_current_state,
+                    future_xy=np.asarray(agent.get("future_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+                    future_yaw=np.asarray(agent.get("future_yaw", np.zeros((0,), dtype=np.float32)), dtype=np.float32),
+                    time_s=time_offset_s,
+                    dt_s=float(agent.get("future_dt_s", dt_s)),
+                )
+                if agent_state is None:
+                    agent_state = self._propagate_ctrv_state(
+                        agent_current_state,
+                        time_s=time_offset_s,
+                    )
+                try:
+                    ea_value = float(self._compute_ea_value_for_pair(ego_state, agent_state))
+                except Exception:
+                    continue
+                pair_count += 1
+                if not math.isfinite(ea_value):
+                    pair_gate = 0.0
+                    max_ea = float("inf")
+                else:
+                    max_ea = max(max_ea, max(0.0, ea_value))
+                    pair_gate = _linear_decay_score(
+                        max(0.0, ea_value),
+                        good_threshold=float(self.ea_gate_good_threshold),
+                        bad_threshold=float(self.ea_gate_bad_threshold),
+                    )
+                min_gate = min(min_gate, float(pair_gate))
+        return {
+            "gate": float(min_gate),
+            "max_ea": float(max_ea),
+            "evaluated_pairs": float(pair_count),
+        }
 
     @staticmethod
     def _category_color(category: str) -> str:
@@ -905,19 +1481,23 @@ class NuScenesTokenScorer:
         centerlines: Sequence[Any],
         drivable_polygons: Sequence[Any],
         scene_objects: Sequence[dict[str, Any]],
+        agent_states_for_ea: Sequence[dict[str, Any]] = (),
         dt_s: float,
     ) -> dict[str, Any]:
         horizon = int(cand_xy.shape[0])
         if horizon <= 0:
+            multiplicative_metrics = {
+                "no_collision": 0.0,
+                "drivable_area": 0.0,
+                "driving_direction": 1.0,
+            }
+            if self.ea_gate_enabled:
+                multiplicative_metrics["ea_safety"] = 0.0#若ea打开就是一个新的multiplicative_merics gate项
             return {
                 "score": 0.0,
                 "weighted_score": 0.0,
                 "multiplicative_product": 0.0,
-                "multiplicative_metrics": {
-                    "no_collision": 0.0,
-                    "drivable_area": 0.0,
-                    "driving_direction": 1.0,
-                },
+                "multiplicative_metrics": multiplicative_metrics,
                 "weighted_metrics": {
                     "progress": 0.0,
                     "ttc": 0.0,
@@ -932,7 +1512,8 @@ class NuScenesTokenScorer:
         mean_err = float(pos_err.mean()) if pos_err.size else 0.0
         yaw_err = np.abs(_wrap_angle(cand_yaw - gt_yaw_cmp)) if gt_yaw_cmp.size else np.zeros((horizon,), dtype=np.float32)
         mean_yaw_err = float(yaw_err.mean()) if yaw_err.size else 0.0
-
+        #仅仅作为分析没有进入最终的score
+        #关于自车进度，有一个想法是将拉伸为直线，然后两者比较， 
         cand_progress = _project_progress(cand_xy[-1], gt_xy_full, gt_s_full) if gt_xy_full.shape[0] > 0 else 0.0
         progress_ratio = float(np.clip(cand_progress / max(1.0e-6, gt_total_len), 0.0, 1.0))
 
@@ -1014,6 +1595,13 @@ class NuScenesTokenScorer:
         else:
             ttc_score = 1.0
 
+        ea_gate_result = self._score_ea_safety_gate(
+            cand_xy=cand_xy,
+            cand_yaw=cand_yaw,
+            agent_states=agent_states_for_ea,
+            dt_s=float(dt_s),
+        ) if self.ea_gate_enabled else {"gate": 1.0, "max_ea": 0.0, "evaluated_pairs": 0.0}
+
         weighted_metrics = {
             "progress": progress_ratio,
             "ttc": float(ttc_score),
@@ -1021,10 +1609,10 @@ class NuScenesTokenScorer:
             "history_comfort": float(history_comfort),
         }
         weighted_weights = {
-            "progress": 5.0,
-            "ttc": 5.0,
-            "lane_keeping": 2.0,
-            "history_comfort": 2.0,
+            "progress": float(self.progress_weight),
+            "ttc": float(self.ttc_weight),
+            "lane_keeping": float(self.lane_keeping_weight),
+            "history_comfort": float(self.history_comfort_weight),
         }
         weighted_score = float(
             sum(weighted_metrics[key] * weighted_weights[key] for key in weighted_metrics)
@@ -1035,6 +1623,8 @@ class NuScenesTokenScorer:
             "drivable_area": float(drivable_area),
             "driving_direction": float(driving_direction),
         }
+        if self.ea_gate_enabled:
+            multiplicative_metrics["ea_safety"] = float(ea_gate_result["gate"])
         multiplicative_product = float(np.prod(np.asarray(list(multiplicative_metrics.values()), dtype=np.float32)))
         score = float(weighted_score * multiplicative_product)
 
@@ -1062,6 +1652,8 @@ class NuScenesTokenScorer:
             "smoothness_penalty_raw": smooth_pen,
             "ttc_earliest_risk_time_s": float(earliest_ttc_risk_s),
             "driving_direction_oncoming_progress_m": float(oncoming_progress_m),
+            "ea_gate_max_ea": float(ea_gate_result.get("max_ea", 0.0)),
+            "ea_gate_evaluated_pairs": float(ea_gate_result.get("evaluated_pairs", 0.0)),
             "score_terms": score_terms,
         }
 
@@ -1087,15 +1679,20 @@ class NuScenesTokenScorer:
             sample_token = replay.get("sample_token", None)
             if sample_token is None:
                 raise RuntimeError("NuScenesTokenScorer requires replay['sample_token']")
-            row = self._lookup_row(str(sample_token))
-            gt_xy = self._lookup_gt(str(sample_token)).copy()
-            gt_yaw = _path_yaw_from_xy(gt_xy)
-            gt_s = _polyline_arclength(gt_xy)
-            gt_total_len = float(max(1.0e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
-            cached_map_context = self._lookup_cached_map_layers(replay, patch_radius=_DEFAULT_PATCH_RADIUS_M)
-            map_context = cached_map_context if cached_map_context is not None else self._lookup_map_layers(row, patch_radius=_DEFAULT_PATCH_RADIUS_M)
+            sample_token_str = str(sample_token)
+            static_ctx = self._build_static_sample_context(
+                replay,
+                patch_radius=_DEFAULT_PATCH_RADIUS_M,
+            )
+            row = dict(static_ctx["row"])
+            gt_xy = np.asarray(static_ctx["gt_xy"], dtype=np.float32).copy()
+            gt_yaw = np.asarray(static_ctx["gt_yaw"], dtype=np.float32).copy()
+            gt_s = np.asarray(static_ctx["gt_s"], dtype=np.float32).copy()
+            gt_total_len = float(static_ctx["gt_total_len"])
+            map_context = dict(static_ctx["map_context"])
             gt_history_xy = self._lookup_gt_history(row, origin_xy=None) if include_debug_context else np.zeros((0, 2), dtype=np.float32)
-            scene_objects = self._collect_scene_objects(row, patch_radius=float(map_context.get("patch_radius", _DEFAULT_PATCH_RADIUS_M)))
+            scene_objects = list(static_ctx["scene_objects"])
+            ea_agent_states = list(static_ctx["ea_agent_states"])
 
             horizon = min(int(gt_xy.shape[0]), int(traj_np.shape[2]))
             gt_xy_cmp = gt_xy[:horizon]
@@ -1105,7 +1702,7 @@ class NuScenesTokenScorer:
 
             sample_detail: dict[str, Any] = {
                 "batch_index": int(batch_idx),
-                "sample_token": str(sample_token),
+                "sample_token": sample_token_str,
                 "gt_origin_shift_xy": [0.0, 0.0],
                 "gt_xy": gt_xy_cmp.copy(),
                 "gt_yaw": gt_yaw_cmp.copy(),
@@ -1130,6 +1727,7 @@ class NuScenesTokenScorer:
                     centerlines=lane_centerlines,
                     drivable_polygons=drivable_polygons,
                     scene_objects=scene_objects,
+                    agent_states_for_ea=ea_agent_states,
                     dt_s=0.5,
                 )
                 score = float(candidate_result["score"])

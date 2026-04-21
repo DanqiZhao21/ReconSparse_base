@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict
 
 import torch
@@ -109,6 +110,25 @@ class TrajectoryLightningModule(L.LightningModule):
         self._grpo_debug_dump_count = 0
         self._reset_update_metric_aggregates()
 
+    def _maybe_report_slow_step_part(self, *, name: str, seconds: float, batch_idx: int) -> None:
+        threshold_s = 2.0
+        if float(seconds) < float(threshold_s):
+            return
+        stage_fn = getattr(self, "stage_fn", None)
+        if not callable(stage_fn):
+            return
+        update_fn = getattr(self, "_update_index", None)
+        update_idx = "unknown"
+        if callable(update_fn):
+            try:
+                update_idx = str(int(update_fn()))
+            except Exception:
+                update_idx = "unknown"
+        stage_fn(
+            f"[learner] slow_step update={update_idx} batch_idx={int(batch_idx)} "
+            f"part={name} took={float(seconds):.2f}s"
+        )
+
     def _maybe_apply_grpo_loss(
         self,
         *,
@@ -117,6 +137,7 @@ class TrajectoryLightningModule(L.LightningModule):
         batch_idx: int,
         loss: torch.Tensor,
         metrics: Dict[str, torch.Tensor],
+        timing_parts: Dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         grpo_coef = float(self.learner_config.grpo_coef)
         grpo_enabled = bool(getattr(self.learner_config, "grpo_enabled", False)) or (grpo_coef > 0.0)
@@ -133,26 +154,42 @@ class TrajectoryLightningModule(L.LightningModule):
                 "GRPO is enabled but the agent does not expose "
                 "`sample_counterfactual_trajectories_from_replay_batch`."
             )
+        t0 = time.perf_counter()
         candidates = candidate_fn(
             replay,
             num_candidates=int(self.learner_config.grpo_num_candidates),
             candidate_select=str(self.learner_config.grpo_candidate_select),
         )
+        sample_s = float(time.perf_counter() - t0)
+        if timing_parts is not None:
+            timing_parts["grpo_sample_s"] = timing_parts.get("grpo_sample_s", 0.0) + sample_s
+        self._maybe_report_slow_step_part(name="grpo_sample", seconds=sample_s, batch_idx=batch_idx)
         candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
+        t0 = time.perf_counter()
         candidate_scores = score_counterfactual_trajectories(
             self.agent,
             replay,
             candidates["traj_xyyaw"],
             device=device,
         )
+        score_s = float(time.perf_counter() - t0)
+        if timing_parts is not None:
+            timing_parts["grpo_score_s"] = timing_parts.get("grpo_score_s", 0.0) + score_s
+        self._maybe_report_slow_step_part(name="grpo_score", seconds=score_s, batch_idx=batch_idx)
+        t0 = time.perf_counter()
         self._maybe_dump_grpo_debug(
             replay=replay,
             traj_xyyaw=candidates["traj_xyyaw"],
             candidate_scores=candidate_scores,
             batch_idx=batch_idx,
         )
+        debug_s = float(time.perf_counter() - t0)
+        if timing_parts is not None:
+            timing_parts["grpo_debug_s"] = timing_parts.get("grpo_debug_s", 0.0) + debug_s
+        self._maybe_report_slow_step_part(name="grpo_debug", seconds=debug_s, batch_idx=batch_idx)
         if not loss_requested:
             return loss, metrics
+        t0 = time.perf_counter()
         grpo_loss = compute_grpo_objective(
             candidate_log_probs=candidate_log_probs,
             candidate_scores=candidate_scores,
@@ -160,6 +197,10 @@ class TrajectoryLightningModule(L.LightningModule):
             use_rank_adv=bool(self.learner_config.grpo_use_rank_adv),
             score_clip=self.learner_config.grpo_score_clip,
         )
+        objective_s = float(time.perf_counter() - t0)
+        if timing_parts is not None:
+            timing_parts["grpo_objective_s"] = timing_parts.get("grpo_objective_s", 0.0) + objective_s
+        self._maybe_report_slow_step_part(name="grpo_objective", seconds=objective_s, batch_idx=batch_idx)
         out_loss = loss + grpo_coef * grpo_loss.loss
         out_metrics = {
             **metrics,
@@ -256,6 +297,8 @@ class TrajectoryLightningModule(L.LightningModule):
         self._update_metric_steps = 0
         self._update_metric_sums: Dict[str, float] = {}
         self._update_metric_max: Dict[str, float] = {}
+        self._update_timing_sums: Dict[str, float] = {}
+        self._update_timing_max: Dict[str, float] = {}
 
     def _record_update_metrics(self, metrics: Dict[str, torch.Tensor], *, batch_size: int) -> None:
         weight = float(max(1, int(batch_size)))
@@ -278,6 +321,24 @@ class TrajectoryLightningModule(L.LightningModule):
         if "approx_kl" in self._update_metric_max:
             out["approx_kl_max"] = float(self._update_metric_max["approx_kl"])
         out["num_minibatches"] = float(self._update_metric_steps)
+        return out
+
+    def _record_update_timing(self, timing_parts: Dict[str, float]) -> None:
+        for key, value in timing_parts.items():
+            scalar = float(value)
+            self._update_timing_sums[key] = self._update_timing_sums.get(key, 0.0) + scalar
+            prev_max = self._update_timing_max.get(key, scalar)
+            self._update_timing_max[key] = scalar if scalar > prev_max else prev_max
+
+    def aggregated_update_timing(self) -> Dict[str, float]:
+        out = dict(self._update_timing_sums)
+        if self._update_metric_steps > 0:
+            denom = float(self._update_metric_steps)
+            for key, value in self._update_timing_sums.items():
+                out[f"{key}_avg"] = float(value / denom)
+        for key, value in self._update_timing_max.items():
+            out[f"{key}_max"] = float(value)
+        out["timed_minibatches"] = float(self._update_metric_steps)
         return out
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
@@ -314,6 +375,8 @@ class TrajectoryLightningModule(L.LightningModule):
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         try:
+            step_t0 = time.perf_counter()
+            timing_parts: Dict[str, float] = {}
             device = self.device
             replay = list(batch["replay"])
             adv = batch["adv"].to(device=device, dtype=torch.float32).view(-1)
@@ -322,16 +385,19 @@ class TrajectoryLightningModule(L.LightningModule):
             if torch.is_tensor(old_logp):
                 old_logp = old_logp.to(device=device, dtype=torch.float32).view(-1)
 
+            t0 = time.perf_counter()
             new_logp = agent_logp_from_replay_batch(
                 self.agent,
                 replay,
                 device=device,
                 eta=float(self.learner_config.eta),
             )
+            timing_parts["new_logp_s"] = float(time.perf_counter() - t0)
 
             if self.learner_config.algo_kind.startswith("ppo"):
                 if self.value_net is None:
                     raise RuntimeError("PPO Lightning module requires value_net")
+                t0 = time.perf_counter()
                 if _use_agent_value_features(self.agent, self.value_net, batch):
                     value_input = self.agent.value_features_from_replay_batch(replay).to(device=device, dtype=torch.float32)
                 else:
@@ -340,6 +406,8 @@ class TrajectoryLightningModule(L.LightningModule):
                 if torch.is_tensor(old_value):
                     old_value = old_value.to(device=device, dtype=torch.float32).view(-1)
                 value_pred = self.value_net(value_input).view(-1)
+                timing_parts["value_s"] = float(time.perf_counter() - t0)
+                t0 = time.perf_counter()
                 ppo_loss = compute_ppo_objective(
                     new_logp=new_logp,
                     old_logp=old_logp,
@@ -353,6 +421,8 @@ class TrajectoryLightningModule(L.LightningModule):
                     kl_coef=float(self.learner_config.kl_coef),
                     dual_clip=self.learner_config.dual_clip,
                 )
+                timing_parts["objective_s"] = float(time.perf_counter() - t0)
+                t0 = time.perf_counter()
                 metrics = compute_ppo_metrics(
                     new_logp=new_logp,
                     old_logp=old_logp,
@@ -361,9 +431,11 @@ class TrajectoryLightningModule(L.LightningModule):
                     value_pred=value_pred,
                     loss=ppo_loss,
                 )
+                timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
                 loss = ppo_loss.loss
             else:
                 reinforce_old_logp = old_logp if self.learner_config.algo_kind in {"reinforcepp", "reinforce_kl"} else None
+                t0 = time.perf_counter()
                 r_loss = compute_reinforce_objective(
                     new_logp=new_logp,
                     old_logp=reinforce_old_logp,
@@ -371,12 +443,15 @@ class TrajectoryLightningModule(L.LightningModule):
                     clip_eps=float(self.learner_config.clip_eps),
                     kl_coef=float(self.learner_config.kl_coef),
                 )
+                timing_parts["objective_s"] = float(time.perf_counter() - t0)
+                t0 = time.perf_counter()
                 metrics = compute_reinforce_metrics(
                     new_logp=new_logp,
                     old_logp=reinforce_old_logp,
                     adv=adv,
                     loss=r_loss,
                 )
+                timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
                 loss = r_loss.loss
 
             loss, metrics = self._maybe_apply_grpo_loss(
@@ -385,8 +460,10 @@ class TrajectoryLightningModule(L.LightningModule):
                 batch_idx=batch_idx,
                 loss=loss,
                 metrics=metrics,
+                timing_parts=timing_parts,
             )
 
+            t0 = time.perf_counter()
             distill_metrics = _maybe_compute_distillation_metrics(
                 self.agent,
                 replay,
@@ -395,10 +472,12 @@ class TrajectoryLightningModule(L.LightningModule):
                 forward_kl_coef=float(self.learner_config.forward_kl_coef),
                 reverse_kl_coef=float(self.learner_config.reverse_kl_coef),
             )
+            timing_parts["distill_s"] = float(time.perf_counter() - t0)
             if distill_metrics is not None:
                 loss = loss + distill_metrics["loss_forward_kl"] + distill_metrics["loss_reverse_kl"]
                 metrics = {**metrics, **distill_metrics}
 
+            t0 = time.perf_counter()
             self.latest_metrics = {key: float(val.detach().cpu().item()) for key, val in metrics.items()}
             self._record_update_metrics(metrics, batch_size=int(adv.shape[0]))
             self._maybe_log_train_seen_samples(
@@ -417,6 +496,9 @@ class TrajectoryLightningModule(L.LightningModule):
                     logger=False,
                     batch_size=int(adv.shape[0]),
                 )
+            timing_parts["metrics_log_s"] = float(time.perf_counter() - t0)
+            timing_parts["training_step_total_s"] = float(time.perf_counter() - step_t0)
+            self._record_update_timing(timing_parts)
             return loss
         except Exception as exc:
             if _exception_is_cuda_oom(exc):

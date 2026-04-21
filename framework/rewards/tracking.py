@@ -72,6 +72,11 @@ class TrackingRewardComputer:
         collision_cfg = cfg.get("collision", {}) or {}
         return collision_cfg if isinstance(collision_cfg, dict) else {}
 
+    def _terminal_cfg(self) -> Dict[str, Any]:
+        cfg = self.reward_cfg or {}
+        terminal_cfg = cfg.get("terminal", {}) or {}
+        return terminal_cfg if isinstance(terminal_cfg, dict) else {}
+
     @staticmethod
     def _ego_yaw_from_pose(pose: np.ndarray) -> float:
         rot = np.asarray(pose[:3, :3], dtype=np.float64)
@@ -193,6 +198,8 @@ class TrackingRewardComputer:
 
         path_xy, path_s = self._ensure_reference_path(env)#Frenet 坐标
         progress_s, lateral_error_m, _proj, tangent = self._project_point_to_path(ego_xz, path_xy, path_s)
+        total_path_len = float(path_s[-1]) if int(path_s.shape[0]) > 0 else 0.0
+        completion_ratio = float(np.clip(progress_s / max(1.0e-6, total_path_len), 0.0, 1.0))
         path_heading = float(math.atan2(float(tangent[1]), float(tangent[0])))
         yaw_path_err_rad = _wrap_angle(float(ego_yaw) - float(path_heading))#航向误差
         yaw_path_err_deg = abs(_angle_to_deg(yaw_path_err_rad))
@@ -208,6 +215,10 @@ class TrackingRewardComputer:
         w_progress = float(path_cfg.get("w_progress", 0.0))
         progress_reward = float(np.clip(progress_delta_s, -progress_backward_cap, progress_forward_cap))
         progress_term = w_progress * progress_reward
+        w_completion_ratio = float(path_cfg.get("w_completion_ratio", 0.0))
+        completion_ratio_power = max(1.0, float(path_cfg.get("completion_ratio_power", 2.0)))
+        completion_ratio_bonus = float(np.clip(completion_ratio, 0.0, 1.0) ** completion_ratio_power)
+        completion_ratio_term = w_completion_ratio * completion_ratio_bonus
         #横向惩罚
         lateral_free = float(path_cfg.get("lateral_free_m", 0.3))
         lateral_delta = float(path_cfg.get("lateral_huber_delta_m", 0.5))
@@ -272,6 +283,7 @@ class TrackingRewardComputer:
         anchor_lateral_term = 0.0
         reward = (
             progress_term
+            + completion_ratio_term
             - lateral_term
             - yaw_term
             - static_collision_penalty
@@ -290,9 +302,13 @@ class TrackingRewardComputer:
                 "reward": float(reward),
                 "done": bool(done),
                 "progress_s": float(progress_s),
+                "total_path_len_m": float(total_path_len),
+                "completion_ratio": float(completion_ratio),
                 "progress_delta_s": float(progress_delta_s),
                 "progress_reward": float(progress_reward),
                 "progress_term": float(progress_term),#####
+                "completion_ratio_bonus": float(completion_ratio_bonus),
+                "completion_ratio_term": float(completion_ratio_term),
                 "lateral_error_m": float(lateral_error_m),
                 "lateral_penalty": float(lateral_penalty),
                 "lateral_term": float(lateral_term),#####
@@ -334,9 +350,18 @@ class TrackingRewardComputer:
         term_cfg: Dict[str, Any],
         terminal_kind: str | None,
     ) -> TrackingRewardResult:
+        success_bonus = float(term_cfg.get("success_bonus", 0.0))
+        out_info = dict(info)
+        reward_out = float(reward)
+        if terminal_kind == "env_done" and success_bonus != 0.0:
+            reward_out += success_bonus
+            out_info["terminal_success_bonus"] = float(success_bonus)
+            out_info["terminal_success_bonus_applied"] = True
+
         penalty = float(term_cfg.get("penalty", 0.0))
         if penalty == 0.0:
-            return TrackingRewardResult(reward=float(reward), info=info)
+            out_info["reward"] = float(reward_out)
+            return TrackingRewardResult(reward=float(reward_out), info=out_info)
 
         apply_on_failure = bool(term_cfg.get("apply_on_failure", True))
         apply_on_timeout = bool(term_cfg.get("apply_on_timeout", False))
@@ -350,11 +375,11 @@ class TrackingRewardComputer:
             should_apply = True
 
         if not should_apply:
-            return TrackingRewardResult(reward=float(reward), info=info)
+            out_info["reward"] = float(reward_out)
+            return TrackingRewardResult(reward=float(reward_out), info=out_info)
 
-        out_info = dict(info)
         out_info["terminal_kind"] = terminal_kind
         out_info["terminal_penalty"] = float(penalty)
         out_info["terminal_penalty_applied"] = True
-        out_info["reward"] = float(reward + penalty)
-        return TrackingRewardResult(reward=float(reward + penalty), info=out_info)
+        out_info["reward"] = float(reward_out + penalty)
+        return TrackingRewardResult(reward=float(reward_out + penalty), info=out_info)

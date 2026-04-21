@@ -19,6 +19,8 @@ env:
       w_progress: 1.0
       progress_forward_cap_m: 2.0
       progress_backward_cap_m: 0.5
+      w_completion_ratio: 1.0
+      completion_ratio_power: 2.0
       w_lateral: 0.25
       lateral_free_m: 0.3
       lateral_huber_delta_m: 0.5
@@ -53,6 +55,7 @@ env:
       terminate_on_static_collision: true
       terminate_on_dynamic_collision: true
       penalty: -15.0
+      success_bonus: 10.0
       apply_on_failure: true
       apply_on_timeout: false
       apply_on_env_done: false
@@ -90,7 +93,7 @@ train:
     max_shard_version_lag: 2
     shards_per_update: 24
     poll_interval_s: 0.1
-    max_updates: 150
+    max_updates: 32
 
   vf_coef: 0.5
   lr_value: 1.0e-4
@@ -131,6 +134,8 @@ agent:
   type: sparsedrive_v2
   ckpt: SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
   trainable_prefixes: [_trajectory_head.decoder.layers.1.metric_heads]
+  nuscenes_scorer:
+    progress_weight: 8.0
   # RL uses candidate_scores, which come from _trajectory_head.decoder.layers.1.metric_heads in SparseDriveV2.
   # If you explicitly want only the trajectory classification head instead, use:
   # trainable_prefixes: [_trajectory_head.decoder.layers.1.traj_mlp]

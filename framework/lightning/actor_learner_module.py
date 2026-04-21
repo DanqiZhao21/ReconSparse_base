@@ -112,10 +112,14 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             ret = datamodule.current_loaded.batch["ret"]
             adv = datamodule.current_loaded.batch["adv"]
             metrics = self.aggregated_update_metrics()
+            timing_parts = self.aggregated_update_timing()
             self.stage_fn(f"[learner] stage3 broadcast: ver={new_v}")
             self.stage_fn(
                 f"[learner] update={int(self._update_index())} shards={len(selected)} "
                 f"samples={n} ver={new_v} metrics={metrics}"
+            )
+            self.stage_fn(
+                f"[learner] step_timing update={int(self._update_index())} parts={timing_parts}"
             )
             self.stage_fn(
                 f"[learner] timing update={int(self._update_index())} "
