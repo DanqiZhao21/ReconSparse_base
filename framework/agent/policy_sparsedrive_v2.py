@@ -182,6 +182,7 @@ class SparseDriveV2Policy(Agent):
         self._last_missing_feature_fields: List[str] = []
         self._teacher_model: torch.nn.Module | None = None
         self._nuscenes_token_scorer: Any | None = None
+        self._nuscenes_pdm_scorer: Any | None = None
 
     @property
     def device(self) -> torch.device:
@@ -1004,23 +1005,56 @@ class SparseDriveV2Policy(Agent):
             features = torch.cat([pooled_vision, status_encoding], dim=1)
         return features.detach().clone()
 
+    def _counterfactual_scorer_backend_name(self) -> str:
+        backend = str(self._nuscenes_scorer_config.get("backend", "token")).strip().lower()
+        if backend in {"pdm", "nuscenes_pdm"}:
+            return "nuscenes_pdm"
+        return "token"
+
     def _ensure_nuscenes_token_scorer(self):
         if self._nuscenes_token_scorer is None:
             from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
 
+            scorer_kwargs = {
+                key: value
+                for key, value in self._nuscenes_scorer_config.items()
+                if key != "backend"
+            }
             self._nuscenes_token_scorer = NuScenesTokenScorer(
                 token2vad_path=nus_cfg.TOKEN2VAD_FILE,
-                **self._nuscenes_scorer_config,
+                **scorer_kwargs,
             )
         return self._nuscenes_token_scorer
+
+    def _ensure_nuscenes_pdm_scorer(self):
+        if self._nuscenes_pdm_scorer is None:
+            from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+            scorer_kwargs = {
+                key: value
+                for key, value in self._nuscenes_scorer_config.items()
+                if key != "backend"
+            }
+            self._nuscenes_pdm_scorer = NuScenesPDMScorer(
+                token2vad_path=nus_cfg.TOKEN2VAD_FILE,
+                **scorer_kwargs,
+            )
+        return self._nuscenes_pdm_scorer
+
+    def _ensure_counterfactual_scorer_backend(self):
+        if self._counterfactual_scorer_backend_name() == "nuscenes_pdm":
+            return self._ensure_nuscenes_pdm_scorer()
+        return self._ensure_nuscenes_token_scorer()
 
     def pdm_score_counterfactuals_from_replay_batch(
         self,
         replays: Sequence[Dict[str, Any]],
         traj_xyyaw: torch.Tensor,
     ) -> torch.Tensor:
-        scorer = self._ensure_nuscenes_token_scorer()
-        return scorer.score(replays, traj_xyyaw).to(device=self.device, dtype=torch.float32)
+        from framework.algorithms.pdm_scorer import _as_score_tensor
+
+        scorer = self._ensure_counterfactual_scorer_backend()
+        return _as_score_tensor(scorer.score(replays, traj_xyyaw), device=self.device)
 
     def dump_counterfactual_debug_from_replay_batch(
         self,
@@ -1033,7 +1067,7 @@ class SparseDriveV2Policy(Agent):
         top_k: int,
     ) -> None:
         del candidate_scores
-        scorer = self._ensure_nuscenes_token_scorer()
+        scorer = self._ensure_counterfactual_scorer_backend()
         scorer.dump_debug_artifacts(
             replays,
             traj_xyyaw,

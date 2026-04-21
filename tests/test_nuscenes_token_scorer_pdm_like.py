@@ -253,6 +253,8 @@ def test_score_with_details_uses_continuous_driving_direction_gate(tmp_path: Pat
                 [0.0, 2.0],
                 [0.0, 2.0],
                 [0.0, 2.0],
+                [0.0, 2.0],
+                [0.0, 2.0],
             ],
             dtype=np.float32,
         ),
@@ -282,8 +284,9 @@ def test_score_with_details_uses_continuous_driving_direction_gate(tmp_path: Pat
     traj_xyyaw = torch.tensor(
         [
             [
-                [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
-                [[-1.0, 0.0, math.pi], [-2.0, 0.0, math.pi], [-3.0, 0.0, math.pi]],
+                [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [4.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+                [[-1.0, 0.0, math.pi], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+                [[-1.0, 0.0, math.pi], [-2.0, 0.0, math.pi], [-3.0, 0.0, math.pi], [-4.0, 0.0, math.pi], [-5.0, 0.0, math.pi]],
             ]
         ],
         dtype=torch.float32,
@@ -295,8 +298,11 @@ def test_score_with_details_uses_continuous_driving_direction_gate(tmp_path: Pat
     )
 
     forward = details[0]["candidates"][0]
-    reverse = details[0]["candidates"][1]
+    brief_reverse = details[0]["candidates"][1]
+    sustained_reverse = details[0]["candidates"][2]
 
     assert forward["multiplicative_metrics"]["driving_direction"] == pytest.approx(1.0)
-    assert 0.0 < reverse["multiplicative_metrics"]["driving_direction"] < 1.0
-    assert reverse["driving_direction_oncoming_progress_m"] == pytest.approx(3.0, abs=1.0e-4)
+    assert brief_reverse["multiplicative_metrics"]["driving_direction"] == pytest.approx(1.0)
+    assert brief_reverse["driving_direction_oncoming_progress_m"] == pytest.approx(0.0, abs=1.0e-4)
+    assert 0.0 < sustained_reverse["multiplicative_metrics"]["driving_direction"] < 1.0
+    assert sustained_reverse["driving_direction_oncoming_progress_m"] == pytest.approx(4.0, abs=1.0e-4)

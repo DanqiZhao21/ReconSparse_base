@@ -114,7 +114,10 @@ def test_score_matches_detail_path_for_mixed_horizon_batch(tmp_path: Path) -> No
 def test_detail_path_reuses_static_context_per_sample_token(monkeypatch, tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
-    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer = NuScenesTokenScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
 
     calls = {
         "lookup_gt": 0,
@@ -140,8 +143,8 @@ def test_detail_path_reuses_static_context_per_sample_token(monkeypatch, tmp_pat
         calls["collect_scene_objects"] += 1
         return []
 
-    def wrapped_collect_ea_agent_states(replay, *, patch_radius: float):
-        del replay, patch_radius
+    def wrapped_collect_ea_agent_states(replay, *, patch_radius: float, row=None):
+        del replay, patch_radius, row
         calls["collect_ea_agent_states"] += 1
         return []
 
@@ -209,8 +212,8 @@ def test_detail_path_reuses_static_context_from_disk_across_scorer_instances(
         calls["collect_scene_objects"] += 1
         return []
 
-    def wrapped_collect_ea_agent_states(replay, *, patch_radius: float):
-        del replay, patch_radius
+    def wrapped_collect_ea_agent_states(replay, *, patch_radius: float, row=None):
+        del replay, patch_radius, row
         calls["collect_ea_agent_states"] += 1
         return []
 

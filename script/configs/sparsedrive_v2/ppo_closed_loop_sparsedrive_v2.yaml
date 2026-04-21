@@ -82,13 +82,13 @@ train:
     buffer_dir: outputs/actor_learner_ppo_batched
     learner_gpu_id: 0
     actor_gpu_pool: [1, 2, 3]
-    actors_per_gpu: 2
+    actors_per_gpu: 4 #每个GPU上跑4个actor，总共12个actor
     auto_max_inflight_per_actor: true
     pause_actor_on_learner_gpu: true
     scene_shard_by_actor: true
     scene_shard_strategy: round_robin
     actor_horizon: 32
-    num_envs_per_actor: 2
+    num_envs_per_actor: 1 #每个actor只跑一个环境，保证每个环境的轨迹连续性，方便GRPO计算
     vec_env_mode: serial
     max_shard_version_lag: 2
     shards_per_update: 24
@@ -135,6 +135,8 @@ agent:
   ckpt: SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
   trainable_prefixes: [_trajectory_head.decoder.layers.1.metric_heads]
   nuscenes_scorer:
+    backend: nuscenes_pdm
+    scene_cache_root: /root/clone/ReconDreamer-RL/assets/nus/cache
     progress_weight: 8.0
   # RL uses candidate_scores, which come from _trajectory_head.decoder.layers.1.metric_heads in SparseDriveV2.
   # If you explicitly want only the trajectory classification head instead, use:

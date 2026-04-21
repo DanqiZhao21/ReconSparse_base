@@ -60,6 +60,8 @@ _DEFAULT_TTC_FUTURE_OFFSETS_S = (0.0, 0.3, 0.6, 0.9)
 _DEFAULT_TTC_STOPPED_SPEED_THRESHOLD_MPS = 5.0e-3
 _DEFAULT_DIRECTION_COMPLIANCE_THRESHOLD_M = 2.0
 _DEFAULT_DIRECTION_VIOLATION_THRESHOLD_M = 6.0
+_DEFAULT_DIRECTION_REVERSE_ALIGNMENT_THRESHOLD = 0.8
+_DEFAULT_DIRECTION_MIN_CONTINUOUS_REVERSE_S = 0.5
 _DEFAULT_EA_PROJECT_SRC = Path("/root/clone/EA/src")
 _DEFAULT_EA_GOOD_THRESHOLD = 0.0
 _DEFAULT_EA_BAD_THRESHOLD = 8.0
@@ -1516,7 +1518,7 @@ class NuScenesTokenScorer:
         #关于自车进度，有一个想法是将拉伸为直线，然后两者比较， 
         cand_progress = _project_progress(cand_xy[-1], gt_xy_full, gt_s_full) if gt_xy_full.shape[0] > 0 else 0.0
         progress_ratio = float(np.clip(cand_progress / max(1.0e-6, gt_total_len), 0.0, 1.0))
-
+        #动力学（舒适性）
         cand_prev = np.concatenate([np.zeros((1, 2), dtype=np.float32), cand_xy[:-1]], axis=0)
         cand_vel = cand_xy - cand_prev
         cand_acc = cand_vel[1:] - cand_vel[:-1] if cand_vel.shape[0] > 1 else np.zeros((0, 2), dtype=np.float32)
@@ -1524,11 +1526,13 @@ class NuScenesTokenScorer:
         cand_yaw_prev = np.concatenate([cand_yaw[:1], cand_yaw[:-1]], axis=0)
         cand_yaw_rate = np.abs(_wrap_angle(cand_yaw - cand_yaw_prev)) / max(1.0e-6, float(dt_s))
         smooth_pen = float(np.linalg.norm(cand_acc, axis=1).mean()) if cand_acc.size else 0.0
+        #舒适性 = 纵向平滑 + 横向平滑”，而且必须做尺度平衡
         comfort_cost = smooth_pen + 0.25 * float(cand_yaw_rate.mean()) if cand_yaw_rate.size else smooth_pen
         history_comfort = float(np.clip(1.0 - 0.08 * comfort_cost, 0.0, 1.0))
 
         lateral_errors: list[float] = []
         oncoming_progress_m = 0.0
+        continuous_reverse_time_s = 0.0
         for step_idx in range(horizon):
             lateral_dist, tangent = self._nearest_centerline_stats(cand_xy[step_idx], centerlines)
             lateral_errors.append(lateral_dist)
@@ -1536,9 +1540,16 @@ class NuScenesTokenScorer:
             move_norm = float(np.linalg.norm(move_vec))
             if move_norm > 1.0e-6:
                 move_dir = (move_vec / move_norm).astype(np.float32)
+                #逆行检测（driving direction）
                 reverse_alignment = max(0.0, -float(np.dot(move_dir, tangent)))
-                oncoming_progress_m += move_norm * reverse_alignment
+                if reverse_alignment > _DEFAULT_DIRECTION_REVERSE_ALIGNMENT_THRESHOLD:
+                    continuous_reverse_time_s += float(dt_s)
+                    if continuous_reverse_time_s > _DEFAULT_DIRECTION_MIN_CONTINUOUS_REVERSE_S:
+                        oncoming_progress_m += move_norm * reverse_alignment
+                else:
+                    continuous_reverse_time_s = 0.0
         mean_lateral = float(np.mean(lateral_errors)) if lateral_errors else 0.0
+        #横向偏移（lane keeping）
         lane_keeping = float(np.clip(1.0 - (mean_lateral / 2.0), 0.0, 1.0)) if centerlines else float(
             np.clip(1.0 - 0.25 * mean_err, 0.0, 1.0)
         )
@@ -1547,7 +1558,7 @@ class NuScenesTokenScorer:
             good_threshold=_DEFAULT_DIRECTION_COMPLIANCE_THRESHOLD_M,
             bad_threshold=_DEFAULT_DIRECTION_VIOLATION_THRESHOLD_M,
         )
-
+        #可行使区域
         offroad = any(not self._point_in_polygons(cand_xy[step_idx], drivable_polygons) for step_idx in range(horizon)) if drivable_polygons else False
         drivable_area = 0.0 if offroad else 1.0
 
@@ -1590,9 +1601,9 @@ class NuScenesTokenScorer:
                 break
         no_collision = 0.0 if collision else 1.0
         ttc_horizon_s = float(_DEFAULT_TTC_FUTURE_OFFSETS_S[-1]) if _DEFAULT_TTC_FUTURE_OFFSETS_S else 1.0
-        if math.isfinite(earliest_ttc_risk_s):
+        if math.isfinite(earliest_ttc_risk_s):#有碰撞风险
             ttc_score = float(np.clip(earliest_ttc_risk_s / max(1.0e-6, ttc_horizon_s), 0.0, 1.0))
-        else:
+        else:#无碰撞风险，则直接满分1分
             ttc_score = 1.0
 
         ea_gate_result = self._score_ea_safety_gate(
