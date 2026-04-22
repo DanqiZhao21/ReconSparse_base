@@ -68,6 +68,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
         self.shards_per_update = int(learner_config.shards_per_update)
         self.max_inflight_per_actor = int(getattr(learner_config, "max_inflight_per_actor", 1))
         self.poll_s = float(learner_config.poll_s)
+        self.shard_collect_timeout_s = float(getattr(learner_config, "shard_collect_timeout_s", 0.0))
         self.max_shard_version_lag = int(learner_config.max_shard_version_lag)
         self.norm_eps = float(learner_config.norm_eps)
         self.inner_epochs = max(1, int(learner_config.inner_epochs))
@@ -81,6 +82,20 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
         self.current_prepare_batch_s = 0.0
         self.current_weights_version = int(start_version)
         self.should_stop = False
+
+    def _actors_present(self, shard_files: List[str]) -> List[int]:
+        present: set[int] = set()
+        for fp in shard_files:
+            name = os.path.basename(fp)
+            if not name.startswith("actor"):
+                continue
+            tail = name[len("actor") :]
+            actor_text = tail.split("_", 1)[0]
+            try:
+                present.add(int(actor_text))
+            except Exception:
+                continue
+        return sorted(present)
 
     def current_inner_epoch_index(self) -> int:
         trainer = getattr(self, "trainer", None)
@@ -103,6 +118,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
             self.stage_fn(f"[learner] stage1 collect: waiting shards mode={self.mode} actors={self.num_actors}")
             last_progress_t = 0.0
             selected = []
+            timed_out_actors: List[int] = []
             while True:
                 if stop_requested(self.paths):
                     break
@@ -123,6 +139,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                 )
                 effective_shards_per_update = int(self.shards_per_update)
                 if self.mode.startswith("async"):
+                    timed_out_actors = []
                     effective_shards_per_update = resolve_async_shards_per_update(
                         requested_shards_per_update=int(self.shards_per_update),
                         num_actors=int(self.num_actors),
@@ -132,6 +149,24 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                     if effective_shards_per_update <= 0:
                         selected = []
                         break
+                    if (
+                        float(self.shard_collect_timeout_s) > 0.0
+                        and len(files) > 0
+                        and len(files) < int(effective_shards_per_update)
+                        and (time.time() - float(wait_t0)) >= float(self.shard_collect_timeout_s)
+                    ):
+                        present_actor_ids = self._actors_present(files)
+                        timed_out_actors = [
+                            actor_id
+                            for actor_id in range(int(self.num_actors))
+                            if int(actor_id) not in present_actor_ids and int(actor_id) not in failed_actor_ids
+                        ]
+                        effective_shards_per_update = resolve_async_shards_per_update(
+                            requested_shards_per_update=int(self.shards_per_update),
+                            num_actors=int(self.num_actors),
+                            max_inflight_per_actor=int(self.max_inflight_per_actor),
+                            failed_actor_ids=list(failed_actor_ids) + list(timed_out_actors),
+                        )
                 selected = select_shards_for_update(
                     files,
                     mode=self.mode,
@@ -145,9 +180,12 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                     failed_suffix = ""
                     if len(failed_actor_ids) > 0:
                         failed_suffix = f" failed_actors={failed_actor_ids}"
+                    timeout_suffix = ""
+                    if len(timed_out_actors) > 0:
+                        timeout_suffix = f" timed_out_actors={timed_out_actors}"
                     self.stage_fn(
                         f"[learner] stage1 collect: have_shards={len(files)}/{max(1, int(effective_shards_per_update))}"
-                        f"{failed_suffix} (dir={self.paths.shards_dir})"
+                        f"{failed_suffix}{timeout_suffix} (dir={self.paths.shards_dir})"
                     )
                 time.sleep(self.poll_s)
             self.current_wait_shards_s = float(time.time() - wait_t0)

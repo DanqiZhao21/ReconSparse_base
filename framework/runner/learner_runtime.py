@@ -134,7 +134,13 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
         stage_fn=stage,
         start_version=int(start_version),
     )
-    trainer = L.Trainer(**trainer_kwargs_from_learner_config(learner_config, accelerator=("gpu" if device.type == "cuda" else "cpu")))
+    trainer = L.Trainer(
+        **trainer_kwargs_from_learner_config(
+            learner_config,
+            accelerator=("gpu" if device.type == "cuda" else "cpu"),
+            device_id=(int(device.index) if device.type == "cuda" and device.index is not None else None),
+        )
+    )
     try:
         trainer.fit(module, datamodule=data)
     except Exception as exc:

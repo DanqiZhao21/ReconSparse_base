@@ -93,6 +93,118 @@ def test_nuscenes_pdm_backend_returns_batch_candidate_scores(tmp_path: Path) -> 
     assert scores.shape == (1, 2)
 
 
+def test_nuscenes_pdm_backend_builds_candidate_geometry_in_candidate_batch(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.3, 0.2, 0.1], [0.7, 0.4, 0.2]],
+                [[0.1, 0.0, -0.1], [0.2, 0.1, 0.0], [0.4, 0.3, 0.1]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+
+    assert geometry["centers_xy"].shape == (1, 2, 3, 2)
+    assert geometry["yaw_rad"].shape == (1, 2, 3)
+    assert geometry["corners_xy"].shape == (1, 2, 3, 4, 2)
+    assert geometry["polygons"].shape == (1, 2, 3)
+    assert geometry["polygons"].dtype == object
+
+
+def test_nuscenes_pdm_drivable_map_contains_points_in_candidate_batch() -> None:
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMDrivableMap
+
+    drivable_map = NuScenesPDMDrivableMap(
+        polygons_xy=[
+            np.asarray([[-1.0, -1.0], [3.0, -1.0], [3.0, 3.0], [-1.0, 3.0]], dtype=np.float32),
+            np.asarray([[10.0, 10.0], [11.0, 10.0], [11.0, 11.0], [10.0, 11.0]], dtype=np.float32),
+        ]
+    )
+    points_xy = np.asarray(
+        [
+            [[0.0, 0.0], [2.0, 2.0], [4.0, 4.0]],
+            [[10.5, 10.5], [0.5, 0.5], [20.0, 20.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    inside = drivable_map.batch_contains_points(points_xy)
+
+    assert inside.shape == (2, 3)
+    assert inside.dtype == bool
+    assert inside.tolist() == [[True, True, False], [True, True, False]]
+
+
+def test_nuscenes_pdm_backend_builds_ttc_projection_geometry_in_candidate_batch(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    centers_xy = np.asarray(
+        [
+            [[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]],
+            [[0.0, 1.0], [0.5, 1.0], [1.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+    yaw_rad = np.zeros((2, 3), dtype=np.float32)
+
+    projection = scorer._build_ttc_projection_geometry(
+        centers_xy=centers_xy,
+        yaw_rad=yaw_rad,
+        dt_s=0.5,
+    )
+
+    assert projection["centers_xy"].shape[:3] == (2, 3, len(projection["offsets_s"]))
+    assert projection["corners_xy"].shape == (2, 3, len(projection["offsets_s"]), 4, 2)
+    assert projection["polygons"].shape == (2, 3, len(projection["offsets_s"]))
+    assert projection["polygons"].dtype == object
+
+
+def test_nuscenes_pdm_backend_query_hits_accepts_batched_polygons(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    scene_objects = [
+        {
+            "token": "obj-a",
+            "corners_xy": [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]],
+            "velocity_xy": [0.0, 0.0],
+        }
+    ]
+    _, _, _, occupancy_map = scorer._build_object_geometry_arrays(scene_objects)
+    polygons_at_step = scorer._build_candidate_geometry_batch(
+        torch.tensor(
+            [
+                [
+                    [[0.0, 0.0, 0.0], [2.0, 2.0, 0.0]],
+                    [[3.0, 3.0, 0.0], [4.0, 4.0, 0.0]],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )["polygons"][0]
+
+    hits = scorer._query_hits_per_candidate(occupancy_map, polygons_at_step[:, 0], predicate="intersects")
+
+    assert hits.shape == (2,)
+    assert hits.dtype == bool
+    assert hits.tolist() == [True, False]
+
+
 def test_nuscenes_pdm_backend_builds_sample_context_once_per_sample(monkeypatch, tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
@@ -352,7 +464,7 @@ def test_nuscenes_pdm_backend_collision_ttc_uses_batch_query_shapes(monkeypatch,
     assert metrics["ttc"].shape == (2,)
     assert query_shapes
     assert all(len(shape) == 1 for shape in query_shapes)
-    assert max(shape[0] for shape in query_shapes) == 2
+    assert sorted(shape[0] for shape in query_shapes) == [6, 18]
 
 
 def test_nuscenes_pdm_backend_prebuilds_ttc_projection_polygon_arrays(tmp_path: Path) -> None:
@@ -445,3 +557,40 @@ def test_nuscenes_pdm_backend_batch_drivable_and_lane_queries_return_expected_sh
     assert metrics["lane_keeping"].shape == (2,)
     assert metrics["driving_direction"].shape == (2,)
     assert fake_map.calls == [(2, 3, 2)]
+
+
+def test_nuscenes_pdm_backend_batch_project_progress_matches_scalar_reference(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_token_scorer import _project_progress
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    final_points_xy = np.asarray(
+        [
+            [0.4, 0.1],
+            [1.6, -0.2],
+            [2.5, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    path_xy = np.asarray(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    path_s = np.asarray([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+
+    batch_progress = scorer._batch_project_progress(final_points_xy, path_xy, path_s)
+    scalar_progress = np.asarray(
+        [_project_progress(point_xy, path_xy, path_s) for point_xy in final_points_xy],
+        dtype=np.float32,
+    )
+
+    assert batch_progress.shape == (3,)
+    assert np.allclose(batch_progress, scalar_progress, atol=1.0e-5)

@@ -104,6 +104,7 @@ train:
     max_shard_version_lag: 2
     shards_per_update: 24
     poll_interval_s: 0.1
+    shard_collect_timeout_s: 60
     max_updates: 32
 
   minibatch_size: 4 #FIXME:24 shards × 32 steps = 768 steps / update   768 / 32 = 24 个 minibatch

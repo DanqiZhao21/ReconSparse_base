@@ -48,6 +48,7 @@ class ActorLearnerLightningConfig:
     shards_per_update: int = 1
     max_inflight_per_actor: int = 1
     poll_s: float = 0.2
+    shard_collect_timeout_s: float = 0.0
     max_shard_version_lag: int = 2
     norm_eps: float = 1e-8
     inner_epochs: int = 1
@@ -178,6 +179,7 @@ def actor_learner_lightning_config_from_algorithm(
         shards_per_update=int(actor_learner_cfg.get("shards_per_update", actor_learner_cfg.get("num_actors", 1))),
         max_inflight_per_actor=int(actor_learner_cfg.get("max_inflight_per_actor", 1)),
         poll_s=float(actor_learner_cfg.get("poll_interval_s", 0.2)),
+        shard_collect_timeout_s=float(actor_learner_cfg.get("shard_collect_timeout_s", 0.0) or 0.0),
         max_shard_version_lag=int(raw_max_shard_version_lag),
         norm_eps=float(algo_meta.get("rpp_norm_eps", 1e-8)),
         inner_epochs=max(1, int(inner_epochs)),
@@ -193,10 +195,16 @@ def trainer_kwargs_from_learner_config(
     learner_config: ActorLearnerLightningConfig,
     *,
     accelerator: str,
+    device_id: int | None = None,
 ) -> Dict[str, Any]:
+    devices: int | list[int]
+    if str(accelerator) == "gpu" and device_id is not None:
+        devices = [int(device_id)]
+    else:
+        devices = 1
     return {
         "accelerator": str(accelerator),
-        "devices": 1,
+        "devices": devices,
         "max_epochs": (
             int(learner_config.max_updates) * max(1, int(learner_config.inner_epochs))
             if int(learner_config.max_updates) > 0

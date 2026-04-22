@@ -4,6 +4,7 @@ import os
 import pickle
 import tempfile
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -302,6 +303,49 @@ class NuScenesPDMScorer:
             "polygons": polygons,
         }
 
+    def _build_candidate_geometry_batch_torch(
+        self,
+        traj_xyyaw: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if traj_xyyaw.ndim != 4 or int(traj_xyyaw.shape[-1]) < 3:
+            raise RuntimeError(
+                "NuScenesPDMScorer expects traj_xyyaw with shape (batch, candidates, horizon, 3); "
+                f"got {tuple(traj_xyyaw.shape)}"
+            )
+        traj = traj_xyyaw.to(device=traj_xyyaw.device, dtype=torch.float32)
+        centers_xy = traj[..., :2]
+        yaw_rad = traj[..., 2]
+        corners_xy = self._ego_corners_from_state_torch(centers_xy, yaw_rad)
+        return {
+            "centers_xy": centers_xy,
+            "yaw_rad": yaw_rad,
+            "corners_xy": corners_xy,
+        }
+
+    def _ego_corners_from_state_torch(self, centers_xy: torch.Tensor, yaw_rad: torch.Tensor) -> torch.Tensor:
+        dx = float(self._ego_length_m) * 0.5
+        dy = float(self._ego_width_m) * 0.5
+        template = torch.tensor(
+            [[dx, dy], [dx, -dy], [-dx, -dy], [-dx, dy]],
+            device=centers_xy.device,
+            dtype=torch.float32,
+        )
+        cos_yaw = torch.cos(yaw_rad)
+        sin_yaw = torch.sin(yaw_rad)
+        rot = torch.stack(
+            [
+                torch.stack([cos_yaw, -sin_yaw], dim=-1),
+                torch.stack([sin_yaw, cos_yaw], dim=-1),
+            ],
+            dim=-2,
+        )
+        rotated = torch.einsum("...qd,...dc->...qc", template.expand(*centers_xy.shape[:-1], 4, 2), rot)
+        return rotated + centers_xy.unsqueeze(-2)
+
+    @staticmethod
+    def _tensor_from_numpy(array: np.ndarray, *, device: torch.device) -> torch.Tensor:
+        return torch.as_tensor(array, device=device, dtype=torch.float32)
+
     @staticmethod
     def _build_centerline_segment_cache(centerlines: Sequence[Any]) -> tuple[np.ndarray, np.ndarray]:
         segments: list[np.ndarray] = []
@@ -384,6 +428,28 @@ class NuScenesPDMScorer:
             "polygons": proj_polygons,
         }
 
+    def _build_ttc_projection_geometry_torch(
+        self,
+        *,
+        centers_xy: torch.Tensor,
+        yaw_rad: torch.Tensor,
+        dt_s: float,
+    ) -> dict[str, torch.Tensor]:
+        offsets_s = torch.as_tensor(
+            [offset for offset in _DEFAULT_TTC_FUTURE_OFFSETS_S if float(offset) > 0.0],
+            device=centers_xy.device,
+            dtype=torch.float32,
+        )
+        speed_mps, _ = self._candidate_speed_and_yaw_rate_batch_torch(centers_xy, yaw_rad, dt_s=float(dt_s))
+        heading_vec = torch.stack([torch.cos(yaw_rad), torch.sin(yaw_rad)], dim=-1)
+        proj_centers = centers_xy[:, :, None, :] + heading_vec[:, :, None, :] * speed_mps[:, :, None, None] * offsets_s.view(1, 1, -1, 1)
+        proj_corners = self._ego_corners_from_state_torch(proj_centers, yaw_rad[:, :, None].expand_as(proj_centers[..., 0]))
+        return {
+            "offsets_s": offsets_s,
+            "centers_xy": proj_centers,
+            "corners_xy": proj_corners,
+        }
+
     @staticmethod
     def _batch_project_progress(
         final_points_xy: np.ndarray,
@@ -421,6 +487,36 @@ class NuScenesPDMScorer:
         best_s = np.take_along_axis(best_s_all, best_idx[:, None], axis=1).reshape(-1)
         has_finite = np.isfinite(np.take_along_axis(dist, best_idx[:, None], axis=1).reshape(-1))
         return np.where(has_finite, best_s, 0.0).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _batch_project_progress_torch(
+        final_points_xy: torch.Tensor,
+        path_xy: torch.Tensor,
+        path_s: torch.Tensor,
+    ) -> torch.Tensor:
+        num_candidates = int(final_points_xy.shape[0])
+        if num_candidates <= 0 or int(path_xy.shape[0]) <= 1 or int(path_s.shape[0]) <= 1:
+            return torch.zeros((num_candidates,), device=final_points_xy.device, dtype=torch.float32)
+        seg_start = path_xy[:-1]
+        seg_end = path_xy[1:]
+        seg_vec = seg_end - seg_start
+        seg_len_sq = (seg_vec * seg_vec).sum(dim=-1)
+        valid_seg = seg_len_sq > 1.0e-12
+        if not bool(valid_seg.any()):
+            return torch.zeros((num_candidates,), device=final_points_xy.device, dtype=torch.float32)
+        safe_seg_len_sq = torch.where(valid_seg, seg_len_sq, torch.ones_like(seg_len_sq))
+        delta = final_points_xy[:, None, :] - seg_start[None, :, :]
+        alpha = ((delta * seg_vec[None, :, :]).sum(dim=-1) / safe_seg_len_sq[None, :]).clamp(0.0, 1.0)
+        proj = seg_start[None, :, :] + alpha.unsqueeze(-1) * seg_vec[None, :, :]
+        dist = torch.linalg.norm(final_points_xy[:, None, :] - proj, dim=-1)
+        inf = torch.full_like(dist, float("inf"))
+        dist = torch.where(valid_seg.unsqueeze(0), dist, inf)
+        best_idx = dist.argmin(dim=1)
+        seg_len = torch.sqrt(safe_seg_len_sq)
+        best_s_all = path_s[:-1].unsqueeze(0) + alpha * seg_len.unsqueeze(0)
+        best_s = torch.gather(best_s_all, dim=1, index=best_idx.unsqueeze(-1)).squeeze(-1)
+        best_dist = torch.gather(dist, dim=1, index=best_idx.unsqueeze(-1)).squeeze(-1)
+        return torch.where(torch.isfinite(best_dist), best_s, torch.zeros_like(best_s))
 
     @staticmethod
     def _batch_centerline_stats(
@@ -462,6 +558,39 @@ class NuScenesPDMScorer:
             best_tangent,
             np.asarray([1.0, 0.0], dtype=np.float32).reshape(1, 1, 2),
         ).astype(np.float32, copy=False)
+        return best_dist, best_tangent
+
+    @staticmethod
+    def _batch_centerline_stats_torch(
+        points_xy: torch.Tensor,
+        segments_xy: torch.Tensor,
+        tangents_xy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_candidates, horizon = points_xy.shape[:2]
+        if segments_xy.numel() <= 0:
+            return (
+                torch.zeros((num_candidates, horizon), device=points_xy.device, dtype=torch.float32),
+                torch.tensor([1.0, 0.0], device=points_xy.device, dtype=torch.float32).view(1, 1, 2).expand(num_candidates, horizon, 2),
+            )
+        seg_start = segments_xy[:, 0, :]
+        seg_end = segments_xy[:, 1, :]
+        seg_vec = seg_end - seg_start
+        seg_len_sq = (seg_vec * seg_vec).sum(dim=-1)
+        valid_seg = seg_len_sq > 1.0e-12
+        safe_seg_len_sq = torch.where(valid_seg, seg_len_sq, torch.ones_like(seg_len_sq))
+        delta = points_xy[:, :, None, :] - seg_start[None, None, :, :]
+        alpha = ((delta * seg_vec[None, None, :, :]).sum(dim=-1) / safe_seg_len_sq.view(1, 1, -1)).clamp(0.0, 1.0)
+        proj = seg_start.view(1, 1, -1, 2) + alpha.unsqueeze(-1) * seg_vec.view(1, 1, -1, 2)
+        dist = torch.linalg.norm(points_xy[:, :, None, :] - proj, dim=-1)
+        inf = torch.full_like(dist, float("inf"))
+        dist = torch.where(valid_seg.view(1, 1, -1), dist, inf)
+        best_idx = dist.argmin(dim=-1)
+        best_dist = torch.gather(dist, dim=-1, index=best_idx.unsqueeze(-1)).squeeze(-1)
+        best_tangent = tangents_xy[best_idx.clamp(0, max(0, tangents_xy.shape[0] - 1))]
+        finite_mask = torch.isfinite(best_dist)
+        best_dist = torch.where(finite_mask, best_dist, torch.zeros_like(best_dist))
+        fallback = torch.tensor([1.0, 0.0], device=points_xy.device, dtype=torch.float32).view(1, 1, 2)
+        best_tangent = torch.where(finite_mask.unsqueeze(-1), best_tangent, fallback)
         return best_dist, best_tangent
 
     def _batch_map_metrics(
@@ -650,6 +779,293 @@ class NuScenesPDMScorer:
             ).astype(np.float32, copy=False)
         return {"no_collision": no_collision, "ttc": ttc}
 
+    @staticmethod
+    def _candidate_speed_and_yaw_rate_batch_torch(
+        centers_xy: torch.Tensor,
+        yaw_rad: torch.Tensor,
+        *,
+        dt_s: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prev_xy = torch.cat([centers_xy[:, :1, :], centers_xy[:, :-1, :]], dim=1)
+        step_delta = centers_xy - prev_xy
+        speed_mps = torch.linalg.norm(step_delta, dim=-1) / max(1.0e-6, float(dt_s))
+        prev_yaw = torch.cat([yaw_rad[:, :1], yaw_rad[:, :-1]], dim=1)
+        yaw_delta = torch.atan2(torch.sin(yaw_rad - prev_yaw), torch.cos(yaw_rad - prev_yaw))
+        yaw_rate = torch.abs(yaw_delta) / max(1.0e-6, float(dt_s))
+        return speed_mps, yaw_rate
+
+    @staticmethod
+    def _oriented_box_axes_torch(corners_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        edge0 = corners_xy[..., 1, :] - corners_xy[..., 0, :]
+        edge1 = corners_xy[..., 3, :] - corners_xy[..., 0, :]
+        axis0 = edge0 / torch.linalg.norm(edge0, dim=-1, keepdim=True).clamp_min(1.0e-6)
+        axis1 = edge1 / torch.linalg.norm(edge1, dim=-1, keepdim=True).clamp_min(1.0e-6)
+        return axis0, axis1
+
+    @classmethod
+    def _obb_intersects_torch(cls, boxes_a: torch.Tensor, boxes_b: torch.Tensor) -> torch.Tensor:
+        center_a = boxes_a.mean(dim=-2)
+        center_b = boxes_b.mean(dim=-2)
+        axis_a0, axis_a1 = cls._oriented_box_axes_torch(boxes_a)
+        axis_b0, axis_b1 = cls._oriented_box_axes_torch(boxes_b)
+        axes = torch.stack([axis_a0, axis_a1, axis_b0, axis_b1], dim=-2)
+        rel = center_b - center_a
+        proj_center = torch.abs((rel.unsqueeze(-2) * axes).sum(dim=-1))
+        proj_a = torch.abs((boxes_a.unsqueeze(-3) - center_a.unsqueeze(-2).unsqueeze(-2)) * axes.unsqueeze(-2)).sum(dim=-1)
+        proj_b = torch.abs((boxes_b.unsqueeze(-3) - center_b.unsqueeze(-2).unsqueeze(-2)) * axes.unsqueeze(-2)).sum(dim=-1)
+        radius_a = proj_a.sum(dim=-1)
+        radius_b = proj_b.sum(dim=-1)
+        overlap = proj_center <= (radius_a + radius_b + 1.0e-5)
+        return overlap.all(dim=-1)
+
+    def _build_object_box_tensor(
+        self,
+        sample_context: NuScenesPDMSampleContext,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        scene_objects = list(sample_context.scene_objects)
+        num_objects = len(scene_objects)
+        if num_objects <= 0:
+            return (
+                torch.zeros((0, 2), device=device, dtype=torch.float32),
+                torch.zeros((0, 2), device=device, dtype=torch.float32),
+                torch.zeros((0,), device=device, dtype=torch.float32),
+                torch.zeros((0,), device=device, dtype=torch.float32),
+            )
+        centers = []
+        dims = []
+        yaws = []
+        velocities = []
+        for obj in scene_objects:
+            center = np.asarray(obj.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+            velocity = np.asarray(obj.get("velocity_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+            length = float(obj.get("length_m", 1.0))
+            width = float(obj.get("width_m", 1.0))
+            yaw = float(obj.get("yaw_rad", 0.0))
+            centers.append(center)
+            dims.append([length, width])
+            yaws.append(yaw)
+            velocities.append(velocity)
+        return (
+            torch.as_tensor(np.asarray(centers, dtype=np.float32), device=device),
+            torch.as_tensor(np.asarray(dims, dtype=np.float32), device=device),
+            torch.as_tensor(np.asarray(yaws, dtype=np.float32), device=device),
+            torch.as_tensor(np.asarray(velocities, dtype=np.float32), device=device),
+        )
+
+    def _object_corners_torch(
+        self,
+        centers_xy: torch.Tensor,
+        dims_lw: torch.Tensor,
+        yaw_rad: torch.Tensor,
+    ) -> torch.Tensor:
+        dx = dims_lw[..., 0] * 0.5
+        dy = dims_lw[..., 1] * 0.5
+        template = torch.stack(
+            [
+                torch.stack([dx, dy], dim=-1),
+                torch.stack([dx, -dy], dim=-1),
+                torch.stack([-dx, -dy], dim=-1),
+                torch.stack([-dx, dy], dim=-1),
+            ],
+            dim=-2,
+        )
+        cos_yaw = torch.cos(yaw_rad)
+        sin_yaw = torch.sin(yaw_rad)
+        rot = torch.stack(
+            [
+                torch.stack([cos_yaw, -sin_yaw], dim=-1),
+                torch.stack([sin_yaw, cos_yaw], dim=-1),
+            ],
+            dim=-2,
+        )
+        rotated = torch.einsum("...qd,...dc->...qc", template, rot)
+        return rotated + centers_xy.unsqueeze(-2)
+
+    def _batch_collision_ttc_metrics_torch(
+        self,
+        *,
+        sample_context: NuScenesPDMSampleContext,
+        candidate_geometry: dict[str, torch.Tensor],
+        dt_s: float,
+    ) -> dict[str, torch.Tensor]:
+        centers_xy = candidate_geometry["centers_xy"]
+        yaw_rad = candidate_geometry["yaw_rad"]
+        ego_corners = candidate_geometry["corners_xy"]
+        num_candidates, horizon = centers_xy.shape[:2]
+        device = centers_xy.device
+        no_collision = torch.ones((num_candidates,), device=device, dtype=torch.float32)
+        ttc = torch.ones((num_candidates,), device=device, dtype=torch.float32)
+        if num_candidates <= 0 or horizon <= 0 or len(sample_context.scene_objects) <= 0:
+            return {"no_collision": no_collision, "ttc": ttc}
+
+        object_centers, object_dims, object_yaws, object_vel = self._build_object_box_tensor(sample_context, device=device)
+        if object_centers.shape[0] <= 0:
+            return {"no_collision": no_collision, "ttc": ttc}
+
+        times = torch.arange(horizon, device=device, dtype=torch.float32) * float(dt_s)
+        obj_centers_now = object_centers.view(1, 1, -1, 2) + object_vel.view(1, 1, -1, 2) * times.view(1, -1, 1, 1)
+        obj_corners_now = self._object_corners_torch(
+            obj_centers_now,
+            object_dims.view(1, 1, -1, 2).expand(1, horizon, -1, -1),
+            object_yaws.view(1, 1, -1).expand(1, horizon, -1),
+        ).expand(num_candidates, -1, -1, -1, -1)
+
+        ego_boxes = ego_corners.unsqueeze(2).expand(-1, -1, obj_centers_now.shape[2], -1, -1)
+        collision_hits = self._obb_intersects_torch(ego_boxes, obj_corners_now)
+        collision_mask = collision_hits.any(dim=(1, 2))
+        no_collision = torch.where(collision_mask, torch.zeros_like(no_collision), no_collision)
+
+        speed_mps, _ = self._candidate_speed_and_yaw_rate_batch_torch(centers_xy, yaw_rad, dt_s=float(dt_s))
+        moving_mask = speed_mps >= float(_DEFAULT_TTC_STOPPED_SPEED_THRESHOLD_MPS)
+        if bool(moving_mask.any()):
+            ttc_projection = self._build_ttc_projection_geometry_torch(
+                centers_xy=centers_xy,
+                yaw_rad=yaw_rad,
+                dt_s=float(dt_s),
+            )
+            proj_corners = ttc_projection["corners_xy"]
+            offsets = ttc_projection["offsets_s"]
+            future_times = times.view(1, horizon, 1, 1) + offsets.view(1, 1, -1, 1)
+            obj_centers_future = object_centers.view(1, 1, 1, -1, 2) + object_vel.view(1, 1, 1, -1, 2) * future_times.unsqueeze(-1)
+            obj_corners_future = self._object_corners_torch(
+                obj_centers_future,
+                object_dims.view(1, 1, 1, -1, 2).expand(1, horizon, offsets.shape[0], -1, -1),
+                object_yaws.view(1, 1, 1, -1).expand(1, horizon, offsets.shape[0], -1),
+            ).expand(num_candidates, -1, -1, -1, -1, -1)
+            ego_future = proj_corners.unsqueeze(3).expand(-1, -1, -1, obj_centers_future.shape[3], -1, -1)
+            future_hits = self._obb_intersects_torch(ego_future, obj_corners_future).any(dim=-1)
+            risk_mask = future_hits & moving_mask.unsqueeze(-1)
+            risk_offsets = torch.where(
+                risk_mask,
+                offsets.view(1, 1, -1).expand(num_candidates, horizon, -1),
+                torch.full((num_candidates, horizon, offsets.shape[0]), float("inf"), device=device, dtype=torch.float32),
+            )
+            earliest = risk_offsets.reshape(num_candidates, -1).min(dim=1).values
+            finite_mask = torch.isfinite(earliest)
+            if bool(finite_mask.any()):
+                ttc_horizon_s = float(_DEFAULT_TTC_FUTURE_OFFSETS_S[-1]) if _DEFAULT_TTC_FUTURE_OFFSETS_S else 1.0
+                ttc = torch.where(
+                    finite_mask,
+                    (earliest / max(1.0e-6, ttc_horizon_s)).clamp(0.0, 1.0),
+                    ttc,
+                )
+        return {"no_collision": no_collision, "ttc": ttc}
+
+    def _score_candidate_batch_for_sample_torch(
+        self,
+        *,
+        sample_context: NuScenesPDMSampleContext,
+        candidate_geometry: dict[str, torch.Tensor],
+        gt_xy_cmp: np.ndarray,
+        gt_yaw_cmp: np.ndarray,
+        gt_xy_full: np.ndarray,
+        gt_s_full: np.ndarray,
+        gt_total_len: float,
+        dt_s: float,
+    ) -> torch.Tensor:
+        centers_xy = candidate_geometry["centers_xy"]
+        yaw_rad = candidate_geometry["yaw_rad"]
+        device = centers_xy.device
+        num_candidates, horizon = centers_xy.shape[:2]
+        if num_candidates <= 0 or horizon <= 0:
+            return torch.zeros((num_candidates,), device=device, dtype=torch.float32)
+
+        gt_xy_cmp_t = torch.as_tensor(gt_xy_cmp, device=device, dtype=torch.float32)
+        gt_yaw_cmp_t = torch.as_tensor(gt_yaw_cmp, device=device, dtype=torch.float32)
+        gt_xy_full_t = torch.as_tensor(gt_xy_full, device=device, dtype=torch.float32)
+        gt_s_full_t = torch.as_tensor(gt_s_full, device=device, dtype=torch.float32)
+
+        pos_err = torch.linalg.norm(centers_xy - gt_xy_cmp_t.view(1, horizon, 2), dim=-1) if gt_xy_cmp_t.numel() > 0 else torch.zeros((num_candidates, horizon), device=device)
+        mean_err = pos_err.mean(dim=1) if pos_err.numel() > 0 else torch.zeros((num_candidates,), device=device)
+        yaw_delta = torch.atan2(torch.sin(yaw_rad - gt_yaw_cmp_t.view(1, horizon)), torch.cos(yaw_rad - gt_yaw_cmp_t.view(1, horizon))) if gt_yaw_cmp_t.numel() > 0 else torch.zeros((num_candidates, horizon), device=device)
+        _ = torch.abs(yaw_delta).mean(dim=1) if yaw_delta.numel() > 0 else torch.zeros((num_candidates,), device=device)
+
+        cand_progress = self._batch_project_progress_torch(centers_xy[:, -1], gt_xy_full_t, gt_s_full_t)
+        progress_ratio = (cand_progress / max(1.0e-6, float(gt_total_len))).clamp(0.0, 1.0)
+
+        prev_xy = torch.cat([centers_xy[:, :1, :], centers_xy[:, :-1, :]], dim=1)
+        cand_vel = centers_xy - prev_xy
+        cand_acc = cand_vel[:, 1:, :] - cand_vel[:, :-1, :] if horizon > 1 else torch.zeros((num_candidates, 0, 2), device=device)
+        prev_yaw = torch.cat([yaw_rad[:, :1], yaw_rad[:, :-1]], dim=1)
+        cand_yaw_rate = torch.abs(torch.atan2(torch.sin(yaw_rad - prev_yaw), torch.cos(yaw_rad - prev_yaw))) / max(1.0e-6, float(dt_s))
+        smooth_pen = torch.linalg.norm(cand_acc, dim=-1).mean(dim=1) if cand_acc.numel() > 0 else torch.zeros((num_candidates,), device=device)
+        comfort_cost = smooth_pen + 0.25 * cand_yaw_rate.mean(dim=1)
+        history_comfort = (1.0 - 0.08 * comfort_cost).clamp(0.0, 1.0)
+
+        drivable_polygons = list(sample_context.drivable_polygons)
+        lane_centerlines = list(sample_context.lane_centerlines)
+        if drivable_polygons:
+            inside = torch.as_tensor(sample_context.drivable_map.batch_contains_points(centers_xy.detach().cpu().numpy()), device=device, dtype=torch.bool)
+            drivable_area = inside.all(dim=1).to(dtype=torch.float32)
+        else:
+            drivable_area = torch.ones((num_candidates,), device=device, dtype=torch.float32)
+
+        if sample_context.centerline_segments_xy.size > 0:
+            lateral_errors, tangents_xy = self._batch_centerline_stats_torch(
+                centers_xy,
+                self._tensor_from_numpy(sample_context.centerline_segments_xy, device=device),
+                self._tensor_from_numpy(sample_context.centerline_tangents_xy, device=device),
+            )
+            mean_lateral = lateral_errors.mean(dim=1)
+            lane_keeping = (1.0 - (mean_lateral / 2.0)).clamp(0.0, 1.0)
+        else:
+            tangents_xy = torch.tensor([1.0, 0.0], device=device, dtype=torch.float32).view(1, 1, 2).expand(num_candidates, horizon, 2)
+            lane_keeping = (1.0 - 0.25 * mean_err).clamp(0.0, 1.0) if lane_centerlines else torch.ones((num_candidates,), device=device, dtype=torch.float32)
+
+        prev_xy = torch.cat([centers_xy[:, :1, :], centers_xy[:, :-1, :]], dim=1)
+        step_delta = centers_xy - prev_xy
+        step_norm = torch.linalg.norm(step_delta, dim=-1)
+        move_dir = torch.where(
+            step_norm.unsqueeze(-1) > 1.0e-6,
+            step_delta / step_norm.unsqueeze(-1).clamp_min(1.0e-6),
+            torch.zeros_like(step_delta),
+        )
+        reverse_alignment = torch.maximum(torch.zeros_like(step_norm), -(move_dir * tangents_xy).sum(dim=-1))
+        reverse_mask = reverse_alignment > _DEFAULT_DIRECTION_REVERSE_ALIGNMENT_THRESHOLD
+        step_indices = torch.arange(horizon, device=device, dtype=torch.int64).view(1, -1)
+        last_false_idx = torch.cummax(torch.where(reverse_mask, torch.full_like(step_indices, -1), step_indices), dim=1).values
+        streak_len = (step_indices - last_false_idx).to(dtype=torch.float32)
+        continuous_reverse_time_s = torch.where(reverse_mask, streak_len * max(1.0e-6, float(dt_s)), torch.zeros_like(streak_len))
+        accrue_mask = continuous_reverse_time_s > _DEFAULT_DIRECTION_MIN_CONTINUOUS_REVERSE_S
+        oncoming_progress_m = torch.where(accrue_mask, step_norm * reverse_alignment, torch.zeros_like(step_norm)).sum(dim=1)
+        good_threshold = float(_DEFAULT_DIRECTION_COMPLIANCE_THRESHOLD_M)
+        bad_threshold = float(_DEFAULT_DIRECTION_VIOLATION_THRESHOLD_M)
+        span = max(1.0e-6, bad_threshold - good_threshold)
+        driving_direction = torch.where(
+            oncoming_progress_m <= good_threshold,
+            torch.ones_like(oncoming_progress_m),
+            torch.where(
+                oncoming_progress_m >= bad_threshold,
+                torch.zeros_like(oncoming_progress_m),
+                ((bad_threshold - oncoming_progress_m) / span).clamp(0.0, 1.0),
+            ),
+        )
+
+        collision_ttc = self._batch_collision_ttc_metrics_torch(
+            sample_context=sample_context,
+            candidate_geometry=candidate_geometry,
+            dt_s=float(dt_s),
+        )
+        no_collision = collision_ttc["no_collision"]
+        ttc = collision_ttc["ttc"]
+
+        weighted_score = (
+            progress_ratio * float(self._delegate.progress_weight)
+            + ttc * float(self._delegate.ttc_weight)
+            + lane_keeping * float(self._delegate.lane_keeping_weight)
+            + history_comfort * float(self._delegate.history_comfort_weight)
+        ) / max(
+            1.0,
+            float(self._delegate.progress_weight)
+            + float(self._delegate.ttc_weight)
+            + float(self._delegate.lane_keeping_weight)
+            + float(self._delegate.history_comfort_weight),
+        )
+        multiplicative_product = no_collision * drivable_area * driving_direction
+        return weighted_score * multiplicative_product
+
     def _score_candidate_batch_for_sample(
         self,
         *,
@@ -811,8 +1227,13 @@ class NuScenesPDMScorer:
         if len(replays) != int(traj_xyyaw.shape[0]):
             raise RuntimeError(f"Replay batch length mismatch: replays={len(replays)} traj_batch={int(traj_xyyaw.shape[0])}")
 
-        geometry_batch = self._build_candidate_geometry_batch(traj_xyyaw)
-        scores = np.zeros((int(traj_xyyaw.shape[0]), int(traj_xyyaw.shape[1])), dtype=np.float32)
+        use_gpu_path = bool(torch.cuda.is_available()) and bool(traj_xyyaw.is_cuda)
+        if use_gpu_path:
+            geometry_batch_t = self._build_candidate_geometry_batch_torch(traj_xyyaw)
+            scores_t = torch.zeros((int(traj_xyyaw.shape[0]), int(traj_xyyaw.shape[1])), device=traj_xyyaw.device, dtype=torch.float32)
+        else:
+            geometry_batch = self._build_candidate_geometry_batch(traj_xyyaw)
+            scores = np.zeros((int(traj_xyyaw.shape[0]), int(traj_xyyaw.shape[1])), dtype=np.float32)
 
         for batch_idx, replay in enumerate(replays):
             sample_context = self._build_sample_context(replay, patch_radius=_DEFAULT_PATCH_RADIUS_M)
@@ -822,23 +1243,42 @@ class NuScenesPDMScorer:
             gt_s = np.asarray(static_ctx.get("gt_s", _polyline_arclength(gt_xy)), dtype=np.float32)
             gt_total_len = float(static_ctx.get("gt_total_len", float(gt_s[-1]) if gt_s.size else 0.0))
             horizon = min(int(traj_xyyaw.shape[2]), int(gt_xy.shape[0])) if gt_xy.size else int(traj_xyyaw.shape[2])
-            candidate_geometry = {
-                key: value[batch_idx, :, :horizon].copy()
-                for key, value in geometry_batch.items()
-            }
             gt_xy_cmp = gt_xy[:horizon]
             gt_yaw_cmp = gt_yaw[:horizon] if gt_yaw.size else _path_yaw_from_xy(gt_xy_cmp)
-            sample_scores = self._score_candidate_batch_for_sample(
-                sample_context=sample_context,
-                candidate_geometry=candidate_geometry,
-                gt_xy_cmp=gt_xy_cmp,
-                gt_yaw_cmp=gt_yaw_cmp,
-                gt_xy_full=gt_xy,
-                gt_s_full=gt_s,
-                gt_total_len=gt_total_len,
-                dt_s=0.5,
-            )
-            scores[batch_idx, : int(sample_scores.shape[0])] = sample_scores.astype(np.float32, copy=False)
+            if use_gpu_path:
+                candidate_geometry_t = {
+                    key: value[batch_idx, :, :horizon]
+                    for key, value in geometry_batch_t.items()
+                }
+                sample_scores_t = self._score_candidate_batch_for_sample_torch(
+                    sample_context=sample_context,
+                    candidate_geometry=candidate_geometry_t,
+                    gt_xy_cmp=gt_xy_cmp,
+                    gt_yaw_cmp=gt_yaw_cmp,
+                    gt_xy_full=gt_xy,
+                    gt_s_full=gt_s,
+                    gt_total_len=gt_total_len,
+                    dt_s=0.5,
+                )
+                scores_t[batch_idx, : int(sample_scores_t.shape[0])] = sample_scores_t
+            else:
+                candidate_geometry = {
+                    key: value[batch_idx, :, :horizon].copy()
+                    for key, value in geometry_batch.items()
+                }
+                sample_scores = self._score_candidate_batch_for_sample(
+                    sample_context=sample_context,
+                    candidate_geometry=candidate_geometry,
+                    gt_xy_cmp=gt_xy_cmp,
+                    gt_yaw_cmp=gt_yaw_cmp,
+                    gt_xy_full=gt_xy,
+                    gt_s_full=gt_s,
+                    gt_total_len=gt_total_len,
+                    dt_s=0.5,
+                )
+                scores[batch_idx, : int(sample_scores.shape[0])] = sample_scores.astype(np.float32, copy=False)
+        if use_gpu_path:
+            return scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
         return scores
 
     def dump_debug_artifacts(

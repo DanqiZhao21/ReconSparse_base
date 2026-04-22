@@ -183,6 +183,7 @@ class SparseDriveV2Policy(Agent):
         self._teacher_model: torch.nn.Module | None = None
         self._nuscenes_token_scorer: Any | None = None
         self._nuscenes_pdm_scorer: Any | None = None
+        self._nuscenes_pdm_gpu_scorer: Any | None = None
 
     @property
     def device(self) -> torch.device:
@@ -954,12 +955,16 @@ class SparseDriveV2Policy(Agent):
         self,
         replays: Sequence[Dict[str, Any]],
     ) -> torch.Tensor:
+        model = self._model.module if isinstance(self._model, DDP) else self._model
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = self.device
         if len(replays) == 0:
             feature_dim = int(self.value_feature_dim or 0)
-            return torch.empty((0, feature_dim), device=self.device, dtype=torch.float32)
+            return torch.empty((0, feature_dim), device=model_device, dtype=torch.float32)
 
-        batched_dev = self._batched_replay_features(replays)
-        model = self._model.module if isinstance(self._model, DDP) else self._model
+        batched_dev = self._to_device_features(self._batched_replay_features(replays), model_device)
         model.eval()
         with torch.inference_mode():
             feature_maps = model._backbone(batched_dev["camera_feature"]["imgs"])
@@ -1009,6 +1014,8 @@ class SparseDriveV2Policy(Agent):
         backend = str(self._nuscenes_scorer_config.get("backend", "token")).strip().lower()
         if backend in {"pdm", "nuscenes_pdm"}:
             return "nuscenes_pdm"
+        if backend in {"pdm_gpu", "nuscenes_pdm_gpu"}:
+            return "nuscenes_pdm_gpu"
         return "token"
 
     def _ensure_nuscenes_token_scorer(self):
@@ -1041,9 +1048,41 @@ class SparseDriveV2Policy(Agent):
             )
         return self._nuscenes_pdm_scorer
 
+    def _ensure_nuscenes_pdm_gpu_scorer(self):
+        if self._nuscenes_pdm_gpu_scorer is None:
+            import importlib.util
+            import sys
+            from pathlib import Path
+
+            module_path = Path(__file__).resolve().parents[1] / "algorithms" / "nuscenes_pdm_backend-GPU.py"
+            module_name = "framework.algorithms.nuscenes_pdm_backend_gpu_runtime"
+            module = sys.modules.get(module_name)
+            if module is None:
+                spec = importlib.util.spec_from_file_location(module_name, module_path)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"Failed to load GPU scorer backend from {module_path}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            scorer_cls = getattr(module, "NuScenesPDMScorer")
+
+            scorer_kwargs = {
+                key: value
+                for key, value in self._nuscenes_scorer_config.items()
+                if key != "backend"
+            }
+            self._nuscenes_pdm_gpu_scorer = scorer_cls(
+                token2vad_path=nus_cfg.TOKEN2VAD_FILE,
+                **scorer_kwargs,
+            )
+        return self._nuscenes_pdm_gpu_scorer
+
     def _ensure_counterfactual_scorer_backend(self):
-        if self._counterfactual_scorer_backend_name() == "nuscenes_pdm":
+        backend_name = self._counterfactual_scorer_backend_name()
+        if backend_name == "nuscenes_pdm":
             return self._ensure_nuscenes_pdm_scorer()
+        if backend_name == "nuscenes_pdm_gpu":
+            return self._ensure_nuscenes_pdm_gpu_scorer()
         return self._ensure_nuscenes_token_scorer()
 
     def pdm_score_counterfactuals_from_replay_batch(
