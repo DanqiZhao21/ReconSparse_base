@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import tempfile
@@ -75,6 +76,7 @@ class NuScenesPDMSampleContext:
     lane_centerlines: list[Any]
     scene_objects: list[dict[str, Any]]
     ea_agent_states: list[dict[str, Any]]
+    ttc_agent_states: list[dict[str, Any]]
     object_tokens: np.ndarray
     object_polygons: np.ndarray
     object_velocity_xy: np.ndarray
@@ -97,13 +99,21 @@ class NuScenesPDMDrivableMap:
 
     def batch_contains_points(self, points_xy: np.ndarray) -> np.ndarray:
         pts = np.asarray(points_xy, dtype=np.float32)
-        if pts.ndim != 3 or pts.shape[-1] != 2:
-            raise RuntimeError(f"Expected points_xy shape (candidates,horizon,2), got {tuple(pts.shape)}")
+        if pts.ndim not in {3, 4} or pts.shape[-1] != 2:
+            raise RuntimeError(
+                "Expected points_xy shape (candidates,horizon,2) or (candidates,horizon,num_points,2), "
+                f"got {tuple(pts.shape)}"
+            )
         num_candidates, horizon = pts.shape[:2]
         if not self._polygons_xy:
-            return np.ones((num_candidates, horizon), dtype=bool)
+            if pts.ndim == 3:
+                return np.ones((num_candidates, horizon), dtype=bool)
+            return np.ones((num_candidates, horizon, pts.shape[2]), dtype=bool)
         point_geoms = shapely_points(pts[..., 0], pts[..., 1])
-        contains_mask = shapely_contains(self._polygons[:, None, None], point_geoms[None, ...])
+        if pts.ndim == 3:
+            contains_mask = shapely_contains(self._polygons[:, None, None], point_geoms[None, ...])
+        else:
+            contains_mask = shapely_contains(self._polygons[:, None, None, None], point_geoms[None, ...])
         return np.any(np.asarray(contains_mask, dtype=bool), axis=0)
 
 
@@ -127,12 +137,10 @@ class NuScenesPDMScorer:
             **kwargs,
         )
         self._sample_context_cache: dict[str, NuScenesPDMSampleContext] = {}
-        self._ego_length_m = 4.6
-        self._ego_width_m = 1.9
         self._derived_context_cache_root = self._delegate.scene_cache_root / "_sample_pdm_context"
 
     def _derived_context_cache_variant(self) -> str:
-        return "pdm-v2"
+        return f"pdm-v4-ea{int(bool(self._delegate.ea_gate_enabled))}"
 
     def _derived_context_cache_path(self, sample_token: str) -> Path:
         return self._derived_context_cache_root / self._delegate._sample_context_cache_filename(
@@ -150,6 +158,7 @@ class NuScenesPDMScorer:
         lane_centerlines: list[Any],
         scene_objects: list[dict[str, Any]],
         ea_agent_states: list[dict[str, Any]],
+        ttc_agent_states: list[dict[str, Any]],
         object_tokens: np.ndarray,
         object_velocity_xy: np.ndarray,
         centerline_segments_xy: np.ndarray,
@@ -163,6 +172,7 @@ class NuScenesPDMScorer:
             "lane_centerlines": lane_centerlines,
             "scene_objects": scene_objects,
             "ea_agent_states": ea_agent_states,
+            "ttc_agent_states": ttc_agent_states,
             "object_tokens": np.asarray(object_tokens, dtype=object),
             "object_velocity_xy": np.asarray(object_velocity_xy, dtype=np.float32),
             "centerline_segments_xy": np.asarray(centerline_segments_xy, dtype=np.float32),
@@ -173,14 +183,26 @@ class NuScenesPDMScorer:
         scene_objects = list(payload.get("scene_objects", []))
         object_tokens, object_polygons, object_velocity_xy, occupancy_map = self._build_object_geometry_arrays(scene_objects)
         drivable_polygons = list(payload.get("drivable_polygons", []))
+        static_context = dict(payload["static_context"])
+        patch_radius = float(payload["patch_radius"])
+        ea_agent_states = list(payload.get("ea_agent_states", []))
+        ttc_agent_states = list(payload.get("ttc_agent_states", []))
+        if not ttc_agent_states:
+            ttc_agent_states = self._build_ttc_agent_states(
+                static_context=static_context,
+                scene_objects=scene_objects,
+                ea_agent_states=ea_agent_states,
+                patch_radius=patch_radius,
+            )
         return NuScenesPDMSampleContext(
             sample_token=str(payload["sample_token"]),
-            patch_radius=float(payload["patch_radius"]),
-            static_context=dict(payload["static_context"]),
+            patch_radius=patch_radius,
+            static_context=static_context,
             drivable_polygons=drivable_polygons,
             lane_centerlines=list(payload.get("lane_centerlines", [])),
             scene_objects=scene_objects,
-            ea_agent_states=list(payload.get("ea_agent_states", [])),
+            ea_agent_states=ea_agent_states,
+            ttc_agent_states=ttc_agent_states,
             object_tokens=np.asarray(payload.get("object_tokens", object_tokens), dtype=object),
             object_polygons=object_polygons,
             object_velocity_xy=np.asarray(payload.get("object_velocity_xy", object_velocity_xy), dtype=np.float32),
@@ -272,6 +294,23 @@ class NuScenesPDMScorer:
         occupancy_map = NuScenesPDMOccupancyMap(tokens=tokens, geometries=polygons)
         return object_tokens, object_polygons, object_velocity_xy, occupancy_map
 
+    def _build_ttc_agent_states(
+        self,
+        *,
+        static_context: dict[str, Any],
+        scene_objects: Sequence[dict[str, Any]],
+        ea_agent_states: Sequence[dict[str, Any]],
+        patch_radius: float,
+    ) -> list[dict[str, Any]]:
+        row = static_context.get("row", None)
+        if isinstance(row, dict):
+            truth_states = self._delegate._lookup_ea_agent_future_truth(row, patch_radius=float(patch_radius))
+            if len(truth_states) > 0:
+                return [dict(item) for item in truth_states]
+        if len(ea_agent_states) > 0:
+            return [dict(item) for item in ea_agent_states]
+        return [dict(item) for item in scene_objects]
+
     def _build_candidate_geometry_batch(
         self,
         traj_xyyaw: torch.Tensor,
@@ -348,6 +387,25 @@ class NuScenesPDMScorer:
         yaw_rate = np.abs(_wrap_angle(yaw_rad - prev_yaw)) / max(1.0e-6, float(dt_s))
         return speed_mps.astype(np.float32, copy=False), yaw_rate.astype(np.float32, copy=False)
 
+    @staticmethod
+    def _candidate_ea_state_dynamics_batch(
+        centers_xy: np.ndarray,
+        yaw_rad: np.ndarray,
+        *,
+        dt_s: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if centers_xy.ndim != 3 or yaw_rad.ndim != 2:
+            raise RuntimeError(
+                f"Expected centers_xy=(candidates,horizon,2) and yaw_rad=(candidates,horizon), got "
+                f"{tuple(centers_xy.shape)} and {tuple(yaw_rad.shape)}"
+            )
+        prev_xy = np.concatenate([np.zeros_like(centers_xy[:, :1, :]), centers_xy[:, :-1, :]], axis=1)
+        step_delta = centers_xy - prev_xy
+        speed_mps = np.linalg.norm(step_delta, axis=-1) / max(1.0e-6, float(dt_s))
+        prev_yaw = np.concatenate([np.zeros_like(yaw_rad[:, :1]), yaw_rad[:, :-1]], axis=1)
+        yaw_rate_rps = _wrap_angle(yaw_rad - prev_yaw) / max(1.0e-6, float(dt_s))
+        return speed_mps.astype(np.float32, copy=False), yaw_rate_rps.astype(np.float32, copy=False)
+
     def _build_ttc_projection_geometry(
         self,
         *,
@@ -383,6 +441,179 @@ class NuScenesPDMScorer:
             "corners_xy": proj_corners,
             "polygons": proj_polygons,
         }
+
+    @staticmethod
+    def _box_corners_batch(
+        centers_xy: np.ndarray,
+        *,
+        lengths_m: np.ndarray,
+        widths_m: np.ndarray,
+        yaw_rad: np.ndarray,
+    ) -> np.ndarray:
+        centers = np.asarray(centers_xy, dtype=np.float32)
+        lengths = np.asarray(lengths_m, dtype=np.float32)
+        widths = np.asarray(widths_m, dtype=np.float32)
+        yaw = np.asarray(yaw_rad, dtype=np.float32)
+        dx = lengths * 0.5
+        dy = widths * 0.5
+        template = np.stack(
+            [
+                np.stack([dx, dy], axis=-1),
+                np.stack([dx, -dy], axis=-1),
+                np.stack([-dx, -dy], axis=-1),
+                np.stack([-dx, dy], axis=-1),
+            ],
+            axis=-2,
+        ).astype(np.float32, copy=False)
+        cos_yaw = np.cos(yaw).astype(np.float32, copy=False)
+        sin_yaw = np.sin(yaw).astype(np.float32, copy=False)
+        rot = np.stack(
+            [
+                np.stack([cos_yaw, -sin_yaw], axis=-1),
+                np.stack([sin_yaw, cos_yaw], axis=-1),
+            ],
+            axis=-2,
+        ).astype(np.float32, copy=False)
+        rotated = np.einsum("...qd,...dc->...qc", template, rot, optimize=True)
+        return (rotated + centers[..., None, :]).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _oriented_box_axes_np(corners_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        edge0 = corners_xy[..., 1, :] - corners_xy[..., 0, :]
+        edge1 = corners_xy[..., 3, :] - corners_xy[..., 0, :]
+        axis0 = edge0 / np.maximum(np.linalg.norm(edge0, axis=-1, keepdims=True), 1.0e-6)
+        axis1 = edge1 / np.maximum(np.linalg.norm(edge1, axis=-1, keepdims=True), 1.0e-6)
+        return axis0.astype(np.float32, copy=False), axis1.astype(np.float32, copy=False)
+
+    @classmethod
+    def _obb_intersects_np(cls, boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+        center_a = boxes_a.mean(axis=-2)
+        center_b = boxes_b.mean(axis=-2)
+        axis_a0, axis_a1 = cls._oriented_box_axes_np(boxes_a)
+        axis_b0, axis_b1 = cls._oriented_box_axes_np(boxes_b)
+        target_shape = np.broadcast_shapes(axis_a0.shape, axis_a1.shape, axis_b0.shape, axis_b1.shape)
+        axis_a0 = np.broadcast_to(axis_a0, target_shape)
+        axis_a1 = np.broadcast_to(axis_a1, target_shape)
+        axis_b0 = np.broadcast_to(axis_b0, target_shape)
+        axis_b1 = np.broadcast_to(axis_b1, target_shape)
+        axes = np.stack([axis_a0, axis_a1, axis_b0, axis_b1], axis=-2).astype(np.float32, copy=False)
+        rel = center_b - center_a
+        proj_center = np.abs(np.sum(rel[..., None, :] * axes, axis=-1)).astype(np.float32, copy=False)
+        centered_a = boxes_a[..., None, :, :] - center_a[..., None, None, :]
+        centered_b = boxes_b[..., None, :, :] - center_b[..., None, None, :]
+        proj_a = np.abs(np.sum(centered_a * axes[..., :, None, :], axis=-1)).astype(np.float32, copy=False)
+        proj_b = np.abs(np.sum(centered_b * axes[..., :, None, :], axis=-1)).astype(np.float32, copy=False)
+        radius_a = np.max(proj_a, axis=-1)
+        radius_b = np.max(proj_b, axis=-1)
+        overlap = proj_center <= (radius_a + radius_b + 1.0e-5)
+        return np.all(overlap, axis=-1)
+
+    def _sample_agent_boxes_at_times(
+        self,
+        agent_states: Sequence[dict[str, Any]],
+        query_times_s: np.ndarray,
+        *,
+        default_dt_s: float,
+    ) -> np.ndarray:
+        times = np.asarray(query_times_s, dtype=np.float32)
+        if len(agent_states) <= 0:
+            return np.zeros((*times.shape, 0, 4, 2), dtype=np.float32)
+
+        flat_times = times.reshape(-1).astype(np.float32, copy=False)
+        num_times = int(flat_times.shape[0])
+        num_agents = len(agent_states)
+        centers = np.zeros((num_times, num_agents, 2), dtype=np.float32)
+        yaws = np.zeros((num_times, num_agents), dtype=np.float32)
+        lengths = np.ones((num_times, num_agents), dtype=np.float32)
+        widths = np.ones((num_times, num_agents), dtype=np.float32)
+
+        for agent_idx, agent in enumerate(agent_states):
+            current_state = self._agent_current_state(agent)
+            future_xy = np.asarray(agent.get("future_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+            future_yaw = np.asarray(agent.get("future_yaw", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+            future_dt_s = float(agent.get("future_dt_s", default_dt_s))
+
+            sampled_x = np.full((num_times,), float(current_state["x"]), dtype=np.float32)
+            sampled_y = np.full((num_times,), float(current_state["y"]), dtype=np.float32)
+            sampled_yaw = np.full((num_times,), float(current_state["yaw_rad"]), dtype=np.float32)
+
+            use_ctrv = np.ones((num_times,), dtype=bool)
+            if future_xy.ndim == 2 and int(future_xy.shape[0]) > 0 and int(future_xy.shape[1]) >= 2:
+                sample_dt = max(1.0e-6, future_dt_s)
+                future_times = np.arange(1, int(future_xy.shape[0]) + 1, dtype=np.float32) * sample_dt
+                valid_truth = flat_times <= float(future_times[-1]) + 1.0e-6
+                if bool(np.any(valid_truth)):
+                    series_times = np.concatenate([np.asarray([0.0], dtype=np.float32), future_times], axis=0)
+                    series_x = np.concatenate(
+                        [np.asarray([float(current_state["x"])], dtype=np.float32), future_xy[:, 0].astype(np.float32, copy=False)],
+                        axis=0,
+                    )
+                    series_y = np.concatenate(
+                        [np.asarray([float(current_state["y"])], dtype=np.float32), future_xy[:, 1].astype(np.float32, copy=False)],
+                        axis=0,
+                    )
+                    sampled_x[valid_truth] = np.interp(flat_times[valid_truth], series_times, series_x).astype(np.float32, copy=False)
+                    sampled_y[valid_truth] = np.interp(flat_times[valid_truth], series_times, series_y).astype(np.float32, copy=False)
+
+                    if int(future_yaw.shape[0]) == int(future_xy.shape[0]):
+                        yaw_series = np.concatenate(
+                            [
+                                np.asarray([float(current_state["yaw_rad"])], dtype=np.float32),
+                                future_yaw.astype(np.float32, copy=False),
+                            ],
+                            axis=0,
+                        )
+                    else:
+                        derived_yaw = _path_yaw_from_xy(
+                            np.concatenate(
+                                [
+                                    np.asarray([[float(current_state["x"]), float(current_state["y"])]], dtype=np.float32),
+                                    future_xy[:, :2].astype(np.float32, copy=False),
+                                ],
+                                axis=0,
+                            )
+                        )
+                        yaw_series = np.asarray(derived_yaw, dtype=np.float32)
+                        if int(yaw_series.shape[0]) > 0:
+                            yaw_series[0] = float(current_state["yaw_rad"])
+                    sampled_yaw[valid_truth] = np.interp(
+                        flat_times[valid_truth],
+                        series_times,
+                        np.unwrap(yaw_series.astype(np.float64)),
+                    ).astype(np.float32, copy=False)
+                    use_ctrv[valid_truth] = False
+
+            if bool(np.any(use_ctrv)):
+                ctrv_times = flat_times[use_ctrv].astype(np.float32, copy=False)
+                x0 = float(current_state["x"])
+                y0 = float(current_state["y"])
+                speed = float(current_state["speed_mps"])
+                yaw0 = float(current_state["yaw_rad"])
+                yaw_rate = float(current_state["yaw_rate_rps"])
+                if abs(yaw_rate) <= 1.0e-6:
+                    sampled_x[use_ctrv] = x0 + speed * math.cos(yaw0) * ctrv_times
+                    sampled_y[use_ctrv] = y0 + speed * math.sin(yaw0) * ctrv_times
+                    sampled_yaw[use_ctrv] = yaw0
+                else:
+                    radius = speed / yaw_rate
+                    delta_yaw = yaw_rate * ctrv_times
+                    sampled_x[use_ctrv] = x0 + radius * (np.sin(yaw0 + delta_yaw) - math.sin(yaw0))
+                    sampled_y[use_ctrv] = y0 - radius * (np.cos(yaw0 + delta_yaw) - math.cos(yaw0))
+                    sampled_yaw[use_ctrv] = yaw0 + delta_yaw
+
+            centers[:, agent_idx, 0] = sampled_x
+            centers[:, agent_idx, 1] = sampled_y
+            yaws[:, agent_idx] = np.arctan2(np.sin(sampled_yaw), np.cos(sampled_yaw)).astype(np.float32, copy=False)
+            lengths[:, agent_idx] = float(agent.get("length_m", current_state["length_m"]))
+            widths[:, agent_idx] = float(agent.get("width_m", current_state["width_m"]))
+
+        corners = self._box_corners_batch(
+            centers,
+            lengths_m=lengths,
+            widths_m=widths,
+            yaw_rad=yaws,
+        )
+        return corners.reshape(*times.shape, num_agents, 4, 2).astype(np.float32, copy=False)
 
     @staticmethod
     def _batch_project_progress(
@@ -472,6 +703,7 @@ class NuScenesPDMScorer:
         dt_s: float,
     ) -> dict[str, np.ndarray]:
         centers_xy = np.asarray(candidate_geometry["centers_xy"], dtype=np.float32)
+        corners_xy = np.asarray(candidate_geometry["corners_xy"], dtype=np.float32)
         num_candidates, horizon = centers_xy.shape[:2]
         if num_candidates <= 0 or horizon <= 0:
             return {
@@ -480,8 +712,8 @@ class NuScenesPDMScorer:
                 "driving_direction": np.ones((num_candidates,), dtype=np.float32),
             }
 
-        inside = sample_context.drivable_map.batch_contains_points(centers_xy)
-        drivable_area = inside.all(axis=1).astype(np.float32, copy=False)
+        inside = sample_context.drivable_map.batch_contains_points(corners_xy)
+        drivable_area = inside.all(axis=(1, 2)).astype(np.float32, copy=False)
 
         lateral_errors, tangents_xy = self._batch_centerline_stats(
             centers_xy,
@@ -606,7 +838,8 @@ class NuScenesPDMScorer:
         no_collision = np.ones((num_candidates,), dtype=np.float32)
         ttc = np.ones((num_candidates,), dtype=np.float32)
         if horizon <= 0 or len(sample_context.occupancy_map) <= 0:
-            return {"no_collision": no_collision, "ttc": ttc}
+            if len(sample_context.ttc_agent_states) <= 0:
+                return {"no_collision": no_collision, "ttc": ttc}
 
         speed_mps, _ = self._candidate_speed_and_yaw_rate_batch(centers_xy, yaw_rad, dt_s=float(dt_s))
         ttc_projection = self._build_ttc_projection_geometry(
@@ -614,27 +847,58 @@ class NuScenesPDMScorer:
             yaw_rad=yaw_rad,
             dt_s=float(dt_s),
         )
-        collision_hits = self._query_hits_per_candidate_grid(
-            sample_context.occupancy_map,
-            polygons,
-            predicate="intersects",
-        )
+        step_times_s = (np.arange(horizon, dtype=np.float32) + 1.0) * float(dt_s)
+        if len(sample_context.ttc_agent_states) > 0:
+            agent_step_corners = self._sample_agent_boxes_at_times(
+                sample_context.ttc_agent_states,
+                step_times_s,
+                default_dt_s=float(dt_s),
+            )
+            if agent_step_corners.shape[1] > 0:
+                ego_now = np.asarray(candidate_geometry["corners_xy"], dtype=np.float32)[:, :, None, :, :]
+                agent_now = agent_step_corners[None, :, :, :, :]
+                collision_hits = np.any(self._obb_intersects_np(ego_now, agent_now), axis=2)
+            else:
+                collision_hits = np.zeros((num_candidates, horizon), dtype=bool)
+        else:
+            collision_hits = self._query_hits_per_candidate_grid(
+                sample_context.occupancy_map,
+                polygons,
+                predicate="intersects",
+            )
         collision_mask = np.any(collision_hits, axis=1)
         earliest_ttc_risk_s = np.full((num_candidates,), np.inf, dtype=np.float32)
 
         moving_mask = speed_mps >= float(_DEFAULT_TTC_STOPPED_SPEED_THRESHOLD_MPS)
         if bool(np.any(moving_mask)):
-            proj_polygons = np.asarray(ttc_projection["polygons"], dtype=object)
-            proj_hits = self._query_hits_per_candidate_grid(
-                sample_context.occupancy_map,
-                proj_polygons.reshape(num_candidates, horizon * int(ttc_projection["offsets_s"].shape[0])),
-                predicate="intersects",
-            ).reshape(num_candidates, horizon, int(ttc_projection["offsets_s"].shape[0]))
+            offsets_s = np.asarray(ttc_projection["offsets_s"], dtype=np.float32)
+            if len(sample_context.ttc_agent_states) > 0 and int(offsets_s.shape[0]) > 0:
+                query_times_s = step_times_s[:, None] + offsets_s.reshape(1, -1)
+                agent_future_corners = self._sample_agent_boxes_at_times(
+                    sample_context.ttc_agent_states,
+                    query_times_s,
+                    default_dt_s=float(dt_s),
+                )
+                if agent_future_corners.shape[2] > 0:
+                    ego_future = np.asarray(ttc_projection["corners_xy"], dtype=np.float32)[:, :, :, None, :, :]
+                    agent_future = agent_future_corners[None, :, :, :, :, :]
+                    future_hits = self._obb_intersects_np(ego_future, agent_future)
+                    proj_hits = np.any(future_hits, axis=3)
+                else:
+                    proj_hits = np.zeros((num_candidates, horizon, int(offsets_s.shape[0])), dtype=bool)
+            else:
+                proj_polygons = np.asarray(ttc_projection["polygons"], dtype=object)
+                proj_hits = self._query_hits_per_candidate_grid(
+                    sample_context.occupancy_map,
+                    proj_polygons.reshape(num_candidates, horizon * int(ttc_projection["offsets_s"].shape[0])),
+                    predicate="intersects",
+                ).reshape(num_candidates, horizon, int(ttc_projection["offsets_s"].shape[0]))
+
             risk_mask = np.logical_and(proj_hits, moving_mask[:, :, None])
             if bool(np.any(risk_mask)):
                 risk_offsets = np.where(
                     risk_mask,
-                    ttc_projection["offsets_s"].reshape(1, 1, -1),
+                    offsets_s.reshape(1, 1, -1),
                     np.inf,
                 ).astype(np.float32, copy=False)
                 earliest_ttc_risk_s = np.min(risk_offsets.reshape(num_candidates, -1), axis=1).astype(np.float32, copy=False)
@@ -649,6 +913,166 @@ class NuScenesPDMScorer:
                 1.0,
             ).astype(np.float32, copy=False)
         return {"no_collision": no_collision, "ttc": ttc}
+
+    @staticmethod
+    def _agent_current_state(agent: dict[str, Any]) -> dict[str, float]:
+        agent_velocity = np.asarray(agent.get("velocity_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+        center_xy = np.asarray(agent.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(2)
+        return {
+            "x": float(center_xy[0]),
+            "y": float(center_xy[1]),
+            "speed_mps": float(agent.get("speed_mps", np.linalg.norm(agent_velocity))),
+            "yaw_rad": float(agent.get("yaw_rad", 0.0)),
+            "yaw_rate_rps": float(agent.get("yaw_rate_rps", 0.0)),
+            "length_m": float(agent.get("length_m", 1.0)),
+            "width_m": float(agent.get("width_m", 1.0)),
+        }
+
+    def _sample_agent_state_at_time(
+        self,
+        agent: dict[str, Any],
+        *,
+        time_s: float,
+        dt_s: float,
+    ) -> dict[str, Any]:
+        current_state = self._agent_current_state(agent)
+        future_xy = np.asarray(agent.get("future_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+        future_yaw = np.asarray(agent.get("future_yaw", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+        sampled_state = self._delegate._sample_state_at_time(
+            current_state=current_state,
+            future_xy=future_xy,
+            future_yaw=future_yaw,
+            time_s=float(time_s),
+            dt_s=float(agent.get("future_dt_s", dt_s)),
+        )
+        if sampled_state is not None:
+            return sampled_state
+        return self._delegate._propagate_ctrv_state(current_state, time_s=float(time_s))
+
+    def _compute_ea_value_batch_for_pairs(
+        self,
+        ego_states: Sequence[dict[str, Any]],
+        agent_states: Sequence[dict[str, Any]],
+    ) -> np.ndarray:
+        if len(ego_states) != len(agent_states):
+            raise RuntimeError(
+                f"EA pair batch length mismatch: ego_states={len(ego_states)} agent_states={len(agent_states)}"
+            )
+        if len(ego_states) <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        out = np.zeros((len(ego_states),), dtype=np.float32)
+        for idx, (ego_state, agent_state) in enumerate(zip(ego_states, agent_states, strict=False)):
+            out[idx] = np.float32(self._delegate._compute_ea_value_for_pair(ego_state, agent_state))
+        return out
+
+    def _score_ea_safety_gate_batch(
+        self,
+        *,
+        sample_context: NuScenesPDMSampleContext,
+        candidate_geometry: dict[str, np.ndarray],
+        dt_s: float,
+    ) -> dict[str, np.ndarray]:
+        centers_xy = np.asarray(candidate_geometry["centers_xy"], dtype=np.float32)
+        yaw_rad = np.asarray(candidate_geometry["yaw_rad"], dtype=np.float32)
+        num_candidates, horizon = centers_xy.shape[:2]
+
+        gate = np.ones((num_candidates,), dtype=np.float32)
+        max_ea = np.zeros((num_candidates,), dtype=np.float32)
+        evaluated_pairs = np.zeros((num_candidates,), dtype=np.float32)
+        if not self._delegate.ea_gate_enabled or num_candidates <= 0:
+            return {"gate": gate, "max_ea": max_ea, "evaluated_pairs": evaluated_pairs}
+
+        vehicle_agents = [
+            dict(item)
+            for item in sample_context.ea_agent_states
+            if "vehicle" in str(item.get("category", "")).strip().lower()
+        ]
+        if len(vehicle_agents) <= 0:
+            return {"gate": gate, "max_ea": max_ea, "evaluated_pairs": evaluated_pairs}
+        if horizon <= 0:
+            return {
+                "gate": np.zeros((num_candidates,), dtype=np.float32),
+                "max_ea": max_ea,
+                "evaluated_pairs": evaluated_pairs,
+            }
+
+        agent_centers = np.asarray(
+            [np.asarray(agent.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(2) for agent in vehicle_agents],
+            dtype=np.float32,
+        )
+        path_agent_dist = np.linalg.norm(
+            centers_xy[:, :, None, :] - agent_centers[None, None, :, :],
+            axis=-1,
+        ).min(axis=1)
+        max_agents = min(int(self._delegate.ea_gate_max_agents), int(agent_centers.shape[0]))
+        if max_agents <= 0:
+            return {"gate": gate, "max_ea": max_ea, "evaluated_pairs": evaluated_pairs}
+        selected_agent_indices = np.argsort(path_agent_dist, axis=1)[:, :max_agents]
+
+        speed_mps, yaw_rate_rps = self._candidate_ea_state_dynamics_batch(
+            centers_xy,
+            yaw_rad,
+            dt_s=float(dt_s),
+        )
+        step_indices = sorted({0, max(0, horizon // 2), horizon - 1})
+
+        flat_candidate_indices: list[int] = []
+        flat_ego_states: list[dict[str, Any]] = []
+        flat_agent_states: list[dict[str, Any]] = []
+        for candidate_idx in range(num_candidates):
+            for step_idx in step_indices:
+                time_offset_s = float(step_idx + 1) * float(dt_s)
+                ego_state = {
+                    "x": float(centers_xy[candidate_idx, step_idx, 0]),
+                    "y": float(centers_xy[candidate_idx, step_idx, 1]),
+                    "speed_mps": float(speed_mps[candidate_idx, step_idx]),
+                    "yaw_rad": float(yaw_rad[candidate_idx, step_idx]),
+                    "yaw_rate_rps": float(yaw_rate_rps[candidate_idx, step_idx]),
+                    "length_m": 4.9,
+                    "width_m": 2.1,
+                }
+                for agent_idx in selected_agent_indices[candidate_idx].tolist():
+                    flat_candidate_indices.append(candidate_idx)
+                    flat_ego_states.append(ego_state)
+                    flat_agent_states.append(
+                        self._sample_agent_state_at_time(
+                            vehicle_agents[int(agent_idx)],
+                            time_s=time_offset_s,
+                            dt_s=float(dt_s),
+                        )
+                    )
+
+        if len(flat_candidate_indices) <= 0:
+            return {"gate": gate, "max_ea": max_ea, "evaluated_pairs": evaluated_pairs}
+
+        try:
+            ea_values = np.asarray(
+                self._compute_ea_value_batch_for_pairs(flat_ego_states, flat_agent_states),
+                dtype=np.float32,
+            ).reshape(-1)
+        except Exception:
+            return {"gate": gate, "max_ea": max_ea, "evaluated_pairs": evaluated_pairs}
+
+        for pair_idx, candidate_idx in enumerate(flat_candidate_indices):
+            ea_value = float(ea_values[pair_idx])
+            evaluated_pairs[candidate_idx] += 1.0
+            if not math.isfinite(ea_value):
+                gate[candidate_idx] = min(gate[candidate_idx], 0.0)
+                max_ea[candidate_idx] = np.float32(np.inf)
+                continue
+            clipped_ea = max(0.0, ea_value)
+            max_ea[candidate_idx] = max(max_ea[candidate_idx], np.float32(clipped_ea))
+            gate[candidate_idx] = min(
+                gate[candidate_idx],
+                np.float32(
+                    _linear_decay_score(
+                        clipped_ea,
+                        good_threshold=float(self._delegate.ea_gate_good_threshold),
+                        bad_threshold=float(self._delegate.ea_gate_bad_threshold),
+                    )
+                ),
+            )
+        return {"gate": gate, "max_ea": max_ea, "evaluated_pairs": evaluated_pairs}
 
     def _score_candidate_batch_for_sample(
         self,
@@ -708,7 +1132,11 @@ class NuScenesPDMScorer:
             dt_s=float(dt_s),
         )
         lane_keeping = map_metrics["lane_keeping"] if lane_centerlines else np.clip(1.0 - 0.25 * mean_err, 0.0, 1.0).astype(np.float32, copy=False)
-        driving_direction = map_metrics["driving_direction"]
+        driving_direction = (
+            map_metrics["driving_direction"]
+            if bool(self._delegate.driving_direction_gate_enabled)
+            else np.ones((num_candidates,), dtype=np.float32)
+        )
         drivable_area = map_metrics["drivable_area"] if drivable_polygons else np.ones((num_candidates,), dtype=np.float32)
 
         collision_ttc = self._batch_collision_ttc_metrics(
@@ -718,6 +1146,11 @@ class NuScenesPDMScorer:
         )
         no_collision = collision_ttc["no_collision"]
         ttc = collision_ttc["ttc"]
+        ea_gate = self._score_ea_safety_gate_batch(
+            sample_context=sample_context,
+            candidate_geometry=candidate_geometry,
+            dt_s=float(dt_s),
+        )
 
         weighted_score = (
             progress_ratio * float(self._delegate.progress_weight)
@@ -732,6 +1165,10 @@ class NuScenesPDMScorer:
             + float(self._delegate.history_comfort_weight),
         )
         multiplicative_product = (no_collision * drivable_area * driving_direction).astype(np.float32, copy=False)
+        if self._delegate.ea_gate_enabled:
+            multiplicative_product = (
+                multiplicative_product * np.asarray(ea_gate["gate"], dtype=np.float32)
+            ).astype(np.float32, copy=False)
         return (weighted_score.astype(np.float32, copy=False) * multiplicative_product).astype(np.float32, copy=False)
 
     def _build_sample_context(
@@ -760,6 +1197,13 @@ class NuScenesPDMScorer:
         )
         map_layers = dict(static_ctx.get("map_context", {}).get("layers", {}))
         scene_objects = list(static_ctx.get("scene_objects", []))
+        ea_agent_states = list(static_ctx.get("ea_agent_states", []))
+        ttc_agent_states = self._build_ttc_agent_states(
+            static_context=static_ctx,
+            scene_objects=scene_objects,
+            ea_agent_states=ea_agent_states,
+            patch_radius=float(static_ctx.get("map_context", {}).get("patch_radius", patch_radius)),
+        )
         object_tokens, object_polygons, object_velocity_xy, occupancy_map = self._build_object_geometry_arrays(scene_objects)
         lane_centerlines = list(map_layers.get("lane_centerline", []))
         drivable_polygons = list(map_layers.get("drivable_area", []))
@@ -771,7 +1215,8 @@ class NuScenesPDMScorer:
             drivable_polygons=drivable_polygons,
             lane_centerlines=lane_centerlines,
             scene_objects=scene_objects,
-            ea_agent_states=list(static_ctx.get("ea_agent_states", [])),
+            ea_agent_states=ea_agent_states,
+            ttc_agent_states=ttc_agent_states,
             object_tokens=object_tokens,
             object_polygons=object_polygons,
             object_velocity_xy=object_velocity_xy,
@@ -789,7 +1234,8 @@ class NuScenesPDMScorer:
                 drivable_polygons=drivable_polygons,
                 lane_centerlines=lane_centerlines,
                 scene_objects=scene_objects,
-                ea_agent_states=list(static_ctx.get("ea_agent_states", [])),
+                ea_agent_states=ea_agent_states,
+                ttc_agent_states=ttc_agent_states,
                 object_tokens=object_tokens,
                 object_velocity_xy=object_velocity_xy,
                 centerline_segments_xy=centerline_segments_xy,

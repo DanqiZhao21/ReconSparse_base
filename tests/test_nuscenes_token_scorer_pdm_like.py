@@ -306,3 +306,75 @@ def test_score_with_details_uses_continuous_driving_direction_gate(tmp_path: Pat
     assert brief_reverse["driving_direction_oncoming_progress_m"] == pytest.approx(0.0, abs=1.0e-4)
     assert 0.0 < sustained_reverse["multiplicative_metrics"]["driving_direction"] < 1.0
     assert sustained_reverse["driving_direction_oncoming_progress_m"] == pytest.approx(4.0, abs=1.0e-4)
+
+
+def test_score_with_details_can_disable_driving_direction_gate(tmp_path: Path) -> None:
+    token = "tok-driving-direction-disabled"
+    token2vad_path = tmp_path / "token2vad.pkl"
+    cache_root = tmp_path / "scene_cache"
+    _write_token2vad(
+        token2vad_path,
+        token=token,
+        gt_ego_fut_trajs=np.asarray(
+            [
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    _write_scene_env_cache(
+        cache_root,
+        scene_id=203,
+        frame_idx=0,
+        payload={
+            "sample_token": token,
+            "ego_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+            "drivable_polygons": [
+                [[-8.0, -4.0], [8.0, -4.0], [8.0, 4.0], [-8.0, 4.0], [-8.0, -4.0]],
+            ],
+            "lanes_centerlines": [
+                [[-6.0, 0.0], [-3.0, 0.0], [0.0, 0.0], [3.0, 0.0], [6.0, 0.0]],
+            ],
+            "static_objects": [],
+            "dynamic_objects": [],
+        },
+    )
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[-1.0, 0.0, math.pi], [-2.0, 0.0, math.pi], [-3.0, 0.0, math.pi], [-4.0, 0.0, math.pi], [-5.0, 0.0, math.pi]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    scorer_default = NuScenesTokenScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=cache_root,
+    )
+    default_scores, default_details = scorer_default.score_with_details(
+        [{"sample_token": token, "scene_id": 203, "frame_idx": 0}],
+        traj_xyyaw,
+    )
+
+    scorer_disabled = NuScenesTokenScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=cache_root,
+        driving_direction_gate_enabled=False,
+    )
+    disabled_scores, disabled_details = scorer_disabled.score_with_details(
+        [{"sample_token": token, "scene_id": 203, "frame_idx": 0}],
+        traj_xyyaw,
+    )
+
+    default_candidate = default_details[0]["candidates"][0]
+    disabled_candidate = disabled_details[0]["candidates"][0]
+
+    assert default_candidate["multiplicative_metrics"]["driving_direction"] < 1.0
+    assert disabled_candidate["multiplicative_metrics"]["driving_direction"] == pytest.approx(1.0)
+    assert float(disabled_scores[0, 0]) > float(default_scores[0, 0])

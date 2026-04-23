@@ -147,6 +147,7 @@ class NuScenesTokenScorer:
         ea_gate_horizon_s: float = _DEFAULT_EA_HORIZON_S,
         ea_gate_dt_coarse_s: float = _DEFAULT_EA_DT_COARSE_S,
         ea_gate_dt_fine_s: float = _DEFAULT_EA_DT_FINE_S,
+        driving_direction_gate_enabled: bool = True,
         #weight评分权重
         progress_weight: float = 8.0,
         ttc_weight: float = 5.0,
@@ -174,6 +175,7 @@ class NuScenesTokenScorer:
         self.ea_gate_horizon_s = float(ea_gate_horizon_s)
         self.ea_gate_dt_coarse_s = float(ea_gate_dt_coarse_s)
         self.ea_gate_dt_fine_s = float(ea_gate_dt_fine_s)
+        self.driving_direction_gate_enabled = bool(driving_direction_gate_enabled)
         self.progress_weight = float(progress_weight)
         self.ttc_weight = float(ttc_weight)
         self.lane_keeping_weight = float(lane_keeping_weight)
@@ -1632,7 +1634,7 @@ class NuScenesTokenScorer:
         multiplicative_metrics = {
             "no_collision": float(no_collision),
             "drivable_area": float(drivable_area),
-            "driving_direction": float(driving_direction),
+            "driving_direction": float(driving_direction) if self.driving_direction_gate_enabled else 1.0,
         }
         if self.ea_gate_enabled:
             multiplicative_metrics["ea_safety"] = float(ea_gate_result["gate"])

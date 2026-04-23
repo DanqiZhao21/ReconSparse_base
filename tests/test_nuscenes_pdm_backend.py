@@ -5,6 +5,7 @@ from pathlib import Path
 import pickle
 
 import numpy as np
+import pytest
 import torch
 
 from framework.agent.policy_sparsedrive_v2 import SparseDriveV2Policy
@@ -521,13 +522,23 @@ def test_nuscenes_pdm_backend_batch_drivable_and_lane_queries_return_expected_sh
 
         def batch_contains_points(self, points_xy):
             self.calls.append(tuple(points_xy.shape))
-            return np.asarray(
-                [
-                    [True, True, True],
-                    [False, False, False],
-                ],
-                dtype=bool,
-            )
+            if tuple(points_xy.shape) == (2, 3, 4, 2):
+                return np.asarray(
+                    [
+                        [
+                            [True, True, True, True],
+                            [True, True, True, True],
+                            [True, True, True, True],
+                        ],
+                        [
+                            [False, False, False, False],
+                            [False, False, False, False],
+                            [False, False, False, False],
+                        ],
+                    ],
+                    dtype=bool,
+                )
+            raise AssertionError(f"unexpected drivable query shape: {tuple(points_xy.shape)}")
 
     fake_map = FakeDrivableMap()
     sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
@@ -556,7 +567,65 @@ def test_nuscenes_pdm_backend_batch_drivable_and_lane_queries_return_expected_sh
     assert metrics["drivable_area"].shape == (2,)
     assert metrics["lane_keeping"].shape == (2,)
     assert metrics["driving_direction"].shape == (2,)
-    assert fake_map.calls == [(2, 3, 2)]
+    assert fake_map.calls == [(2, 3, 4, 2)]
+
+
+def test_nuscenes_pdm_backend_drivable_area_uses_ego_box_corners(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [1.6, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+
+    class FakeDrivableMap:
+        def batch_contains_points(self, points_xy):
+            if tuple(points_xy.shape) != (1, 3, 4, 2):
+                raise AssertionError(f"unexpected drivable query shape: {tuple(points_xy.shape)}")
+            # Centerline is fully drivable, but one corner leaves the map at the second step.
+            return np.asarray(
+                [
+                    [
+                        [True, True, True, True],
+                        [True, False, True, True],
+                        [True, True, True, True],
+                    ]
+                ],
+                dtype=bool,
+            )
+
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+    sample_context.drivable_map = FakeDrivableMap()
+    sample_context.centerline_segments_xy = np.asarray(
+        [
+            [[0.0, 0.0], [2.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    sample_context.centerline_tangents_xy = np.asarray(
+        [
+            [1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    metrics = scorer._batch_map_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["drivable_area"].shape == (1,)
+    assert metrics["drivable_area"][0] == pytest.approx(0.0)
 
 
 def test_nuscenes_pdm_backend_batch_project_progress_matches_scalar_reference(tmp_path: Path) -> None:
@@ -594,3 +663,514 @@ def test_nuscenes_pdm_backend_batch_project_progress_matches_scalar_reference(tm
 
     assert batch_progress.shape == (3,)
     assert np.allclose(batch_progress, scalar_progress, atol=1.0e-5)
+
+
+def test_nuscenes_pdm_backend_ea_gate_is_optional_and_gates_batched_candidates(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    scene_cache_root = tmp_path / "scene_cache"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[2.0, 0.0, 0.0], [3.5, 0.0, 0.0], [4.5, 0.0, 0.0]],
+                [[1.0, 2.5, 0.0], [2.0, 2.5, 0.0], [3.0, 2.5, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+        del replay
+        return {
+            "gt_xy": np.asarray([[2.0, 0.0], [3.5, 0.0], [4.5, 0.0]], dtype=np.float32),
+            "gt_yaw": np.zeros((3,), dtype=np.float32),
+            "gt_s": np.asarray([0.0, 1.5, 2.5], dtype=np.float32),
+            "gt_total_len": 2.5,
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {"drivable_area": [], "lane_centerline": []},
+            },
+            "scene_objects": [],
+            "ea_agent_states": [
+                {
+                    "category": "vehicle.car",
+                    "center_xy": [4.0, 0.0],
+                    "yaw_rad": 0.0,
+                    "yaw_rate_rps": 0.0,
+                    "velocity_xy": [0.0, 0.0],
+                    "speed_mps": 0.0,
+                    "length_m": 4.8,
+                    "width_m": 2.0,
+                }
+            ],
+        }
+
+    scorer_plain = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=scene_cache_root / "plain",
+    )
+    monkeypatch.setattr(scorer_plain._delegate, "_build_static_sample_context", fake_static_context)
+    plain_scores = scorer_plain.score([{"sample_token": "tok-a"}], traj_xyyaw)
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=scene_cache_root / "ea",
+        ea_gate_enabled=True,
+        ea_gate_good_threshold=0.0,
+        ea_gate_bad_threshold=5.0,
+    )
+    monkeypatch.setattr(scorer._delegate, "_build_static_sample_context", fake_static_context)
+    monkeypatch.setattr(
+        scorer,
+        "_compute_ea_value_batch_for_pairs",
+        lambda ego_states, agent_states: np.asarray(
+            [
+                4.0 if float(ego_state["x"]) > 1.5 and abs(float(ego_state["y"])) < 0.5 else 0.0
+                for ego_state, _agent_state in zip(ego_states, agent_states, strict=False)
+            ],
+            dtype=np.float32,
+        ),
+        raising=False,
+    )
+
+    gated_scores = scorer.score([{"sample_token": "tok-a"}], traj_xyyaw)
+
+    assert plain_scores.shape == (1, 2)
+    assert gated_scores.shape == (1, 2)
+    assert float(plain_scores[0, 0]) == pytest.approx(0.0)
+    assert float(gated_scores[0, 0]) == pytest.approx(0.0)
+    assert float(gated_scores[0, 1]) == pytest.approx(float(plain_scores[0, 1]), rel=1.0e-6)
+
+
+def test_nuscenes_pdm_backend_can_disable_driving_direction_gate(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    scene_cache_root = tmp_path / "scene_cache"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[-1.0, 0.0, np.pi], [-2.0, 0.0, np.pi], [-3.0, 0.0, np.pi], [-4.0, 0.0, np.pi], [-5.0, 0.0, np.pi]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+            del replay
+            return {
+                "gt_xy": np.asarray([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]], dtype=np.float32),
+                "gt_yaw": np.zeros((5,), dtype=np.float32),
+                "gt_s": np.asarray([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+                "gt_total_len": 4.0,
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {
+                    "drivable_area": [
+                        [[-8.0, -4.0], [8.0, -4.0], [8.0, 4.0], [-8.0, 4.0], [-8.0, -4.0]],
+                    ],
+                    "lane_centerline": [
+                        [[-6.0, 0.0], [-3.0, 0.0], [0.0, 0.0], [3.0, 0.0], [6.0, 0.0]],
+                    ],
+                },
+            },
+            "scene_objects": [],
+            "ea_agent_states": [],
+        }
+
+    scorer_default = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=scene_cache_root / "default",
+    )
+    monkeypatch.setattr(scorer_default._delegate, "_build_static_sample_context", fake_static_context)
+    default_scores = scorer_default.score([{"sample_token": "tok-a"}], traj_xyyaw)
+
+    scorer_disabled = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=scene_cache_root / "disabled",
+        driving_direction_gate_enabled=False,
+    )
+    monkeypatch.setattr(scorer_disabled._delegate, "_build_static_sample_context", fake_static_context)
+    disabled_scores = scorer_disabled.score([{"sample_token": "tok-a"}], traj_xyyaw)
+
+    assert default_scores.shape == (1, 1)
+    assert disabled_scores.shape == (1, 1)
+    assert float(disabled_scores[0, 0]) > float(default_scores[0, 0])
+
+
+def test_nuscenes_pdm_backend_ttc_uses_agent_future_truth_boxes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+        del replay
+        return {
+            "row": {
+                    "gt_boxes": np.asarray(
+                        [
+                            [4.4, 1.0, 0.0, 1.0, 4.0, 1.8, 0.0],
+                        ],
+                        dtype=np.float32,
+                    ),
+                "gt_velocity": np.asarray([[0.0, 0.0]], dtype=np.float32),
+                "gt_names": np.asarray(["vehicle.car"], dtype=object),
+                "valid_flag": np.asarray([True], dtype=bool),
+                "gt_agent_fut_trajs": np.asarray(
+                    [
+                        [[0.0, -1.0], [0.0, -2.0], [0.0, -3.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_agent_fut_masks": np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+                "gt_agent_fut_yaw": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+            },
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {"drivable_area": [], "lane_centerline": []},
+            },
+            "scene_objects": [
+                {
+                    "category": "vehicle.car",
+                    "center_xy": [4.4, 1.0],
+                    "velocity_xy": [0.0, 0.0],
+                    "yaw_rad": 0.0,
+                    "length_m": 4.0,
+                    "width_m": 1.0,
+                }
+            ],
+            "ea_agent_states": [],
+        }
+
+    monkeypatch.setattr(scorer._delegate, "_build_static_sample_context", fake_static_context)
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["no_collision"].shape == (1,)
+    assert metrics["ttc"].shape == (1,)
+    assert metrics["no_collision"][0] == pytest.approx(0.0)
+    assert float(metrics["ttc"][0]) < 1.0
+
+
+def test_nuscenes_pdm_backend_ttc_falls_back_to_ctrv_when_future_truth_missing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+        del replay
+        return {
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {"drivable_area": [], "lane_centerline": []},
+            },
+            "scene_objects": [
+                {
+                    "category": "vehicle.car",
+                    "center_xy": [4.4, 6.5],
+                    "velocity_xy": [0.0, -2.0],
+                    "yaw_rad": -np.pi * 0.5,
+                    "yaw_rate_rps": 0.0,
+                    "length_m": 4.0,
+                    "width_m": 1.0,
+                }
+            ],
+            "ea_agent_states": [],
+        }
+
+    monkeypatch.setattr(scorer._delegate, "_build_static_sample_context", fake_static_context)
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["no_collision"].shape == (1,)
+    assert metrics["ttc"].shape == (1,)
+    assert metrics["no_collision"][0] == pytest.approx(1.0)
+    assert float(metrics["ttc"][0]) < 1.0
+
+
+def test_nuscenes_pdm_backend_no_collision_uses_future_agent_boxes_not_static_snapshot(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+        del replay
+        return {
+            "row": {
+                "gt_boxes": np.asarray(
+                    [
+                        [2.0, 0.0, 0.0, 1.0, 4.0, 1.8, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_velocity": np.asarray([[0.0, 0.0]], dtype=np.float32),
+                "gt_names": np.asarray(["vehicle.car"], dtype=object),
+                "valid_flag": np.asarray([True], dtype=bool),
+                "gt_agent_fut_trajs": np.asarray(
+                    [
+                        [[0.0, 20.0], [0.0, 20.0], [0.0, 20.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_agent_fut_masks": np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+                "gt_agent_fut_yaw": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+            },
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {"drivable_area": [], "lane_centerline": []},
+            },
+            "scene_objects": [
+                {
+                    "category": "vehicle.car",
+                    "center_xy": [2.0, 0.0],
+                    "velocity_xy": [0.0, 0.0],
+                    "yaw_rad": 0.0,
+                    "length_m": 4.0,
+                    "width_m": 1.0,
+                }
+            ],
+            "ea_agent_states": [],
+        }
+
+    monkeypatch.setattr(scorer._delegate, "_build_static_sample_context", fake_static_context)
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[7.0, 0.0, 0.0], [9.0, 0.0, 0.0], [11.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["no_collision"].shape == (1,)
+    assert metrics["no_collision"][0] == pytest.approx(1.0)
+
+
+def test_nuscenes_pdm_backend_no_collision_detects_future_agent_box_overlap(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+        del replay
+        return {
+            "row": {
+                "gt_boxes": np.asarray(
+                    [
+                        [20.0, 0.0, 0.0, 1.0, 4.0, 1.8, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_velocity": np.asarray([[0.0, 0.0]], dtype=np.float32),
+                "gt_names": np.asarray(["vehicle.car"], dtype=object),
+                "valid_flag": np.asarray([True], dtype=bool),
+                "gt_agent_fut_trajs": np.asarray(
+                    [
+                        [[0.0, -16.0], [0.0, -16.0], [0.0, -16.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_agent_fut_masks": np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+                "gt_agent_fut_yaw": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+            },
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {"drivable_area": [], "lane_centerline": []},
+            },
+            "scene_objects": [
+                {
+                    "category": "vehicle.car",
+                    "center_xy": [20.0, 0.0],
+                    "velocity_xy": [0.0, 0.0],
+                    "yaw_rad": 0.0,
+                    "length_m": 4.0,
+                    "width_m": 1.0,
+                }
+            ],
+            "ea_agent_states": [],
+        }
+
+    monkeypatch.setattr(scorer._delegate, "_build_static_sample_context", fake_static_context)
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["no_collision"].shape == (1,)
+    assert metrics["no_collision"][0] == pytest.approx(0.0)
+
+
+def test_nuscenes_pdm_backend_no_collision_aligns_future_agents_to_candidate_step_times(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
+
+    def fake_static_context(replay, *, patch_radius: float):
+        del replay
+        return {
+            "row": {
+                "gt_boxes": np.asarray(
+                    [
+                        [20.0, 0.0, 0.0, 1.0, 4.0, 1.8, 0.0],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_velocity": np.asarray([[0.0, 0.0]], dtype=np.float32),
+                "gt_names": np.asarray(["vehicle.car"], dtype=object),
+                "valid_flag": np.asarray([True], dtype=bool),
+                # Local future deltas that place the agent at x=6.0 at the first future step.
+                "gt_agent_fut_trajs": np.asarray(
+                    [
+                        [[0.0, -14.0], [0.0, 0.0], [0.0, 0.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "gt_agent_fut_masks": np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32),
+                "gt_agent_fut_yaw": np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+            },
+            "map_context": {
+                "patch_radius": float(patch_radius),
+                "layers": {"drivable_area": [], "lane_centerline": []},
+            },
+            "scene_objects": [
+                {
+                    "category": "vehicle.car",
+                    "center_xy": [20.0, 0.0],
+                    "velocity_xy": [0.0, 0.0],
+                    "yaw_rad": 0.0,
+                    "length_m": 4.0,
+                    "width_m": 1.0,
+                }
+            ],
+            "ea_agent_states": [],
+        }
+
+    monkeypatch.setattr(scorer._delegate, "_build_static_sample_context", fake_static_context)
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[6.0, 0.0, 0.0], [8.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["no_collision"].shape == (1,)
+    assert metrics["no_collision"][0] == pytest.approx(0.0)

@@ -904,7 +904,7 @@ class NuScenesPDMScorer:
         if object_centers.shape[0] <= 0:
             return {"no_collision": no_collision, "ttc": ttc}
 
-        times = torch.arange(horizon, device=device, dtype=torch.float32) * float(dt_s)
+        times = (torch.arange(horizon, device=device, dtype=torch.float32) + 1.0) * float(dt_s)
         obj_centers_now = object_centers.view(1, 1, -1, 2) + object_vel.view(1, 1, -1, 2) * times.view(1, -1, 1, 1)
         obj_corners_now = self._object_corners_torch(
             obj_centers_now,
@@ -1124,7 +1124,11 @@ class NuScenesPDMScorer:
             dt_s=float(dt_s),
         )
         lane_keeping = map_metrics["lane_keeping"] if lane_centerlines else np.clip(1.0 - 0.25 * mean_err, 0.0, 1.0).astype(np.float32, copy=False)
-        driving_direction = map_metrics["driving_direction"]
+        driving_direction = (
+            map_metrics["driving_direction"]
+            if bool(self._delegate.driving_direction_gate_enabled)
+            else np.ones((num_candidates,), dtype=np.float32)
+        )
         drivable_area = map_metrics["drivable_area"] if drivable_polygons else np.ones((num_candidates,), dtype=np.float32)
 
         collision_ttc = self._batch_collision_ttc_metrics(
