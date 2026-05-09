@@ -14,6 +14,7 @@ def test_parse_log_text_extracts_progress_and_anomalies() -> None:
 [00:16:17] [learner] stage2 train: selected_shards=24 inner_epochs=1
 [00:16:26] [learner] slow_step update=0 batch_idx=0 part=grpo_debug took=6.69s
 [00:19:01] [learner] update=0 shards=24 samples=768 ver=2 metrics={'loss_pi': 0.12, 'approx_kl': 0.03}
+[00:19:01] [learner] reward_summary update=0 summary={'positive_reward_mean': 0.4, 'cost_reward_mean': 0.2, 'safety_gate_rate': 0.1}
 [00:19:01] [learner] step_timing update=0 parts={'training_step_total_s': 120.0, 'grpo_debug_s': 80.0}
 [00:19:01] [learner] timing update=0 collect=90.50s load=1.20s prepare=0.50s train=120.00s save=0.80s update=210.50s time_per_shard=5.00s
 """
@@ -27,6 +28,7 @@ def test_parse_log_text_extracts_progress_and_anomalies() -> None:
     assert len(parsed.slow_steps) == 1
     assert parsed.update_timings[0].update_time_s == 210.5
     assert parsed.update_metrics[0]["loss_pi"] == 0.12
+    assert parsed.reward_summary[0]["positive_reward_mean"] == 0.4
     assert any("grpo_debug" in item for item in parsed.anomalies)
 
 

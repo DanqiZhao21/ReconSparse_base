@@ -148,7 +148,9 @@ class NuScenesTokenScorer:
         ea_gate_dt_coarse_s: float = _DEFAULT_EA_DT_COARSE_S,
         ea_gate_dt_fine_s: float = _DEFAULT_EA_DT_FINE_S,
         driving_direction_gate_enabled: bool = True,
+        dac_gate_enabled: bool = True,
         #weight评分权重
+        dac_weight: float = 0.0,
         progress_weight: float = 8.0,
         ttc_weight: float = 5.0,
         lane_keeping_weight: float = 2.0,
@@ -176,6 +178,8 @@ class NuScenesTokenScorer:
         self.ea_gate_dt_coarse_s = float(ea_gate_dt_coarse_s)
         self.ea_gate_dt_fine_s = float(ea_gate_dt_fine_s)
         self.driving_direction_gate_enabled = bool(driving_direction_gate_enabled)
+        self.dac_gate_enabled = bool(dac_gate_enabled)
+        self.dac_weight = float(dac_weight)
         self.progress_weight = float(progress_weight)
         self.ttc_weight = float(ttc_weight)
         self.lane_keeping_weight = float(lane_keeping_weight)

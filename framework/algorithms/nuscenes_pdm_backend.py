@@ -132,6 +132,12 @@ class NuScenesPDMScorer:
         **kwargs: Any,
     ) -> None:
         self.token2vad_path = Path(token2vad_path)
+        self.score_mode = str(kwargs.pop("score_mode", "full")).strip().lower()
+        if self.score_mode not in {"full", "drivable_area_only"}:
+            raise ValueError(
+                f"Unsupported NuScenesPDMScorer score_mode={self.score_mode!r}; "
+                "expected 'full' or 'drivable_area_only'"
+            )
         self._delegate = NuScenesTokenScorer(
             token2vad_path=self.token2vad_path,
             **kwargs,
@@ -1138,6 +1144,8 @@ class NuScenesPDMScorer:
             else np.ones((num_candidates,), dtype=np.float32)
         )
         drivable_area = map_metrics["drivable_area"] if drivable_polygons else np.ones((num_candidates,), dtype=np.float32)
+        if self.score_mode == "drivable_area_only":
+            return drivable_area.astype(np.float32, copy=False)
 
         collision_ttc = self._batch_collision_ttc_metrics(
             sample_context=sample_context,
@@ -1153,18 +1161,21 @@ class NuScenesPDMScorer:
         )
 
         weighted_score = (
-            progress_ratio * float(self._delegate.progress_weight)
+            drivable_area * float(self._delegate.dac_weight)
+            + progress_ratio * float(self._delegate.progress_weight)
             + ttc * float(self._delegate.ttc_weight)
             + lane_keeping * float(self._delegate.lane_keeping_weight)
             + history_comfort * float(self._delegate.history_comfort_weight)
         ) / max(
             1.0,
-            float(self._delegate.progress_weight)
+            float(self._delegate.dac_weight)
+            + float(self._delegate.progress_weight)
             + float(self._delegate.ttc_weight)
             + float(self._delegate.lane_keeping_weight)
             + float(self._delegate.history_comfort_weight),
         )
-        multiplicative_product = (no_collision * drivable_area * driving_direction).astype(np.float32, copy=False)
+        drivable_gate = drivable_area if bool(self._delegate.dac_gate_enabled) else np.ones_like(drivable_area)
+        multiplicative_product = (no_collision * drivable_gate * driving_direction).astype(np.float32, copy=False)
         if self._delegate.ea_gate_enabled:
             multiplicative_product = (
                 multiplicative_product * np.asarray(ea_gate["gate"], dtype=np.float32)

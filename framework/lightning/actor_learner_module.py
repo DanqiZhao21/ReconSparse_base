@@ -107,8 +107,22 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             reward_count = int(getattr(loaded, "reward_count", 0)) if loaded is not None else 0
             done_sum = float(getattr(loaded, "done_sum", 0.0)) if loaded is not None else 0.0
             done_count = int(getattr(loaded, "done_count", 0)) if loaded is not None else 0
+            reward_summary = dict(getattr(loaded, "reward_summary", {}) or {}) if loaded is not None else {}
             reward_mean = float(reward_sum) / float(max(1, reward_count))
             done_rate = float(done_sum) / float(max(1, done_count))
+            reward_summary_steps = float(max(1.0, float(reward_summary.get("step_count", 0.0))))
+            reward_summary_view = {
+                "positive_reward_mean": float(reward_summary.get("positive_reward_sum", 0.0)) / reward_summary_steps,
+                "gated_positive_reward_mean": float(reward_summary.get("gated_positive_reward_sum", 0.0)) / reward_summary_steps,
+                "cost_reward_mean": float(reward_summary.get("cost_reward_sum", 0.0)) / reward_summary_steps,
+                "safety_gate_rate": float(reward_summary.get("safety_gate_active_count", 0.0)) / reward_summary_steps,
+                "collision_gate_rate": float(reward_summary.get("collision_gate_count", 0.0)) / reward_summary_steps,
+                "severe_tracking_lateral_gate_rate": float(reward_summary.get("severe_tracking_lateral_gate_count", 0.0)) / reward_summary_steps,
+                "severe_tracking_yaw_gate_rate": float(reward_summary.get("severe_tracking_yaw_gate_count", 0.0)) / reward_summary_steps,
+                "terminal_failure_rate": float(reward_summary.get("terminal_failure_count", 0.0)) / reward_summary_steps,
+                "terminal_timeout_rate": float(reward_summary.get("terminal_timeout_count", 0.0)) / reward_summary_steps,
+                "terminal_env_done_rate": float(reward_summary.get("terminal_env_done_count", 0.0)) / reward_summary_steps,
+            }
             ret = datamodule.current_loaded.batch["ret"]
             adv = datamodule.current_loaded.batch["adv"]
             metrics = self.aggregated_update_metrics()
@@ -117,6 +131,10 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             self.stage_fn(
                 f"[learner] update={int(self._update_index())} shards={len(selected)} "
                 f"samples={n} ver={new_v} metrics={metrics}"
+            )
+            self.stage_fn(
+                f"[learner] reward_summary update={int(self._update_index())} "
+                f"summary={reward_summary_view}"
             )
             self.stage_fn(
                 f"[learner] step_timing update={int(self._update_index())} parts={timing_parts}"
@@ -150,6 +168,16 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                     "reward_sum": float(reward_sum),
                     "reward_mean": float(reward_mean),
                     "done_rate": float(done_rate),
+                    "positive_reward_mean": float(reward_summary_view["positive_reward_mean"]),
+                    "gated_positive_reward_mean": float(reward_summary_view["gated_positive_reward_mean"]),
+                    "cost_reward_mean": float(reward_summary_view["cost_reward_mean"]),
+                    "safety_gate_rate": float(reward_summary_view["safety_gate_rate"]),
+                    "collision_gate_rate": float(reward_summary_view["collision_gate_rate"]),
+                    "severe_tracking_lateral_gate_rate": float(reward_summary_view["severe_tracking_lateral_gate_rate"]),
+                    "severe_tracking_yaw_gate_rate": float(reward_summary_view["severe_tracking_yaw_gate_rate"]),
+                    "terminal_failure_rate": float(reward_summary_view["terminal_failure_rate"]),
+                    "terminal_timeout_rate": float(reward_summary_view["terminal_timeout_rate"]),
+                    "terminal_env_done_rate": float(reward_summary_view["terminal_env_done_rate"]),
                     "ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
                     "ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
                     "adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,

@@ -95,3 +95,196 @@ def test_terminal_success_bonus_applies_on_env_done() -> None:
     assert result.info["terminal_success_bonus"] == pytest.approx(7.5)
     assert result.info["terminal_success_bonus_applied"] is True
 
+
+def test_collision_defaults_to_constraint_gate_not_dense_penalty() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 1.0,
+            "w_lateral": 0.0,
+            "w_yaw": 0.0,
+        },
+        "collision": {
+            "w_static": 5.0,
+            "w_dynamic": 7.0,
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(
+        start_ego=_pose(0.0, 1.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    result = computer.compute(
+        env=env,
+        info={"static_collision": True, "dynamic_collision": True},
+        step_idx=0,
+        done=False,
+    )
+
+    assert result.reward == pytest.approx(0.0)
+    assert result.info["positive_reward"] == pytest.approx(0.0)
+    assert result.info["cost_reward"] == pytest.approx(0.0)
+    assert result.info["static_collision_penalty"] == pytest.approx(0.0)
+    assert result.info["dynamic_collision_penalty"] == pytest.approx(0.0)
+    assert result.info["safety_gate_active"] is True
+    assert result.info["safety_gate_sources"] == ["collision_constraint"]
+
+
+def test_collision_gate_only_masks_positive_reward_not_cost() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 0.0,
+            "w_completion_ratio": 2.0,
+            "completion_ratio_power": 1.0,
+            "w_lateral": 2.0,
+            "lateral_free_m": 0.0,
+            "lateral_huber_delta_m": 1.0,
+            "w_yaw": 0.0,
+        },
+        "collision": {
+            "mode": "constraint_gate",
+            "gate_scale": 0.0,
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(
+        start_ego=_pose(1.0, 4.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    result = computer.compute(
+        env=env,
+        info={"static_collision": True},
+        step_idx=0,
+        done=False,
+    )
+
+    assert result.info["positive_reward"] > 0.0
+    assert result.info["cost_reward"] > 0.0
+    assert result.reward == pytest.approx(-result.info["cost_reward"])
+    assert result.info["safety_gate_active"] is True
+    assert result.info["safety_gate_sources"] == ["collision_constraint"]
+
+
+def test_severe_tracking_gate_masks_positive_reward_before_terminal() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 0.0,
+            "w_completion_ratio": 1.5,
+            "completion_ratio_power": 1.0,
+            "w_lateral": 0.25,
+            "lateral_free_m": 0.0,
+            "lateral_huber_delta_m": 1.0,
+            "w_yaw": 0.0,
+            "severe_lateral_error_m": 1.0,
+            "severe_gate_scale": 0.0,
+        },
+        "collision": {
+            "mode": "constraint_gate",
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(
+        start_ego=_pose(2.0, 4.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+    assert result.info["positive_reward"] > 0.0
+    assert result.info["cost_reward"] > 0.0
+    assert result.reward == pytest.approx(-result.info["cost_reward"])
+    assert result.info["safety_gate_active"] is True
+    assert result.info["safety_gate_sources"] == ["severe_tracking_lateral"]
+
+
+def test_collision_gate_does_not_improve_negative_dense_reward() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 0.0,
+            "w_lateral": 2.0,
+            "lateral_free_m": 0.0,
+            "lateral_huber_delta_m": 1.0,
+            "w_yaw": 0.0,
+        },
+        "collision": {
+            "mode": "constraint_gate",
+            "gate_scale": 0.0,
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(
+        start_ego=_pose(2.0, 1.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    no_collision = computer.compute(env=env, info={}, step_idx=0, done=False)
+    computer.reset()
+    collision = computer.compute(
+        env=env,
+        info={"static_collision": True},
+        step_idx=0,
+        done=False,
+    )
+
+    assert no_collision.reward < 0.0
+    assert collision.reward == pytest.approx(no_collision.reward)
+    assert collision.info["safety_gate_active"] is True
+    assert collision.info["safety_gate_scale"] == pytest.approx(0.0)
+
+
+def test_collision_penalty_can_still_be_enabled_for_backward_compatibility() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 1.0,
+            "w_lateral": 0.0,
+            "w_yaw": 0.0,
+        },
+        "collision": {
+            "mode": "dense_penalty",
+            "w_static": 5.0,
+            "w_dynamic": 7.0,
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(
+        start_ego=_pose(0.0, 1.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    result = computer.compute(
+        env=env,
+        info={"static_collision": True, "dynamic_collision": True},
+        step_idx=0,
+        done=False,
+    )
+
+    assert result.reward == pytest.approx(-12.0)
+    assert result.info["static_collision_penalty"] == pytest.approx(5.0)
+    assert result.info["dynamic_collision_penalty"] == pytest.approx(7.0)
+    assert result.info["safety_gate_active"] is False

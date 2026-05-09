@@ -25,6 +25,9 @@ env:
       w_yaw: 1.0
       yaw_free_deg: 5.0
       yaw_huber_delta_deg: 10.0
+      severe_lateral_error_m: 3.0
+      severe_yaw_error_deg: 30.0
+      severe_gate_scale: 0.0
       w_anchor_progress: 0.0
       w_anchor_lateral: 0.0
       anchor_free_m: 0.2
@@ -38,6 +41,8 @@ env:
       yaw_jerk_delta: 0.3
       jerk_clip: 50.0
     collision:
+      mode: constraint_gate
+      gate_scale: 0.0
       w_static: 5.0
       w_dynamic: 5.0
     logging:

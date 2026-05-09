@@ -515,6 +515,24 @@ class SparseDriveV2Policy(Agent):
                 out[key] = value.to(device=device, dtype=torch.float32)
         return out
 
+    def _batch_observation_features(
+        self,
+        observations: Sequence[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        features_list = [self._build_features(obs) for obs in observations]
+        if len(features_list) == 0:
+            return [], {"camera_feature": {}, "status_feature": torch.empty((0,), dtype=torch.float32)}
+
+        camera_keys = list(features_list[0]["camera_feature"].keys())
+        batched_camera = {
+            key: torch.cat([feat["camera_feature"][key] for feat in features_list], dim=0)
+            for key in camera_keys
+        }
+        return features_list, {
+            "camera_feature": batched_camera,
+            "status_feature": torch.cat([feat["status_feature"] for feat in features_list], dim=0),
+        }
+
     @staticmethod
     def _unwrap_model(module: torch.nn.Module | DDP) -> torch.nn.Module:
         return module.module if isinstance(module, DDP) else module
@@ -580,7 +598,9 @@ class SparseDriveV2Policy(Agent):
 
 
     @staticmethod
-    def _build_env_action(traj_xyyaw: np.ndarray) -> Tuple[Any, ...]:
+    def _build_env_action(traj_xyyaw: np.ndarray | torch.Tensor) -> Tuple[Any, ...]:
+        if torch.is_tensor(traj_xyyaw):
+            traj_xyyaw = traj_xyyaw.detach().cpu().numpy()
         first = traj_xyyaw[0]
         return (float(first[0]), float(first[1]), float(first[2]), 2)
 
@@ -658,7 +678,6 @@ class SparseDriveV2Policy(Agent):
         except Exception:
             pass
 
-#TODO:这里的sample仍然是伪batchshi'xian
     def sample_sparsedrivev2_with_replay(
         self,
         observation: Dict[str, Any],
@@ -672,7 +691,7 @@ class SparseDriveV2Policy(Agent):
             mode_select=str(mode_select),
         )
         return actions[0], logps[0], replays[0]
-
+#actor采样时：闭环log π(a|s)
     def sample_sparsedrivev2_with_replay_batch(
         self,
         observations: List[Dict[str, Any]],
@@ -683,19 +702,10 @@ class SparseDriveV2Policy(Agent):
         if len(observations) == 0:
             return [], [], []
 
-        features_list = [self._build_features(obs) for obs in observations]
-        camera_keys = list(features_list[0]["camera_feature"].keys())
-        batched_camera = {
-            key: torch.cat([feat["camera_feature"][key] for feat in features_list], dim=0)
-            for key in camera_keys
-        }
-        batched_features = {
-            "camera_feature": batched_camera,
-            "status_feature": torch.cat([feat["status_feature"] for feat in features_list], dim=0),
-        }
+        features_list, batched_features = self._batch_observation_features(observations)
         batched_dev = self._to_device_features(batched_features, self.device)
 
-        model = self._model.module if isinstance(self._model, DDP) else self._model
+        model = self._unwrap_model(self._model)
         model.eval()
         with torch.inference_mode():
             out = self._forward_policy(batched_dev)
@@ -740,7 +750,7 @@ class SparseDriveV2Policy(Agent):
             replays.append(replay)
 
         return actions, logps, replays
-
+# learner 训练时
     def logp_from_replay_batch(
         self,
         replays: Sequence[Dict[str, Any]],
@@ -785,6 +795,64 @@ class SparseDriveV2Policy(Agent):
         logp_all = torch.log_softmax(score_logits, dim=1)
         return logp_all[torch.arange(score_logits.shape[0], device=score_logits.device), mode_indices]
 
+#GRPO部分：输入已经 forward 出来的结果，然后挑候选。
+    def _select_counterfactual_candidates_from_policy_outputs(
+        self,
+        *,
+        score_logits: torch.Tensor,
+        candidate_trajs: torch.Tensor,
+        num_candidates: int,
+        candidate_select: str,
+        logp_all: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        if candidate_trajs.ndim != 4:
+            raise RuntimeError(
+                "SparseDriveV2 counterfactual candidates require candidate trajectories with shape "
+                f"(batch, modes, horizon, dims); got {tuple(candidate_trajs.shape)}"
+            )
+
+        batch_size, num_modes, horizon, traj_dim = tuple(candidate_trajs.shape)
+        del batch_size, horizon, traj_dim
+        k = max(1, min(int(num_candidates), int(num_modes)))
+        select = str(candidate_select).strip().lower()
+        if select not in {"topk", "all"}:
+            raise ValueError(f"Unsupported candidate_select={candidate_select!r}; expected 'topk' or 'all'")
+
+        if select == "all":
+            selected_indices = torch.argsort(score_logits, dim=1, descending=True)[:, :k]
+        else:
+            selected_indices = torch.topk(score_logits, k=k, dim=1, largest=True, sorted=True).indices
+
+        gather_idx_scores = selected_indices
+        gather_idx_traj = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(
+            -1,
+            -1,
+            candidate_trajs.shape[2],
+            candidate_trajs.shape[3],
+        )
+        selected_score_logits = torch.gather(score_logits, dim=1, index=gather_idx_scores)
+        selected_trajs = torch.gather(candidate_trajs, dim=1, index=gather_idx_traj)
+
+        if logp_all is None:
+            logp_all = torch.log_softmax(score_logits, dim=1)
+        selected_log_probs = torch.gather(logp_all, dim=1, index=gather_idx_scores)
+
+        selected_trajs_flat = selected_trajs.reshape(-1, selected_trajs.shape[2], selected_trajs.shape[3])
+        traj_xyyaw = self._traj_batch_to_xyyaw(selected_trajs_flat).reshape(
+            selected_trajs.shape[0],
+            selected_trajs.shape[1],
+            selected_trajs.shape[2],
+            3,
+        )
+
+        return {
+            "traj_xyyaw": traj_xyyaw.detach(),
+            "log_probs": selected_log_probs,
+            "mode_indices": selected_indices.to(dtype=torch.long),
+            "score_logits": selected_score_logits,
+        }
+        
+#调用上层函数
     def sample_counterfactual_trajectories_from_replay_batch(
         self,
         replays: Sequence[Dict[str, Any]],
@@ -806,45 +874,64 @@ class SparseDriveV2Policy(Agent):
         out = self._forward_policy_on_model(model, batched_dev)
         score_logits = out["candidate_scores"].to(dtype=torch.float32)
         candidate_trajs = out["candidate_trajectories"]
+        return self._select_counterfactual_candidates_from_policy_outputs(
+            score_logits=score_logits,
+            candidate_trajs=candidate_trajs,
+            num_candidates=int(num_candidates),
+            candidate_select=str(candidate_select),
+        )
+
+    def replay_policy_outputs_from_replay_batch(
+        self,
+        replays: Sequence[Dict[str, Any]],
+        *,
+        eta: float = 1.0,
+        num_candidates: int,
+        candidate_select: str = "topk",
+    ) -> Dict[str, Any]:
+        del eta
+        if len(replays) == 0:
+            empty_candidates = {
+                "traj_xyyaw": torch.empty((0, 0, 0, 3), dtype=torch.float32),
+                "log_probs": torch.empty((0, 0), device=self.device, dtype=torch.float32),
+                "mode_indices": torch.empty((0, 0), device=self.device, dtype=torch.long),
+                "score_logits": torch.empty((0, 0), device=self.device, dtype=torch.float32),
+            }
+            return {
+                "new_logp": torch.empty((0,), device=self.device, dtype=torch.float32),
+                "counterfactual": empty_candidates,
+            }
+
+        batched_dev = self._batched_replay_features(replays)
+        model = self._unwrap_model(self._model)
+        model.eval()
+        out = self._forward_policy_on_model(model, batched_dev)
+        score_logits = out["candidate_scores"].to(dtype=torch.float32)
+        candidate_trajs = out["candidate_trajectories"]
         if candidate_trajs.ndim != 4:
             raise RuntimeError(
-                "SparseDriveV2 counterfactual candidates require candidate trajectories with shape "
+                "SparseDriveV2 replay policy outputs require candidate trajectories with shape "
                 f"(batch, modes, horizon, dims); got {tuple(candidate_trajs.shape)}"
             )
 
-        batch_size, num_modes, horizon, traj_dim = tuple(candidate_trajs.shape)
-        del batch_size, horizon, traj_dim
-        k = max(1, min(int(num_candidates), int(num_modes)))
-        select = str(candidate_select).strip().lower()
-        if select not in {"topk", "all"}:
-            raise ValueError(f"Unsupported candidate_select={candidate_select!r}; expected 'topk' or 'all'")
-
-        if select == "all":
-            selected_indices = torch.argsort(score_logits, dim=1, descending=True)[:, :k]
-        else:
-            selected_indices = torch.topk(score_logits, k=k, dim=1, largest=True, sorted=True).indices
-
-        gather_idx_scores = selected_indices
-        gather_idx_traj = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, candidate_trajs.shape[2], candidate_trajs.shape[3])
-        selected_score_logits = torch.gather(score_logits, dim=1, index=gather_idx_scores)
-        selected_trajs = torch.gather(candidate_trajs, dim=1, index=gather_idx_traj)
-
+        mode_indices = torch.as_tensor(
+            [int(rep.get("mode_idx", 0)) for rep in replays],
+            dtype=torch.long,
+            device=score_logits.device,
+        )
         logp_all = torch.log_softmax(score_logits, dim=1)
-        selected_log_probs = torch.gather(logp_all, dim=1, index=gather_idx_scores)
-
-        selected_trajs_flat = selected_trajs.reshape(-1, selected_trajs.shape[2], selected_trajs.shape[3])
-        traj_xyyaw = self._traj_batch_to_xyyaw(selected_trajs_flat).reshape(
-            selected_trajs.shape[0],
-            selected_trajs.shape[1],
-            selected_trajs.shape[2],
-            3,
+        new_logp = logp_all[torch.arange(score_logits.shape[0], device=score_logits.device), mode_indices]
+        counterfactual = self._select_counterfactual_candidates_from_policy_outputs(
+            score_logits=score_logits,
+            candidate_trajs=candidate_trajs,
+            num_candidates=int(num_candidates),
+            candidate_select=str(candidate_select),
+            logp_all=logp_all,
         )
 
         return {
-            "traj_xyyaw": traj_xyyaw.detach(),
-            "log_probs": selected_log_probs,
-            "mode_indices": selected_indices.to(dtype=torch.long),
-            "score_logits": selected_score_logits,
+            "new_logp": new_logp,
+            "counterfactual": counterfactual,
         }
 
     def init_distillation_teacher(self, *, ckpt_path: str | None = None) -> None:

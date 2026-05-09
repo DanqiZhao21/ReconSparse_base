@@ -138,6 +138,7 @@ class TrajectoryLightningModule(L.LightningModule):
         loss: torch.Tensor,
         metrics: Dict[str, torch.Tensor],
         timing_parts: Dict[str, float] | None = None,
+        candidates: Dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         grpo_coef = float(self.learner_config.grpo_coef)
         grpo_enabled = bool(getattr(self.learner_config, "grpo_enabled", False)) or (grpo_coef > 0.0)
@@ -146,24 +147,28 @@ class TrajectoryLightningModule(L.LightningModule):
         if not loss_requested and not debug_requested:
             return loss, metrics
 
-        candidate_fn = getattr(self.agent, "sample_counterfactual_trajectories_from_replay_batch", None)
-        if not callable(candidate_fn):
-            if not loss_requested:
-                return loss, metrics
-            raise RuntimeError(
-                "GRPO is enabled but the agent does not expose "
-                "`sample_counterfactual_trajectories_from_replay_batch`."
+        if candidates is None:
+            candidate_fn = getattr(self.agent, "sample_counterfactual_trajectories_from_replay_batch", None)
+            if not callable(candidate_fn):
+                if not loss_requested:
+                    return loss, metrics
+                raise RuntimeError(
+                    "GRPO is enabled but the agent does not expose "
+                    "`sample_counterfactual_trajectories_from_replay_batch`."
+                )
+            t0 = time.perf_counter()
+            candidates = candidate_fn(
+                replay,
+                num_candidates=int(self.learner_config.grpo_num_candidates),
+                candidate_select=str(self.learner_config.grpo_candidate_select),
             )
-        t0 = time.perf_counter()
-        candidates = candidate_fn(
-            replay,
-            num_candidates=int(self.learner_config.grpo_num_candidates),
-            candidate_select=str(self.learner_config.grpo_candidate_select),
-        )
-        sample_s = float(time.perf_counter() - t0)
-        if timing_parts is not None:
-            timing_parts["grpo_sample_s"] = timing_parts.get("grpo_sample_s", 0.0) + sample_s
-        self._maybe_report_slow_step_part(name="grpo_sample", seconds=sample_s, batch_idx=batch_idx)
+            sample_s = float(time.perf_counter() - t0)
+            if timing_parts is not None:
+                timing_parts["grpo_sample_s"] = timing_parts.get("grpo_sample_s", 0.0) + sample_s
+            self._maybe_report_slow_step_part(name="grpo_sample", seconds=sample_s, batch_idx=batch_idx)
+        else:
+            if timing_parts is not None:
+                timing_parts.setdefault("grpo_sample_s", 0.0)
         candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
         t0 = time.perf_counter()
         candidate_scores = score_counterfactual_trajectories(
@@ -211,6 +216,61 @@ class TrajectoryLightningModule(L.LightningModule):
             "grpo_score_max": grpo_loss.score_max.detach(),
         }
         return out_loss, out_metrics
+
+    def _maybe_fused_replay_policy_outputs(
+        self,
+        replay: list[Dict[str, Any]],
+        *,
+        device: torch.device,
+        timing_parts: Dict[str, float],
+    ) -> Dict[str, Any] | None:
+        grpo_coef = float(self.learner_config.grpo_coef)
+        loss_requested = (bool(getattr(self.learner_config, "grpo_enabled", False)) or grpo_coef > 0.0) and grpo_coef > 0.0
+        debug_requested = bool(getattr(self.learner_config, "grpo_debug_visualize", False))
+        if not loss_requested and not debug_requested:
+            return None
+
+        fused_fn = getattr(self.agent, "replay_policy_outputs_from_replay_batch", None)
+        if not callable(fused_fn):
+            return None
+
+        t0 = time.perf_counter()
+        outputs = fused_fn(
+            replay,
+            eta=float(self.learner_config.eta),
+            num_candidates=int(self.learner_config.grpo_num_candidates),
+            candidate_select=str(self.learner_config.grpo_candidate_select),
+        )
+        timing_parts["fused_policy_s"] = float(time.perf_counter() - t0)
+        new_logp = outputs.get("new_logp", None)
+        if torch.is_tensor(new_logp):
+            outputs["new_logp"] = new_logp.to(device=device, dtype=torch.float32).view(-1)
+        return outputs
+
+    def _compute_grpo_only_loss(
+        self,
+        *,
+        replay: list[Dict[str, Any]],
+        device: torch.device,
+        batch_idx: int,
+        timing_parts: Dict[str, float],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        grpo_coef = float(self.learner_config.grpo_coef)
+        if not bool(getattr(self.learner_config, "grpo_enabled", False)) or grpo_coef <= 0.0:
+            raise RuntimeError("train.algo=grpo_only requires train.grpo.enable=true and train.grpo.coef > 0")
+
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        loss, metrics = self._maybe_apply_grpo_loss(
+            replay=replay,
+            device=device,
+            batch_idx=batch_idx,
+            loss=zero,
+            metrics={},
+            timing_parts=timing_parts,
+        )
+        if "grpo_loss" not in metrics:
+            raise RuntimeError("train.algo=grpo_only did not produce a GRPO loss")
+        return loss, metrics
 
     def _maybe_dump_grpo_debug(
         self,
@@ -385,83 +445,104 @@ class TrajectoryLightningModule(L.LightningModule):
             if torch.is_tensor(old_logp):
                 old_logp = old_logp.to(device=device, dtype=torch.float32).view(-1)
 
-            t0 = time.perf_counter()
-            new_logp = agent_logp_from_replay_batch(
-                self.agent,
-                replay,
-                device=device,
-                eta=float(self.learner_config.eta),
-            )
-            timing_parts["new_logp_s"] = float(time.perf_counter() - t0)
-
-            if self.learner_config.algo_kind.startswith("ppo"):
-                if self.value_net is None:
-                    raise RuntimeError("PPO Lightning module requires value_net")
-                t0 = time.perf_counter()
-                if _use_agent_value_features(self.agent, self.value_net, batch):
-                    value_input = self.agent.value_features_from_replay_batch(replay).to(device=device, dtype=torch.float32)
-                else:
-                    value_input = batch["obs"].to(device=device, dtype=torch.float32)
-                old_value = batch.get("old_value", None)
-                if torch.is_tensor(old_value):
-                    old_value = old_value.to(device=device, dtype=torch.float32).view(-1)
-                value_pred = self.value_net(value_input).view(-1)
-                timing_parts["value_s"] = float(time.perf_counter() - t0)
-                t0 = time.perf_counter()
-                ppo_loss = compute_ppo_objective(
-                    new_logp=new_logp,
-                    old_logp=old_logp,
-                    adv=adv,
-                    ret=ret,
-                    value_pred=value_pred,
-                    old_value=old_value,
-                    clip_eps=float(self.learner_config.clip_eps),
-                    vf_coef=float(self.learner_config.vf_coef),
-                    value_clip_eps=float(self.learner_config.value_clip_eps),
-                    kl_coef=float(self.learner_config.kl_coef),
-                    dual_clip=self.learner_config.dual_clip,
+            if self.learner_config.algo_kind == "grpo_only":
+                loss, metrics = self._compute_grpo_only_loss(
+                    replay=replay,
+                    device=device,
+                    batch_idx=batch_idx,
+                    timing_parts=timing_parts,
                 )
-                timing_parts["objective_s"] = float(time.perf_counter() - t0)
-                t0 = time.perf_counter()
-                metrics = compute_ppo_metrics(
-                    new_logp=new_logp,
-                    old_logp=old_logp,
-                    adv=adv,
-                    ret=ret,
-                    value_pred=value_pred,
-                    loss=ppo_loss,
-                )
-                timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
-                loss = ppo_loss.loss
             else:
-                reinforce_old_logp = old_logp if self.learner_config.algo_kind in {"reinforcepp", "reinforce_kl"} else None
-                t0 = time.perf_counter()
-                r_loss = compute_reinforce_objective(
-                    new_logp=new_logp,
-                    old_logp=reinforce_old_logp,
-                    adv=adv,
-                    clip_eps=float(self.learner_config.clip_eps),
-                    kl_coef=float(self.learner_config.kl_coef),
+                fused_policy_outputs = self._maybe_fused_replay_policy_outputs(
+                    replay,
+                    device=device,
+                    timing_parts=timing_parts,
                 )
-                timing_parts["objective_s"] = float(time.perf_counter() - t0)
-                t0 = time.perf_counter()
-                metrics = compute_reinforce_metrics(
-                    new_logp=new_logp,
-                    old_logp=reinforce_old_logp,
-                    adv=adv,
-                    loss=r_loss,
-                )
-                timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
-                loss = r_loss.loss
+                fused_candidates = None
+                if fused_policy_outputs is not None:
+                    new_logp = fused_policy_outputs["new_logp"]
+                    fused_candidates = fused_policy_outputs.get("counterfactual", None)
+                    timing_parts["new_logp_s"] = 0.0
+                    timing_parts["grpo_sample_s"] = 0.0
+                else:
+                    t0 = time.perf_counter()
+                    new_logp = agent_logp_from_replay_batch(
+                        self.agent,
+                        replay,
+                        device=device,
+                        eta=float(self.learner_config.eta),
+                    )
+                    timing_parts["new_logp_s"] = float(time.perf_counter() - t0)
 
-            loss, metrics = self._maybe_apply_grpo_loss(
-                replay=replay,
-                device=device,
-                batch_idx=batch_idx,
-                loss=loss,
-                metrics=metrics,
-                timing_parts=timing_parts,
-            )
+                if self.learner_config.algo_kind.startswith("ppo"):
+                    if self.value_net is None:
+                        raise RuntimeError("PPO Lightning module requires value_net")
+                    t0 = time.perf_counter()
+                    if _use_agent_value_features(self.agent, self.value_net, batch):
+                        value_input = self.agent.value_features_from_replay_batch(replay).to(device=device, dtype=torch.float32)
+                    else:
+                        value_input = batch["obs"].to(device=device, dtype=torch.float32)
+                    old_value = batch.get("old_value", None)
+                    if torch.is_tensor(old_value):
+                        old_value = old_value.to(device=device, dtype=torch.float32).view(-1)
+                    value_pred = self.value_net(value_input).view(-1)
+                    timing_parts["value_s"] = float(time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    ppo_loss = compute_ppo_objective(
+                        new_logp=new_logp,
+                        old_logp=old_logp,
+                        adv=adv,
+                        ret=ret,
+                        value_pred=value_pred,
+                        old_value=old_value,
+                        clip_eps=float(self.learner_config.clip_eps),
+                        vf_coef=float(self.learner_config.vf_coef),
+                        value_clip_eps=float(self.learner_config.value_clip_eps),
+                        kl_coef=float(self.learner_config.kl_coef),
+                        dual_clip=self.learner_config.dual_clip,
+                    )
+                    timing_parts["objective_s"] = float(time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    metrics = compute_ppo_metrics(
+                        new_logp=new_logp,
+                        old_logp=old_logp,
+                        adv=adv,
+                        ret=ret,
+                        value_pred=value_pred,
+                        loss=ppo_loss,
+                    )
+                    timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
+                    loss = ppo_loss.loss
+                else:
+                    reinforce_old_logp = old_logp if self.learner_config.algo_kind in {"reinforcepp", "reinforce_kl"} else None
+                    t0 = time.perf_counter()
+                    r_loss = compute_reinforce_objective(
+                        new_logp=new_logp,
+                        old_logp=reinforce_old_logp,
+                        adv=adv,
+                        clip_eps=float(self.learner_config.clip_eps),
+                        kl_coef=float(self.learner_config.kl_coef),
+                    )
+                    timing_parts["objective_s"] = float(time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    metrics = compute_reinforce_metrics(
+                        new_logp=new_logp,
+                        old_logp=reinforce_old_logp,
+                        adv=adv,
+                        loss=r_loss,
+                    )
+                    timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
+                    loss = r_loss.loss
+
+                loss, metrics = self._maybe_apply_grpo_loss(
+                    replay=replay,
+                    device=device,
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    metrics=metrics,
+                    timing_parts=timing_parts,
+                    candidates=fused_candidates,
+                )
 
             t0 = time.perf_counter()
             distill_metrics = _maybe_compute_distillation_metrics(

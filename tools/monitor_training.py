@@ -27,6 +27,7 @@ UPDATE_METRICS_RE = re.compile(
     r"\[learner\] update=(?P<update>\d+) shards=(?P<shards>\d+) samples=(?P<samples>\d+) "
     r"ver=(?P<version>\d+) metrics=(?P<metrics>\{.*\})"
 )
+REWARD_SUMMARY_RE = re.compile(r"\[learner\] reward_summary update=(?P<update>\d+) summary=(?P<summary>\{.*\})")
 UPDATE_TIMING_RE = re.compile(
     r"\[learner\] timing update=(?P<update>\d+) collect=(?P<collect>[0-9.]+)s "
     r"load=(?P<load>[0-9.]+)s prepare=(?P<prepare>[0-9.]+)s train=(?P<train>[0-9.]+)s "
@@ -87,6 +88,7 @@ class ParsedLog:
     actor_shards: list[ActorShardEvent] = field(default_factory=list)
     slow_steps: list[SlowStepEvent] = field(default_factory=list)
     update_metrics: dict[int, dict[str, float]] = field(default_factory=dict)
+    reward_summary: dict[int, dict[str, float]] = field(default_factory=dict)
     update_timings: dict[int, UpdateTiming] = field(default_factory=dict)
     step_timing_parts: dict[int, dict[str, float]] = field(default_factory=dict)
     shard_dir: str | None = None
@@ -157,6 +159,12 @@ def parse_log_text(text: str) -> ParsedLog:
             parsed.latest_update = update
             parsed.weight_version = int(metrics_match.group("version"))
             parsed.update_metrics[update] = _safe_literal_dict(metrics_match.group("metrics"))
+            continue
+
+        reward_summary_match = REWARD_SUMMARY_RE.search(line)
+        if reward_summary_match:
+            update = int(reward_summary_match.group("update"))
+            parsed.reward_summary[update] = _safe_literal_dict(reward_summary_match.group("summary"))
             continue
 
         timing_match = UPDATE_TIMING_RE.search(line)
@@ -281,10 +289,12 @@ def build_snapshot(*, log_path: Path, buffer_dir: Path | None = None) -> dict[st
     latest_update_idx = max(parsed.update_timings) if parsed.update_timings else None
     latest_update_timing = None
     latest_update_metrics: dict[str, float] | None = None
+    latest_reward_summary: dict[str, float] | None = None
     latest_step_timing: dict[str, float] | None = None
     if latest_update_idx is not None:
         latest_update_timing = parsed.update_timings[latest_update_idx]
         latest_update_metrics = parsed.update_metrics.get(latest_update_idx, {})
+        latest_reward_summary = parsed.reward_summary.get(latest_update_idx, {})
         latest_step_timing = parsed.step_timing_parts.get(latest_update_idx, {})
 
     max_updates = parsed.max_updates or 0
@@ -313,6 +323,7 @@ def build_snapshot(*, log_path: Path, buffer_dir: Path | None = None) -> dict[st
         "latest_update": {
             "timing": vars(latest_update_timing) if latest_update_timing is not None else None,
             "metrics": latest_update_metrics,
+            "reward_summary": latest_reward_summary,
             "step_timing_parts": latest_step_timing,
         },
         "actor_stats": {
@@ -396,6 +407,7 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
                     f"load {timing['load_s']:.2f}s, prepare {timing['prepare_s']:.2f}s, save {timing['save_s']:.2f}s"
                 ),
                 f"- Latest metrics: `{json.dumps(latest_update['metrics'] or {}, ensure_ascii=True, sort_keys=True)}`",
+                f"- Latest reward summary: `{json.dumps(latest_update['reward_summary'] or {}, ensure_ascii=True, sort_keys=True)}`",
                 f"- Latest step timing: `{json.dumps(latest_update['step_timing_parts'] or {}, ensure_ascii=True, sort_keys=True)}`",
             ]
         )

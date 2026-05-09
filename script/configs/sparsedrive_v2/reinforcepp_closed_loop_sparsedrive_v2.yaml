@@ -19,6 +19,10 @@ env:
   reward:
     mode: step_path
     dt: 0.5
+    # Dense reward is split as:
+    #   reward = gated_positive_reward - cost_reward
+    # Positive terms come from progress/completion.
+    # Cost terms come from tracking and comfort penalties.
     path:
       interp_ds_m: 0.25
       w_progress: 1.0
@@ -34,6 +38,9 @@ env:
       w_yaw: 0.1
       yaw_free_deg: 5.0
       yaw_huber_delta_deg: 10.0
+      severe_lateral_error_m: 3.0
+      severe_yaw_error_deg: 30.0
+      severe_gate_scale: 0.0
       
       w_anchor_progress: 0.0
       w_anchor_lateral: 0.0
@@ -48,6 +55,9 @@ env:
       yaw_jerk_delta: 0.3
       jerk_clip: 50.0
     collision:
+      # constraint_gate only gates positive dense reward; it does not erase costs.
+      mode: constraint_gate
+      gate_scale: 0.0
       w_static: 5.0
       w_dynamic: 5.0
     logging:
@@ -55,6 +65,7 @@ env:
         enable: true
         prefix: rl
     terminal:
+      # Terminal handles episode-level failure; keep this separate from dense shaping/gates.
       enable: true
       xz_err_m_max: 5.0
       yaw_err_deg_max: 45.0

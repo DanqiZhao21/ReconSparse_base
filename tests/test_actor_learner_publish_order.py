@@ -53,6 +53,7 @@ def test_publish_failure_does_not_consume_shards_or_bump_version(tmp_path: Path)
         reward_count=1,
         done_sum=0.0,
         done_count=1,
+        reward_summary={},
         batch={
             "ret": torch.tensor([1.0], dtype=torch.float32),
             "adv": torch.tensor([0.5], dtype=torch.float32),

@@ -10,6 +10,55 @@ from framework.rollout.timing import build_rollout_timing, extract_env_timing
 from framework.utils.obs import obs_to_tensor
 
 
+def _reward_summary_defaults() -> Dict[str, float]:
+    return {
+        "reward_sum": 0.0,
+        "positive_reward_sum": 0.0,
+        "gated_positive_reward_sum": 0.0,
+        "cost_reward_sum": 0.0,
+        "safety_gate_active_count": 0.0,
+        "collision_gate_count": 0.0,
+        "severe_tracking_lateral_gate_count": 0.0,
+        "severe_tracking_yaw_gate_count": 0.0,
+        "terminal_failure_count": 0.0,
+        "terminal_timeout_count": 0.0,
+        "terminal_env_done_count": 0.0,
+        "step_count": 0.0,
+    }
+
+
+def _accumulate_reward_summary(summary: Dict[str, float], info: Any, *, reward: float) -> None:
+    summary["reward_sum"] += float(reward)
+    summary["step_count"] += 1.0
+    if not isinstance(info, dict):
+        return
+    summary["positive_reward_sum"] += float(info.get("positive_reward", 0.0) or 0.0)
+    summary["gated_positive_reward_sum"] += float(info.get("gated_positive_reward", 0.0) or 0.0)
+    summary["cost_reward_sum"] += float(info.get("cost_reward", 0.0) or 0.0)
+    if bool(info.get("safety_gate_active", False)):
+        summary["safety_gate_active_count"] += 1.0
+    gate_sources = info.get("safety_gate_sources", [])
+    if isinstance(gate_sources, (list, tuple)):
+        gate_source_set = {str(item) for item in gate_sources}
+    elif gate_sources:
+        gate_source_set = {str(gate_sources)}
+    else:
+        gate_source_set = set()
+    if "collision_constraint" in gate_source_set:
+        summary["collision_gate_count"] += 1.0
+    if "severe_tracking_lateral" in gate_source_set:
+        summary["severe_tracking_lateral_gate_count"] += 1.0
+    if "severe_tracking_yaw" in gate_source_set:
+        summary["severe_tracking_yaw_gate_count"] += 1.0
+    terminal_kind = str(info.get("terminal_kind", "") or "")
+    if terminal_kind == "failure":
+        summary["terminal_failure_count"] += 1.0
+    elif terminal_kind == "timeout":
+        summary["terminal_timeout_count"] += 1.0
+    elif terminal_kind == "env_done":
+        summary["terminal_env_done_count"] += 1.0
+
+
 def _default_obs_tensor(obs: Any) -> torch.Tensor:
     try:
         return obs_to_tensor(obs, device=torch.device("cpu")).squeeze(0).detach().cpu()
@@ -103,6 +152,7 @@ def collect_single_env_shard(
     next_obs_after = obs
     step_records: List[Dict[str, float]] = []
     counters: Dict[str, int] = {"done_count": 0, "reset_count": 0}
+    reward_summary = _reward_summary_defaults()
 
     step_count = 0
     collect_t0 = time.perf_counter()
@@ -122,6 +172,7 @@ def collect_single_env_shard(
         step_timing.update(extract_env_timing(_info))
         done = bool(terminated or truncated)
         next_obs_after = obs
+        _accumulate_reward_summary(reward_summary, _info, reward=float(reward))
 
         obs_buf.append(obs_t)
         old_logp_buf.append(logp.detach().cpu().float())
@@ -174,6 +225,7 @@ def collect_single_env_shard(
             "time": float(time.time()),
             "shard_idx": int(shard_idx),
             "timing": timing,
+            "reward_summary": reward_summary,
         },
     }
     if next_value_feature is not None:
@@ -208,6 +260,7 @@ def collect_vector_env_shards(
     last_terminateds: List[float] = [1.0 for _ in range(int(num_envs_per_actor))]
     step_records_by_env: List[List[Dict[str, float]]] = [[] for _ in range(int(num_envs_per_actor))]
     counters_by_env: List[Dict[str, int]] = [{"done_count": 0, "reset_count": 0} for _ in range(int(num_envs_per_actor))]
+    reward_summaries_by_env: List[Dict[str, float]] = [_reward_summary_defaults() for _ in range(int(num_envs_per_actor))]
 
     step_count = 0
     collect_t0 = time.perf_counter()
@@ -247,6 +300,7 @@ def collect_vector_env_shards(
             old_logp_bufs[i].append(logps[i].detach().cpu().float())
             replay_bufs[i].append(replays[i])
             rew_bufs[i].append(float(reward_list[i]))
+            _accumulate_reward_summary(reward_summaries_by_env[i], _info_list[i], reward=float(reward_list[i]))
             done_bufs[i].append(1.0 if step_done[i] else 0.0)
             terminated_bufs[i].append(1.0 if bool(term_list[i]) else 0.0)
             truncated_bufs[i].append(1.0 if bool(trunc_list[i]) else 0.0)
@@ -301,6 +355,7 @@ def collect_vector_env_shards(
                     "time": float(time.time()),
                     "shard_idx": int(shard_idx_per_env[i]),
                     "timing": timing,
+                    "reward_summary": reward_summaries_by_env[i],
                 },
             }
         )

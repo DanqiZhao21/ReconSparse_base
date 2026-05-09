@@ -14,8 +14,9 @@ class LoadedShardBatch:
     reward_count: int
     done_sum: float
     done_count: int
+    reward_summary: Dict[str, float]
 
-
+#给PPO分支使用
 def compute_gae(
     *,
     rewards: torch.Tensor,
@@ -56,7 +57,7 @@ def compute_gae(
     ret = adv + values
     return adv, ret
 
-
+#给非PPO分支使用
 def compute_returns(*, rewards: torch.Tensor, dones: torch.Tensor, gamma: float) -> torch.Tensor:
     if rewards.ndim != 1 or dones.ndim != 1:
         raise ValueError("compute_returns expects 1D tensors (T,)")
@@ -126,6 +127,7 @@ def build_training_batch(
     reward_count = 0
     done_sum = 0.0
     done_count = 0
+    reward_summary_totals: Dict[str, float] = {}
 
     is_ppo_family = str(algo_key).startswith("ppo")
     value_module = getattr(value_net, "module", value_net)
@@ -158,6 +160,14 @@ def build_training_batch(
                 reward_count += int(rewards_i.numel())
                 done_sum += float(dones_i.detach().sum().cpu().item())
                 done_count += int(dones_i.numel())
+                meta_i = shard.get("meta", {}) or {}
+                reward_summary_i = meta_i.get("reward_summary", {}) or {}
+                if isinstance(reward_summary_i, dict):
+                    for key, value in reward_summary_i.items():
+                        try:
+                            reward_summary_totals[str(key)] = reward_summary_totals.get(str(key), 0.0) + float(value)
+                        except Exception:
+                            continue
 
                 done_last = float(shard.get("done_last", float(dones_i[-1].item() if dones_i.numel() else 1.0)))
                 terminated_last = float(
@@ -221,6 +231,14 @@ def build_training_batch(
                 reward_count += int(rewards_i.numel())
                 done_sum += float(dones_i.detach().sum().cpu().item())
                 done_count += int(dones_i.numel())
+                meta_i = shard.get("meta", {}) or {}
+                reward_summary_i = meta_i.get("reward_summary", {}) or {}
+                if isinstance(reward_summary_i, dict):
+                    for key, value in reward_summary_i.items():
+                        try:
+                            reward_summary_totals[str(key)] = reward_summary_totals.get(str(key), 0.0) + float(value)
+                        except Exception:
+                            continue
 
                 ret_i = compute_returns(rewards=rewards_i, dones=dones_i, gamma=float(gamma))
                 adv_i = ret_i# no baseline
@@ -266,6 +284,7 @@ def build_training_batch(
         reward_count=int(reward_count),
         done_sum=float(done_sum),
         done_count=int(done_count),
+        reward_summary=dict(reward_summary_totals),
     )
 
 

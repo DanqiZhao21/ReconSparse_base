@@ -120,3 +120,44 @@ def test_legacy_reinforcepp_grpo_fields_still_backfill_when_shared_grpo_missing(
     assert learner_cfg.grpo_debug_dir == "legacy/grpo"
     assert learner_cfg.grpo_debug_max_batches == 4
     assert learner_cfg.grpo_debug_top_k == 2
+
+
+def test_grpo_only_algorithm_builds_policy_only_learner_config() -> None:
+    from framework.runner.learner_factory import build_algorithm_bundle
+
+    class Agent:
+        def __init__(self) -> None:
+            self.trainable_module = __import__("torch").nn.Linear(1, 1)
+
+    cfg = {
+        "train": {
+            "algo": "grpo_only",
+            "policy_lr": 1.0e-5,
+            "clip_eps": 0.2,
+            "minibatch_size": 4,
+            "actor_learner": {"mode": "async", "num_actors": 1, "shards_per_update": 1},
+            "grpo": {"enable": True, "coef": 1.0, "num_candidates": 8},
+        }
+    }
+
+    algo, value_net, meta = build_algorithm_bundle(
+        cfg,
+        agent=Agent(),
+        device=__import__("torch").device("cpu"),
+        ddp_enabled=False,
+        world_size=1,
+        rank=0,
+    )
+    learner_cfg = actor_learner_lightning_config_from_algorithm(
+        algo,
+        train_cfg=cfg["train"],
+        actor_learner_cfg=cfg["train"]["actor_learner"],
+        algo_meta=meta,
+    )
+
+    assert value_net is None
+    assert meta["algo_key"] == "grpo_only"
+    assert learner_cfg.algo_kind == "grpo_only"
+    assert learner_cfg.grpo_enabled is True
+    assert learner_cfg.grpo_coef == 1.0
+    assert learner_cfg.include_obs is False

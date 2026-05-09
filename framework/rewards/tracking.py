@@ -72,6 +72,11 @@ class TrackingRewardComputer:
         collision_cfg = cfg.get("collision", {}) or {}
         return collision_cfg if isinstance(collision_cfg, dict) else {}
 
+    def _collision_mode(self) -> str:
+        collision_cfg = self._collision_cfg()
+        mode = collision_cfg.get("mode", "constraint_gate")
+        return str(mode).strip().lower() or "constraint_gate"
+
     def _terminal_cfg(self) -> Dict[str, Any]:
         cfg = self.reward_cfg or {}
         terminal_cfg = cfg.get("terminal", {}) or {}
@@ -231,11 +236,34 @@ class TrackingRewardComputer:
         yaw_excess_deg = max(0.0, float(yaw_path_err_deg) - yaw_free_deg)
         yaw_penalty = _huber(yaw_excess_deg, yaw_delta_deg)
         yaw_term = float(path_cfg.get("w_yaw", cfg.get("w_heading", 0.0))) * yaw_penalty
-        #碰撞惩罚
+        #碰撞约束
         static_collision = bool(info.get("static_collision", False)) if isinstance(info, dict) else False
         dynamic_collision = bool(info.get("dynamic_collision", False)) if isinstance(info, dict) else False
-        static_collision_penalty = float(collision_cfg.get("w_static", cfg.get("w_static", 5.0))) if static_collision else 0.0
-        dynamic_collision_penalty = float(collision_cfg.get("w_dynamic", cfg.get("w_dynamic", 5.0))) if dynamic_collision else 0.0
+        collision_mode = self._collision_mode()
+        static_collision_penalty = 0.0
+        dynamic_collision_penalty = 0.0
+        safety_gate_active = False
+        safety_gate_scale = 1.0
+        safety_gate_sources: list[str] = []
+        if collision_mode == "dense_penalty":
+            static_collision_penalty = float(collision_cfg.get("w_static", cfg.get("w_static", 5.0))) if static_collision else 0.0
+            dynamic_collision_penalty = float(collision_cfg.get("w_dynamic", cfg.get("w_dynamic", 5.0))) if dynamic_collision else 0.0
+        elif static_collision or dynamic_collision:
+            safety_gate_active = True
+            safety_gate_scale = min(float(safety_gate_scale), float(collision_cfg.get("gate_scale", 0.0)))
+            safety_gate_sources.append("collision_constraint")
+
+        severe_gate_scale = float(path_cfg.get("severe_gate_scale", cfg.get("severe_gate_scale", 0.0)))
+        severe_lateral_error_m = path_cfg.get("severe_lateral_error_m", cfg.get("severe_lateral_error_m", None))
+        severe_yaw_error_deg = path_cfg.get("severe_yaw_error_deg", cfg.get("severe_yaw_error_deg", None))
+        if severe_lateral_error_m is not None and float(lateral_error_m) > float(severe_lateral_error_m):
+            safety_gate_active = True
+            safety_gate_scale = min(float(safety_gate_scale), float(severe_gate_scale))
+            safety_gate_sources.append("severe_tracking_lateral")
+        if severe_yaw_error_deg is not None and float(yaw_path_err_deg) > float(severe_yaw_error_deg):
+            safety_gate_active = True
+            safety_gate_scale = min(float(safety_gate_scale), float(severe_gate_scale))
+            safety_gate_sources.append("severe_tracking_yaw")
 
         jerk_clip = float(comfort_cfg.get("jerk_clip", cfg.get("jerk_clip", 50.0)))
         jerk = 0.0
@@ -281,18 +309,18 @@ class TrackingRewardComputer:
 #TODO:
         anchor_progress_term = 0.0
         anchor_lateral_term = 0.0
-        reward = (
-            progress_term
-            + completion_ratio_term
-            - lateral_term
-            - yaw_term
-            - static_collision_penalty
-            - dynamic_collision_penalty
-            - jerk_term
-            - yaw_jerk_term
-            + anchor_progress_term
-            - anchor_lateral_term
+        positive_reward = progress_term + completion_ratio_term + anchor_progress_term
+        cost_reward = (
+            lateral_term
+            + yaw_term
+            + static_collision_penalty
+            + dynamic_collision_penalty
+            + jerk_term
+            + yaw_jerk_term
+            + anchor_lateral_term
         )
+        gated_positive_reward = positive_reward * float(safety_gate_scale)
+        reward = gated_positive_reward - cost_reward
 
         out_info = dict(info or {})
         out_info.update(
@@ -306,6 +334,9 @@ class TrackingRewardComputer:
                 "completion_ratio": float(completion_ratio),
                 "progress_delta_s": float(progress_delta_s),
                 "progress_reward": float(progress_reward),
+                "positive_reward": float(positive_reward),
+                "gated_positive_reward": float(gated_positive_reward),
+                "cost_reward": float(cost_reward),
                 "progress_term": float(progress_term),#####
                 "completion_ratio_bonus": float(completion_ratio_bonus),
                 "completion_ratio_term": float(completion_ratio_term),
@@ -325,8 +356,15 @@ class TrackingRewardComputer:
                 "yaw_jerk_term": float(yaw_jerk_term),#####
                 "static_collision": bool(static_collision),
                 "dynamic_collision": bool(dynamic_collision),
+                "collision_mode": str(collision_mode),
                 "static_collision_penalty": float(static_collision_penalty),
                 "dynamic_collision_penalty": float(dynamic_collision_penalty),
+                "safety_gate_active": bool(safety_gate_active),
+                "safety_gate_scale": float(safety_gate_scale),
+                "safety_gate_source": "+".join(safety_gate_sources),
+                "safety_gate_sources": list(safety_gate_sources),
+                "severe_lateral_error_m": None if severe_lateral_error_m is None else float(severe_lateral_error_m),
+                "severe_yaw_error_deg": None if severe_yaw_error_deg is None else float(severe_yaw_error_deg),
                 "anchor_progress_term": float(anchor_progress_term),#####
                 "anchor_lateral_term": float(anchor_lateral_term),#####
                 "pos_dev": float(lateral_error_m),

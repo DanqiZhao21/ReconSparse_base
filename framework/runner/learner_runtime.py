@@ -25,6 +25,19 @@ from framework.runner.logging import (
 )
 
 
+def _restore_learner_checkpoint_if_available(*, agent: Any, paths: BufferPaths, stage_fn: Any) -> int:
+    version = read_int(paths.version_file, default=0)
+    if int(version) <= 0 or not os.path.exists(paths.latest_ckpt):
+        return int(version)
+    try:
+        agent.load_checkpoint(paths.latest_ckpt, strict=False)
+        stage_fn(f"[learner] restored published weights ver={int(version)} from {paths.latest_ckpt}")
+    except Exception as exc:
+        stage_fn(f"[learner] failed to restore published weights: {exc}")
+        raise
+    return int(version)
+
+
 def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
     del learner_rank
     train_cfg = cfg.get("train", {}) or {}
@@ -98,6 +111,8 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
                 agent.save_checkpoint(paths.latest_ckpt)
             except Exception as exc:
                 stage(f"[learner] initial save failed: {exc}")
+        else:
+            _restore_learner_checkpoint_if_available(agent=agent, paths=paths, stage_fn=stage)
     if ddp_enabled:
         dist.barrier()
 

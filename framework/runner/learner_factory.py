@@ -150,10 +150,10 @@ def build_algorithm_bundle(
             distill_temperature=float(ppo_cfg.get("distill_temperature", 1.0)),
             teacher_ckpt=_resolve_optional_repo_path(ppo_cfg.get("teacher_ckpt", None)),
         )
-    elif algo_key in {"reinforce++", "reinforce", "reinforcepp", "reinforce_vanilla"}:
+    elif algo_key in {"reinforce++", "reinforce", "reinforcepp", "reinforce_vanilla", "grpo_only"}:
         policy_params = _trainable_parameters(getattr(agent, "trainable_module", None) or agent)
         if len(policy_params) == 0:
-            raise RuntimeError("No trainable policy parameters found for Reinforce")
+            raise RuntimeError("No trainable policy parameters found for policy-gradient learner")
         algo = ReinforcePP(
             clip_eps=clip_eps,
             kl_coef=float(reinforce_cfg.get("kl_coef", rpp_cfg.get("kl_coef", 0.0))) if algo_key in {"reinforce_kl", "reinforcepp"} else 0.0,

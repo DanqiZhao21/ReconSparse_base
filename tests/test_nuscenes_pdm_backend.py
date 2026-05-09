@@ -71,6 +71,114 @@ def test_policy_pdm_score_hook_accepts_numpy_backend_scores(monkeypatch) -> None
     assert tuple(scores.shape) == (1, 2)
 
 
+def test_sparsedrivev2_replay_sampling_forwards_observations_as_one_batch(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    policy._execute_mode = "first_step"
+    policy._model = torch.nn.Linear(1, 1)
+    forward_batch_sizes = []
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    def fake_build_features(observation):
+        idx = int(observation["idx"])
+        return {
+            "camera_feature": {
+                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
+                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
+            },
+            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
+            "feature_missing_fields": [],
+        }
+
+    def fake_forward_policy(features_dev):
+        forward_batch_sizes.append(int(features_dev["status_feature"].shape[0]))
+        batch_size = int(features_dev["status_feature"].shape[0])
+        scores = torch.arange(batch_size * 2, dtype=torch.float32).reshape(batch_size, 2)
+        trajs = torch.zeros((batch_size, 2, 3, 3), dtype=torch.float32)
+        trajs[:, :, 0, 0] = torch.arange(batch_size, dtype=torch.float32).view(batch_size, 1)
+        trajs[:, 1, 0, 1] = 10.0
+        return {
+            "candidate_scores": scores,
+            "candidate_trajectories": trajs,
+        }
+
+    monkeypatch.setattr(policy, "_build_features", fake_build_features)
+    monkeypatch.setattr(policy, "_forward_policy", fake_forward_policy)
+
+    actions, logps, replays = policy.sample_sparsedrivev2_with_replay_batch(
+        [{"idx": 0}, {"idx": 1}, {"idx": 2}],
+        mode_select="greedy",
+    )
+
+    assert forward_batch_sizes == [3]
+    assert len(actions) == 3
+    assert len(logps) == 3
+    assert len(replays) == 3
+    assert [int(rep["mode_idx"]) for rep in replays] == [1, 1, 1]
+    assert [tuple(rep["status_feature"].shape) for rep in replays] == [(1, 8), (1, 8), (1, 8)]
+
+
+def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    policy._model = torch.nn.Linear(1, 1)
+    forward_calls = 0
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    replays = [
+        {
+            "camera_feature": {
+                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
+                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
+            },
+            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
+            "mode_idx": idx % 3,
+        }
+        for idx in range(2)
+    ]
+
+    def fake_forward_policy_on_model(model, features_dev):
+        del model
+        nonlocal forward_calls
+        forward_calls += 1
+        batch_size = int(features_dev["status_feature"].shape[0])
+        scores = torch.tensor(
+            [[0.1, 0.4, 0.2], [0.9, 0.3, 0.7]],
+            dtype=torch.float32,
+        )[:batch_size]
+        trajs = torch.arange(batch_size * 3 * 4 * 3, dtype=torch.float32).reshape(batch_size, 3, 4, 3)
+        return {
+            "candidate_scores": scores,
+            "candidate_trajectories": trajs,
+        }
+
+    monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
+
+    fused = policy.replay_policy_outputs_from_replay_batch(
+        replays,
+        num_candidates=2,
+        candidate_select="topk",
+    )
+
+    assert forward_calls == 1
+
+    forward_calls = 0
+    expected_logp = policy.logp_from_replay_batch(replays)
+    expected_candidates = policy.sample_counterfactual_trajectories_from_replay_batch(
+        replays,
+        num_candidates=2,
+        candidate_select="topk",
+    )
+
+    assert forward_calls == 2
+    assert torch.allclose(fused["new_logp"], expected_logp)
+    assert torch.allclose(fused["counterfactual"]["log_probs"], expected_candidates["log_probs"])
+    assert torch.equal(fused["counterfactual"]["mode_indices"], expected_candidates["mode_indices"])
+    assert torch.allclose(fused["counterfactual"]["traj_xyyaw"], expected_candidates["traj_xyyaw"])
+
+
 def test_nuscenes_pdm_backend_returns_batch_candidate_scores(tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
@@ -92,6 +200,114 @@ def test_nuscenes_pdm_backend_returns_batch_candidate_scores(tmp_path: Path) -> 
 
     assert isinstance(scores, np.ndarray)
     assert scores.shape == (1, 2)
+
+
+def test_nuscenes_pdm_backend_drivable_area_only_score_ignores_other_terms(monkeypatch, tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path, score_mode="drivable_area_only")
+
+    def fake_map_metrics(**kwargs):
+        del kwargs
+        return {
+            "drivable_area": np.asarray([1.0, 0.0], dtype=np.float32),
+            "lane_keeping": np.asarray([0.0, 1.0], dtype=np.float32),
+            "driving_direction": np.asarray([0.0, 1.0], dtype=np.float32),
+        }
+
+    monkeypatch.setattr(scorer, "_batch_map_metrics", fake_map_metrics)
+    monkeypatch.setattr(
+        scorer,
+        "_batch_collision_ttc_metrics",
+        lambda **kwargs: {
+            "no_collision": np.asarray([0.0, 1.0], dtype=np.float32),
+            "ttc": np.asarray([0.0, 1.0], dtype=np.float32),
+        },
+    )
+
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+    sample_context.drivable_polygons = [
+        np.asarray([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)
+    ]
+    static_ctx = dict(sample_context.static_context)
+    candidate_geometry = scorer._build_candidate_geometry_batch(
+        torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+    )
+    sample_scores = scorer._score_candidate_batch_for_sample(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in candidate_geometry.items()},
+        gt_xy_cmp=np.asarray(static_ctx["gt_xy"], dtype=np.float32),
+        gt_yaw_cmp=np.asarray(static_ctx["gt_yaw"], dtype=np.float32),
+        gt_xy_full=np.asarray(static_ctx["gt_xy"], dtype=np.float32),
+        gt_s_full=np.asarray(static_ctx["gt_s"], dtype=np.float32),
+        gt_total_len=float(static_ctx["gt_total_len"]),
+        dt_s=0.5,
+    )
+
+    assert np.allclose(sample_scores, np.asarray([1.0, 0.0], dtype=np.float32))
+
+
+def test_nuscenes_pdm_backend_dac_weight_scores_drivable_area_as_weighted_term(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        progress_weight=0.0,
+        ttc_weight=5.0,
+        lane_keeping_weight=0.0,
+        history_comfort_weight=0.0,
+        dac_weight=5.0,
+        dac_gate_enabled=False,
+        driving_direction_gate_enabled=False,
+    )
+
+    monkeypatch.setattr(
+        scorer,
+        "_batch_map_metrics",
+        lambda **kwargs: {
+            "drivable_area": np.asarray([1.0, 0.0], dtype=np.float32),
+            "lane_keeping": np.asarray([1.0, 1.0], dtype=np.float32),
+            "driving_direction": np.asarray([1.0, 1.0], dtype=np.float32),
+        },
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_batch_collision_ttc_metrics",
+        lambda **kwargs: {
+            "no_collision": np.asarray([1.0, 1.0], dtype=np.float32),
+            "ttc": np.asarray([1.0, 1.0], dtype=np.float32),
+        },
+    )
+
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+    sample_context.drivable_polygons = [
+        np.asarray([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], dtype=np.float32)
+    ]
+    static_ctx = dict(sample_context.static_context)
+    candidate_geometry = scorer._build_candidate_geometry_batch(
+        torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+    )
+    sample_scores = scorer._score_candidate_batch_for_sample(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in candidate_geometry.items()},
+        gt_xy_cmp=np.asarray(static_ctx["gt_xy"], dtype=np.float32),
+        gt_yaw_cmp=np.asarray(static_ctx["gt_yaw"], dtype=np.float32),
+        gt_xy_full=np.asarray(static_ctx["gt_xy"], dtype=np.float32),
+        gt_s_full=np.asarray(static_ctx["gt_s"], dtype=np.float32),
+        gt_total_len=float(static_ctx["gt_total_len"]),
+        dt_s=0.5,
+    )
+
+    assert np.allclose(sample_scores, np.asarray([1.0, 0.5], dtype=np.float32))
 
 
 def test_nuscenes_pdm_backend_builds_candidate_geometry_in_candidate_batch(tmp_path: Path) -> None:

@@ -18,10 +18,28 @@
 - 统一使用 path-based smooth reward 计算，不再保留旧的 legacy reward 分支。
 - 把 expert clip 视作 path，而不是严格的逐时刻监督点。
 - 计算 ego 在 densify 后 path 上的投影进度 `progress_s` 和增量 `progress_delta_s`。
-- 对横向偏移 `lateral_error_m` 和路径朝向误差 `yaw_path_err_deg` 使用带死区的平滑惩罚。
-- 对纵向 jerk 和 yaw jerk 使用带死区的舒适度惩罚。
+- 把 dense reward 显式拆成 `positive_reward` 和 `cost_reward`：
+  - `positive_reward` 主要来自 progress / completion / anchor progress
+  - `cost_reward` 主要来自 lateral / yaw / comfort / dense collision penalty
+- `collision.mode=constraint_gate` 时，碰撞不再直接扣 dense reward，而是只门控正向收益。
+- 还支持对严重横向偏差或严重朝向偏差触发 `severe_gate_scale`，同样只门控正向收益。
 - 在 episode 结束时，可根据 failure、timeout 或 env_done 再施加 terminal penalty。
-- 奖励输出不仅有 reward，还会把各个分项、路径指标和碰撞指标写回 info，方便调试和记录。
+- 奖励输出不仅有 reward，还会把各个分项、gate 来源和路径指标写回 info，方便调试和记录。
+
+## 推荐分层职责
+
+- `step reward`:
+  - 提供 dense learning signal
+  - 鼓励沿路径推进、靠近终点、保持平顺
+- `constraint gate`:
+  - 用于 collision / severe tracking 这类约束事件
+  - 只削弱正向收益，不洗白已有代价
+- `terminal penalty`:
+  - 用于 episode-level failure / timeout / success 边界
+  - 表达“这局结束得好不好”
+- `PDM / GRPO scorer`:
+  - 用于轨迹级偏好和候选排序
+  - 不要和 step reward 混成一套手调加减法
 
 ## 训练时如何经过这里
 

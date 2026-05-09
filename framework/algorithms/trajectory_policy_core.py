@@ -118,7 +118,7 @@ def compute_ppo_objective(
     approx_kl = ((ratio - 1.0) - log_ratio).mean()
     loss = loss_pi + float(vf_coef) * loss_v + float(kl_coef) * approx_kl
     return TrajectoryPPOObjective(
-        loss=loss,
+        loss=loss,           
         loss_pi=loss_pi,
         loss_v=loss_v,
         approx_kl=approx_kl,
