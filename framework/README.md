@@ -11,9 +11,71 @@
 - 通过文件缓冲区完成 actor 和 learner 之间的异步协作。
 - 用 Lightning 管理训练循环、日志、checkpoint 和权重版本切换。
 
+## 训练入口
+
+当前有两种主入口：
+
+### 1. 仅训练
+
+入口是 `script/train_actor_learner_v2.py`。它只负责拉起 actor-learner 训练，不做自动评估。
+
+```bash
+cd /root/clone/ReconDreamer-RL
+
+PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
+  --role orchestrator \
+  --config script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+```
+
+默认运行目录会放在：
+
+```text
+outputs/actor_learner/<timestamp>_<run_name>/
+```
+
+其中会包含：
+
+- `buffer/shards/`
+- `buffer/consumed/`
+- `weights/latest.ckpt`
+- `weights/version.txt`
+- 本轮实际生效的 YAML 配置
+
+### 2. 训练 + 自动评估
+
+入口是 `script/run_train_eval_pipeline.sh`，或者直接调用 `script/train_eval_pipeline.py`。它会先训练，再把最新 checkpoint 自动送去评估。
+
+默认只跑 `reinforcepp`：
+
+```bash
+cd /root/clone/ReconDreamer-RL
+
+PYTHONPATH=/root/clone/ReconDreamer-RL \
+python -u script/train_eval_pipeline.py \
+  --reinforcepp-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+```
+
+如果要额外跑 PPO，再加 `--ppo`：
+
+```bash
+PYTHONPATH=/root/clone/ReconDreamer-RL \
+python -u script/train_eval_pipeline.py \
+  --ppo \
+  --ppo-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/xxx.yaml \
+  --reinforcepp-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+```
+
+自动 train + eval 的运行结果会放在：
+
+```text
+outputs/TrainEvaluationAuto/<run_id>/
+```
+
+其中训练阶段会在该 run 目录下生成 `actor_learner/`，评估结果则写到 HUGSIM-ORI 的 `outputs/evaluate-auto/` 下。
+
 ## 主训练链路
 
-当前主入口是 `script/train_actor_learner_v2.py`。整体运行流程可以概括为：
+仅训练这条链路的核心流程可以概括为：
 
 1. `runner/config_normalization.py` 先规范化 actor-learner 相关配置。
 2. `runner/orchestrator.py`、`runner/actor_runtime.py`、`runner/learner_runtime.py` 分别负责 orchestrator、actor、learner 三类角色。
@@ -26,13 +88,7 @@
 
 简化后的数据流如下：
 
-`script/train_actor_learner_v2.py`
--> `runner/`
--> `rollout/` + `io/`
--> `batch/`
--> `algorithms/` + `lightning/`
--> 新权重
--> Actor
+`script/train_actor_learner_v2.py -> runner -> rollout + io -> batch -> algorithms + lightning -> 新权重 -> Actor`
 
 ## 目录分工
 

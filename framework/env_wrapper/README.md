@@ -46,8 +46,9 @@
 
 ## 训练时如何经过这里
 
-`runner/env_factory.py` 会调用 make_scene_sampling_env 构建环境。随后：
+`runner/env_factory.py` 会调用 `make_scene_sampling_env` 或直接构建 `RLReconEnv`。随后：
 
-- Actor 在 rollout/collector.py 中不断对这里的环境调用 step。
-- rl_wrapper.py 会在每一步把仿真结果转成 RL 能理解的 reward 和终止信号。
-- 若开启多进程环境，则 subproc_vec_env.py 负责把这些 step 和 reset 分发到各 worker。
+- Actor 在 `rollout/collector.py` 中不断对这里的环境调用 step。
+- `rl_wrapper.py` 会在每一步把仿真结果转成 RL 能理解的 reward 和终止信号。
+- `rewards/tracking.py` 负责具体 reward 细节，环境包装器只负责把它接到 step 流程里。
+- 若开启多进程环境，则 `subproc_vec_env.py` 负责把这些 step 和 reset 分发到各 worker。

@@ -56,7 +56,7 @@ Torch C++ 扩展加载补丁。
 
 训练过程中最常见的路径是：
 
-- Agent 和 runner 通过 repo_paths.py 找模型和配置。
-- rollout 或 value net 通过 obs.py 处理图像观测。
-- 环境渲染和相关测试通过 gsplat_backend.py、gsplat_warmup.py、torch_extension.py 保障 CUDA 扩展可用。
-- reward 相关地图缓存则依赖 build_metrics_cache.py 预处理产物。
+- `runner/agent_factory.py` 和 `runner/launch_env.py` 通过 `repo_paths.py` 找模型和配置。
+- `rollout/collector.py` 和 value net 通过 `obs.py` 处理图像观测。
+- 环境渲染和相关测试通过 `gsplat_backend.py`、`gsplat_warmup.py`、`torch_extension.py` 保障 CUDA 扩展可用。
+- reward 相关地图缓存则依赖 `build_metrics_cache.py` 预处理产物，并被 `env_wrapper/rl_wrapper.py` 消费。

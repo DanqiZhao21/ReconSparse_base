@@ -93,12 +93,13 @@ Learner 算法组件构建。
 
 ## 训练时如何经过这里
 
-`script/train_actor_learner_v2.py` 会先进入这个目录：
+`script/train_actor_learner_v2.py` 和 `script/train_eval_pipeline.py` 的训练阶段都会进入这个目录：
 
 1. `config_normalization.py` 先补齐 actor-learner 相关配置。
 2. `orchestrator.py` 负责拉起 learner / actor 进程。
 3. `actor_runtime.py` 和 `learner_runtime.py` 分别进入采样与训练主循环。
 4. `agent_factory.py`、`env_factory.py`、`learner_factory.py` 提供运行时所需对象。
 5. `launch_env.py` 为子进程准备可运行的 Python 和 CUDA 环境。
+6. `train_eval_pipeline.py` 会先准备一份按 run 目录落盘的训练配置，再把它交给这里的 orchestrator 执行。
 
 因此这个目录就是 framework 的“总调度台”。

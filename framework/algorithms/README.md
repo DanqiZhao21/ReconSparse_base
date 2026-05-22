@@ -81,10 +81,10 @@ NuScenes 共享工具层，不是独立业务 scorer。
 
 Learner 端主流程大致是：
 
-1. lightning/actor_learner_datamodule.py 选出一批 shard。
+1. `lightning/actor_learner_datamodule.py` 选出一批 shard。
 2. `framework/batch/actor_learner.py` 把 shard 组装成训练 batch。
-3. runner/learner_factory.py 构建 PPO/ReinforcePP 规格对象（仅配置承载，PPO 同时携带 value net）。
-4. runner/learner_runtime.py 组装 Lightning 训练入口，`trajectory_module.py` 负责实际 `training_step`，`actor_learner_module.py` 负责 actor-learner 生命周期钩子。
-5. trajectory_policy_core.py 为 Lightning 模块提供 PPO/Reinforce 目标函数与 metrics 计算。
+3. `runner/learner_factory.py` 构建 PPO/ReinforcePP 规格对象（仅配置承载，PPO 同时携带 value net）。
+4. `runner/learner_runtime.py` 组装 Lightning 训练入口，`trajectory_module.py` 负责实际 `training_step`，`actor_learner_module.py` 负责 actor-learner 生命周期钩子。
+5. `trajectory_policy_core.py` 为 Lightning 模块提供 PPO/Reinforce 目标函数与 metrics 计算。
 
-这里不再保留旧的 algorithm execution driver 文件。当前 canonical 目标函数入口就是 `trajectory_policy_core.py`，batch 组装入口就是 `framework/batch/actor_learner.py`。
+当前 canonical 目标函数入口就是 `trajectory_policy_core.py`，batch 组装入口就是 `framework/batch/actor_learner.py`。

@@ -60,7 +60,7 @@ SparseDriveV2 的 RL 适配器，是当前仓库较新的策略接入层。
 
 ## 训练时如何经过这里
 
-主入口 `script/train_actor_learner_v2.py` 启动后，`runner/agent_factory.py` 会优先进入这个目录构建 Agent。随后：
+训练入口 `script/train_actor_learner_v2.py` 和 `script/train_eval_pipeline.py` 的训练阶段，都会通过 `runner/agent_factory.py` 进入这个目录构建 Agent。随后：
 
 - Actor 进程在 rollout 期间不断调用这里的策略实现来采样动作。
 - Learner 进程在训练时通过 replay 再次进入这里，计算新旧策略概率比值。

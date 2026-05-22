@@ -77,14 +77,14 @@ outputs/TrainEvaluationAuto/<run_id>/
 
 仅训练这条链路的核心流程可以概括为：
 
-1. `runner/config_normalization.py` 先补齐 actor-learner 相关配置。
+1. `runner/config_normalization.py` 先规范化 actor-learner 相关配置。
 2. `runner/orchestrator.py`、`runner/actor_runtime.py`、`runner/learner_runtime.py` 分别负责 orchestrator、actor、learner 三类角色。
 3. Actor 通过 `env_wrapper` 和 `rollout` 不断与环境交互，调用 agent 产出动作、logp 和 replay。
 4. `rollout/collector.py` 把观测、奖励、done、replay 等信息打包成 shard。
-5. `io/buffer.py` 和 `io/shard_policy.py` 负责 shard 写入、筛选、消费与权重版本同步。
+5. `io/buffer.py` 把 shard 写入共享缓冲区，并维护权重版本、消费状态和停止标记；`io/shard_policy.py` 负责 learner 侧 shard 选择策略。
 6. Learner 通过 `lightning/actor_learner_datamodule.py` 读取 shard，交给 `batch/actor_learner.py` 生成训练 batch。
-7. `algorithms/trajectory_policy_core.py` 和 `lightning/trajectory_module.py` 共同完成 PPO 或 ReinforcePP 更新，优化器由 Lightning `configure_optimizers()` 创建。
-8. 更新后的权重重新写回 buffer，Actor 检测到新版本后继续采样。
+7. `algorithms/trajectory_policy_core.py` 和 `lightning/trajectory_module.py` 共同完成 PPO 或 ReinforcePP 更新，`configure_optimizers()` 负责主动优化器构建。
+8. `lightning/actor_learner_module.py` 在 update 结束后保存新权重、推进 version，并让 Actor 检测新版本后继续采样。
 
 简化后的数据流如下：
 

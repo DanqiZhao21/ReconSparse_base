@@ -8,6 +8,7 @@
 - 把 PPO 或 ReinforcePP 的损失计算封装成 LightningModule。
 - 在 `configure_optimizers()` 中主动构建当前 learner 使用的优化器。
 - 在 actor-learner 模式下，把 shard 选择、训练结束后的 checkpoint 回写、WandB 日志等流程接进 Lightning 生命周期。
+- 这里的 actor-learner 专用模块已经是主路径，不是辅助兼容层。
 
 ## 文件说明
 
@@ -52,7 +53,7 @@ Lightning 侧 learner handoff 配置。
 - 会通过 `framework.io.shard_policy` 调用版本过滤、兼容性过滤和 sync/async shard 选择策略，再调用 batch/build_training_batch 生成训练数据。
 - 它连接了 IO 层和 Lightning 层，是 Learner 每次 update 前的第一站。
 - 当 `inner_epochs > 1` 时，它会在同一 update 内复用同一批 shard/batch，只重新走 dataloader 迭代与 minibatch 打乱。
-- 文件名当前继续保留 `actor_learner_*`，是为了明确它服务的是文件缓冲 actor-learner 协议，而不是所有 Lightning 训练场景的通用 datamodule。
+- 文件名保留 `actor_learner_*`，是为了明确它服务的是文件缓冲 actor-learner 协议，而不是所有 Lightning 训练场景的通用 datamodule。
 
 ### actor_learner_module.py
 
@@ -61,7 +62,7 @@ Lightning 侧 learner handoff 配置。
 - 继承 TrajectoryLightningModule，在 epoch 开始和结束时额外处理训练锁、消费 shard、保存权重、递增 version。
 - 还负责把一次 update 的统计信息发到 stage 日志和 WandB。
 - 可以看作“Learner 更新生命周期控制器”。
-- 文件名当前也故意不改成更泛的 `learner_module.py`，因为这一层仍然绑定 actor-learner buffer 协议和版本发布语义。
+- 文件名保留 `actor_learner_*`，因为这一层仍然绑定 actor-learner buffer 协议和版本发布语义。
 
 ## 训练时如何经过这里
 

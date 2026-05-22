@@ -43,4 +43,4 @@
 
 ## 训练时如何经过这里
 
-Actor 调用环境 step 时，env_wrapper/rl_wrapper.py 会把仿真状态传给 TrackingRewardComputer。它返回的 reward 会被 rollout/collector.py 收进 shard，最后进入 Learner 用于计算 return 和 advantage。
+Actor 调用环境 step 时，`env_wrapper/rl_wrapper.py` 会把仿真状态传给 `TrackingRewardComputer`。它返回的 reward 会被 `rollout/collector.py` 收进 shard，最后进入 Learner 用于计算 return 和 advantage。

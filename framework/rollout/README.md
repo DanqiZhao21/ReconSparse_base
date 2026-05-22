@@ -20,4 +20,4 @@ actor 采样核心文件。
 
 ## 训练时如何经过这里
 
-`runner/actor_runtime.py` 中的 Actor 主循环会持续调用这里的函数收集固定 horizon 的轨迹片段。收集完成的 shard 会交给 `io/buffer.py` 写入磁盘，然后等待 Learner 消费。
+`runner/actor_runtime.py` 中的 Actor 主循环会持续调用这里的函数收集固定 horizon 的轨迹片段。收集完成的 shard 会交给 `io/buffer.py` 写入磁盘，然后等待 Learner 消费。这里产出的 shard 也是后续 `batch/actor_learner.py` 组装训练 batch 的直接输入。
