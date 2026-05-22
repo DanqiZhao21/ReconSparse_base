@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
+from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
 
 
 def _write_token2vad(path: Path) -> dict[str, dict[str, object]]:
@@ -44,7 +44,7 @@ def _write_token2vad(path: Path) -> dict[str, dict[str, object]]:
 def test_score_uses_batched_torch_path(monkeypatch, tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
-    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path)
 
     def _raise_if_cpu_detail_path(*args, **kwargs):
         del args, kwargs
@@ -77,7 +77,7 @@ def test_score_uses_batched_torch_path(monkeypatch, tmp_path: Path) -> None:
 def test_score_matches_detail_path_for_mixed_horizon_batch(tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
-    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path)
 
     traj_xyyaw = torch.tensor(
         [
@@ -114,7 +114,7 @@ def test_score_matches_detail_path_for_mixed_horizon_batch(tmp_path: Path) -> No
 def test_detail_path_reuses_static_context_per_sample_token(monkeypatch, tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=tmp_path / "scene_cache",
     )
@@ -185,7 +185,7 @@ def test_detail_path_reuses_static_context_from_disk_across_scorer_instances(
     scene_cache_root = tmp_path / "scene_cache"
     _write_token2vad(token2vad_path)
 
-    scorer_first = NuScenesTokenScorer(
+    scorer_first = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=scene_cache_root,
     )
@@ -236,7 +236,7 @@ def test_detail_path_reuses_static_context_from_disk_across_scorer_instances(
 
     scores_0, _details_0 = scorer_first._score_batch(replays, traj_xyyaw, include_debug_context=False)
 
-    scorer_second = NuScenesTokenScorer(
+    scorer_second = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=scene_cache_root,
     )

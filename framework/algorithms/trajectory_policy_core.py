@@ -55,6 +55,16 @@ def _as_logp_tensor(logp_out: Any, *, device: torch.device) -> torch.Tensor:
     raise TypeError(f"Unsupported logp output type: {type(logp_out)!r}")
 
 
+def _as_score_tensor(scores: Any, *, device: torch.device) -> torch.Tensor:
+    if torch.is_tensor(scores):
+        return scores.to(device=device, dtype=torch.float32)
+    if isinstance(scores, np.ndarray):
+        return torch.from_numpy(scores).to(device=device, dtype=torch.float32)
+    if isinstance(scores, (list, tuple)):
+        return torch.as_tensor(scores, device=device, dtype=torch.float32)
+    raise TypeError(f"Unsupported counterfactual score type: {type(scores)!r}")
+
+
 def agent_logp_from_replay_batch(
     agent: Any,
     replays: Sequence[Dict[str, Any]],
@@ -71,6 +81,26 @@ def agent_logp_from_replay_batch(
 
     vals = [agent.logp_from_replay(rep, eta=float(eta)) for rep in replays]
     return _as_logp_tensor(vals, device=device)
+
+
+def score_counterfactual_trajectories(
+    agent: Any,
+    replays: Sequence[dict[str, Any]],
+    traj_xyyaw: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    scorer_fn = getattr(agent, "pdm_score_counterfactuals_from_replay_batch", None)
+    if not callable(scorer_fn):
+        scorer_fn = getattr(agent, "score_counterfactuals_from_replay_batch", None)
+    if not callable(scorer_fn):
+        raise RuntimeError(
+            "GRPO is enabled but the agent does not expose a counterfactual scorer hook. "
+            "Expected `pdm_score_counterfactuals_from_replay_batch(...)`."
+        )
+
+    scores = scorer_fn(replays, traj_xyyaw)
+    return _as_score_tensor(scores, device=device)
 
 
 '''
@@ -168,9 +198,12 @@ def compute_grpo_objective(
     *,
     candidate_log_probs: torch.Tensor,
     candidate_scores: torch.Tensor,
+    candidate_score_logits: torch.Tensor | None = None,
     score_norm_eps: float = 1e-6,
     use_rank_adv: bool = False,
     score_clip: float | None = None,
+    objective: str = "logprob",
+    temperature: float = 1.0,
 ) -> TrajectoryGRPOObjective:
     if candidate_log_probs.ndim != 2 or candidate_scores.ndim != 2:
         raise ValueError("candidate_log_probs and candidate_scores must both be 2D tensors (batch, candidates)")
@@ -194,7 +227,24 @@ def compute_grpo_objective(
         score_std = scores.std(dim=1, keepdim=True, unbiased=False)
         advantages = (scores - score_mean) / (score_std + float(score_norm_eps))
 
-    loss = -(advantages.detach() * candidate_log_probs).mean()
+    objective_key = str(objective).strip().lower()
+    if objective_key in {"logprob", "reinforce", "grpo"}:
+        loss = -(advantages.detach() * candidate_log_probs).mean()
+    elif objective_key == "expected_prob":
+        logits = candidate_score_logits
+        if logits is None:
+            logits = candidate_log_probs
+        logits = logits.to(device=candidate_log_probs.device, dtype=torch.float32)
+        if tuple(logits.shape) != tuple(candidate_log_probs.shape):
+            raise ValueError(
+                "candidate_score_logits must match candidate_log_probs shape for expected_prob objective; "
+                f"got logits={tuple(logits.shape)} log_probs={tuple(candidate_log_probs.shape)}"
+            )
+        temp = max(1.0e-6, float(temperature))
+        probs = torch.softmax(logits / temp, dim=1)
+        loss = -(probs * advantages.detach()).sum(dim=1).mean()
+    else:
+        raise ValueError(f"Unsupported GRPO objective={objective!r}; expected 'logprob' or 'expected_prob'")
     score_mean = scores.mean(dim=1)
     score_std = scores.std(dim=1, unbiased=False)
     score_min = scores.min(dim=1).values

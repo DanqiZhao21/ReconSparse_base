@@ -1,5 +1,7 @@
 import math
 import bisect
+import pickle
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -9,7 +11,11 @@ from reconsimulator.envs.metrics import oriented_box, EGO_LENGTH, EGO_WIDTH
 from reconsimulator.envs.metrics_cache import load_scene_env_cache
 from shapely.geometry import Polygon
 
+from framework.env_wrapper.map_metrics import compute_craft_map_metrics
 from framework.rewards import TrackingRewardComputer
+from framework.rewards.closed_loop_ea import ClosedLoopEAScorer
+
+_DEFAULT_PDM_CONTEXT_CACHE_ROOT = Path(__file__).resolve().parents[2] / "assets" / "nus" / "cache" / "_sample_pdm_context"
 
 
 class RLReconEnv:
@@ -39,6 +45,8 @@ class RLReconEnv:
             self.env = ReconSimulator(cuda=cuda, scene=scene, debug=bool(debug), render_w=int(render_w), render_h=int(render_h))
         self.reward_cfg = reward_cfg or {}
         self._reward_computer = TrackingRewardComputer(self.reward_cfg)
+        ea_cfg = self.reward_cfg.get("ea", {}) if isinstance(self.reward_cfg, dict) else {}
+        self._closed_loop_ea_scorer = ClosedLoopEAScorer(ea_cfg if isinstance(ea_cfg, dict) else {})
 
         # Step index for aligning with NuScenes keyframes (2Hz → every 5 steps at 10Hz)
         self._step_idx: int = 0
@@ -62,6 +70,7 @@ class RLReconEnv:
         self._env_cache_scene_id: int | None = None
         self._env_cache: Dict[int, Dict[str, Any]] = {}
         self._env_cache_keys: list[int] = []
+        self._pdm_context_cache: Dict[str, Dict[str, Any] | None] = {}
 
     def set_external_plan_local_xyyaw(self, plan: Any) -> None:
         if plan is None:
@@ -143,11 +152,23 @@ class RLReconEnv:
             if not isinstance(snap, dict):
                 return False, False
 
-            # Ego pose in map coordinates (x,z -> map x,y)
-            ego_x = float(self.env.start_ego[:3, 3][0])
-            ego_y = float(self.env.start_ego[:3, 3][2])
-            Rm = self.env.start_ego[:3, :3]
-            ego_yaw = float(math.atan2(float(Rm[2, 0]), float(Rm[0, 0])))
+            # Convert simulator local(front-start) ego pose back to world/map coordinates.
+            # env_cache polygons are in map/world x-y plane.
+            world_pose = None
+            try:
+                cfs = np.asarray(getattr(self.env, "camera_front_start"), dtype=np.float64)
+                local_pose = np.asarray(getattr(self.env, "start_ego"), dtype=np.float64)
+                if cfs.shape == (4, 4) and local_pose.shape == (4, 4):
+                    world_pose = cfs @ local_pose
+            except Exception:
+                world_pose = None
+            if world_pose is None:
+                world_pose = np.asarray(getattr(self.env, "start_ego"), dtype=np.float64)
+
+            ego_x = float(world_pose[0, 3])
+            ego_y = float(world_pose[1, 3])
+            Rm = world_pose[:3, :3]
+            ego_yaw = float(math.atan2(float(Rm[1, 0]), float(Rm[0, 0])))
             ego_poly = oriented_box(ego_x, ego_y, float(EGO_LENGTH), float(EGO_WIDTH), float(ego_yaw))
 
             static_collision = False
@@ -171,8 +192,285 @@ class RLReconEnv:
         except Exception:
             print("⚠️ Warning: failed to compute collision flags from env_cache.")
             return False, False
-    
-#ADD
+
+    @staticmethod
+    def _object_center_xy(obj: Dict[str, Any]) -> np.ndarray | None:
+        center = obj.get("center_xy", None)
+        if center is not None:
+            try:
+                arr = np.asarray(center, dtype=np.float64).reshape(-1)
+                if arr.size >= 2:
+                    return arr[:2].astype(np.float64, copy=False)
+            except Exception:
+                pass
+
+        poly = obj.get("poly", None)
+        if isinstance(poly, list) and len(poly) >= 3:
+            try:
+                pts = np.asarray(poly, dtype=np.float64)
+                if pts.ndim == 2 and pts.shape[0] >= 3 and pts.shape[1] >= 2:
+                    return np.mean(pts[:, :2], axis=0)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _object_half_extent_along(obj: Dict[str, Any], axis_xy: np.ndarray, *, default_half_extent_m: float) -> float:
+        length = obj.get("length_m", None)
+        if length is not None:
+            try:
+                return max(0.0, 0.5 * float(length))
+            except Exception:
+                pass
+
+        poly = obj.get("poly", None)
+        if isinstance(poly, list) and len(poly) >= 3:
+            try:
+                pts = np.asarray(poly, dtype=np.float64)
+                if pts.ndim == 2 and pts.shape[0] >= 3 and pts.shape[1] >= 2:
+                    proj = pts[:, :2] @ np.asarray(axis_xy, dtype=np.float64).reshape(2)
+                    return max(0.0, 0.5 * float(np.max(proj) - np.min(proj)))
+            except Exception:
+                pass
+        return max(0.0, float(default_half_extent_m))
+
+    def _compute_front_obstacle_metrics(self) -> Dict[str, Any]:
+        """Compute nearest in-corridor front obstacle metrics for dense safety reward."""
+        out: Dict[str, Any] = {
+            "front_obstacle_available": False,
+            "front_obstacle_gap_m": float("inf"),
+            "front_obstacle_lateral_m": float("inf"),
+            "front_obstacle_closing_speed_mps": 0.0,
+            "front_obstacle_ttc_s": float("inf"),
+            "front_obstacle_category": "",
+            "front_obstacle_source": "env_cache",
+        }
+        try:
+            safety_cfg = self.reward_cfg.get("safety", {}) if isinstance(self.reward_cfg, dict) else {}
+            if not isinstance(safety_cfg, dict):
+                safety_cfg = {}
+            lookahead_m = max(1.0e-6, float(safety_cfg.get("lookahead_m", 20.0)))
+            corridor_half_width_m = max(1.0e-6, float(safety_cfg.get("corridor_half_width_m", 2.5)))
+            ego_length_m = float(safety_cfg.get("ego_length_m", EGO_LENGTH))
+
+            scene_id = int(getattr(self.env, "scene", 0))
+            step_idx = int(self._step_idx)
+            snap = self._get_env_cache_snapshot(scene_id=scene_id, step_idx=step_idx)
+            if not isinstance(snap, dict):
+                return out
+
+            world_pose = None
+            try:
+                cfs = np.asarray(getattr(self.env, "camera_front_start"), dtype=np.float64)
+                local_pose = np.asarray(getattr(self.env, "start_ego"), dtype=np.float64)
+                if cfs.shape == (4, 4) and local_pose.shape == (4, 4):
+                    world_pose = cfs @ local_pose
+            except Exception:
+                world_pose = None
+            if world_pose is None:
+                world_pose = np.asarray(getattr(self.env, "start_ego"), dtype=np.float64)
+
+            ego_xy = np.asarray([float(world_pose[0, 3]), float(world_pose[1, 3])], dtype=np.float64)
+            Rm = np.asarray(world_pose[:3, :3], dtype=np.float64)
+            ego_yaw = float(math.atan2(float(Rm[1, 0]), float(Rm[0, 0])))
+            ego_forward = np.asarray([math.cos(ego_yaw), math.sin(ego_yaw)], dtype=np.float64)
+            ego_left = np.asarray([-math.sin(ego_yaw), math.cos(ego_yaw)], dtype=np.float64)
+
+            ego_velocity = np.asarray(getattr(self.env, "_status_vel_xy", [0.0, 0.0]), dtype=np.float64).reshape(-1)
+            ego_forward_speed = float(np.dot(ego_velocity[:2], ego_forward)) if ego_velocity.size >= 2 else 0.0
+            ego_half_extent = max(0.0, 0.5 * ego_length_m)
+
+            best: Dict[str, Any] | None = None
+            for obj in snap.get("dynamic_objects", []) or []:
+                if not isinstance(obj, dict):
+                    continue
+                if "vehicle" not in str(obj.get("category", "")).strip().lower():
+                    continue
+                center_xy = self._object_center_xy(obj)
+                if center_xy is None:
+                    continue
+                rel = np.asarray(center_xy, dtype=np.float64).reshape(2) - ego_xy
+                longitudinal_center = float(np.dot(rel, ego_forward))
+                lateral = float(np.dot(rel, ego_left))
+                if longitudinal_center <= 0.0 or abs(lateral) > corridor_half_width_m:
+                    continue
+                obj_half_extent = self._object_half_extent_along(
+                    obj,
+                    ego_forward,
+                    default_half_extent_m=float(safety_cfg.get("default_object_half_length_m", 2.0)),
+                )
+                gap = float(longitudinal_center - ego_half_extent - obj_half_extent)
+                if gap <= 0.0 or gap > lookahead_m:
+                    continue
+                obj_velocity = np.asarray(obj.get("velocity_xy", [0.0, 0.0]), dtype=np.float64).reshape(-1)
+                obj_forward_speed = float(np.dot(obj_velocity[:2], ego_forward)) if obj_velocity.size >= 2 else 0.0
+                closing_speed = max(0.0, ego_forward_speed - obj_forward_speed)
+                ttc_s = float(gap / closing_speed) if closing_speed > 1.0e-6 else float("inf")
+                candidate = {
+                    "front_obstacle_available": True,
+                    "front_obstacle_gap_m": float(gap),
+                    "front_obstacle_lateral_m": float(lateral),
+                    "front_obstacle_closing_speed_mps": float(closing_speed),
+                    "front_obstacle_ttc_s": float(ttc_s),
+                    "front_obstacle_category": str(obj.get("category", "")),
+                    "front_obstacle_source": "env_cache",
+                }
+                if best is None or float(candidate["front_obstacle_gap_m"]) < float(best["front_obstacle_gap_m"]):
+                    best = candidate
+
+            if best is not None:
+                out.update(best)
+            return out
+        except Exception:
+            print("⚠️ Warning: failed to compute front obstacle metrics from env_cache.")
+            return out
+
+    def _pdm_context_cache_root(self, map_cfg: Dict[str, Any]) -> Path:
+        configured = map_cfg.get("pdm_context_cache_root", map_cfg.get("sample_pdm_context_cache_root", None))
+        if configured is not None and str(configured).strip() != "":
+            return Path(str(configured))
+        return _DEFAULT_PDM_CONTEXT_CACHE_ROOT
+
+    def _load_pdm_context_payload(self, *, sample_token: str, cache_root: Path) -> Dict[str, Any] | None:
+        if not hasattr(self, "_pdm_context_cache"):
+            self._pdm_context_cache = {}
+        token = str(sample_token)
+        cache_key = f"{str(cache_root)}::{token}"
+        if cache_key in self._pdm_context_cache:
+            return self._pdm_context_cache[cache_key]
+
+        payload: Dict[str, Any] | None = None
+        try:
+            candidates = sorted(Path(cache_root).glob(f"{token}*.pkl"))
+            for path in candidates:
+                try:
+                    with path.open("rb") as handle:
+                        loaded = pickle.load(handle)
+                except Exception:
+                    continue
+                if isinstance(loaded, dict):
+                    payload = loaded
+                    break
+        except Exception:
+            payload = None
+
+        self._pdm_context_cache[cache_key] = payload
+        return payload
+
+    def _augment_snapshot_from_pdm_context(self, snapshot: Dict[str, Any], *, map_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        sample_token = snapshot.get("sample_token", None)
+        if sample_token is None:
+            return snapshot
+
+        centerlines = snapshot.get("lanes_centerlines", snapshot.get("lane_centerlines", [])) or []
+        drivable_polygons = snapshot.get("drivable_polygons", []) or []
+        if len(centerlines) > 0 and len(drivable_polygons) > 0:
+            return snapshot
+
+        payload = self._load_pdm_context_payload(
+            sample_token=str(sample_token),
+            cache_root=self._pdm_context_cache_root(map_cfg),
+        )
+        if not isinstance(payload, dict):
+            return snapshot
+
+        out = dict(snapshot)
+        if len(centerlines) == 0:
+            pdm_centerlines = payload.get("lane_centerlines", payload.get("lanes_centerlines", [])) or []
+            if len(pdm_centerlines) > 0:
+                out["lanes_centerlines"] = pdm_centerlines
+        if len(drivable_polygons) == 0:
+            pdm_drivable = payload.get("drivable_polygons", []) or []
+            if len(pdm_drivable) > 0:
+                out["drivable_polygons"] = pdm_drivable
+        out["map_metrics_pdm_context_fallback"] = True
+        return out
+
+    def _compute_map_metrics(self) -> Dict[str, Any]:
+        """Compute CRAFT-compatible map metrics using NuScenes env_cache layers."""
+        try:
+            scene_id = int(getattr(self.env, "scene", 0))
+            step_idx = int(self._step_idx)
+            snap = self._get_env_cache_snapshot(scene_id=scene_id, step_idx=step_idx)
+            if not isinstance(snap, dict):
+                return {}
+
+            world_pose = None
+            try:
+                cfs = np.asarray(getattr(self.env, "camera_front_start"), dtype=np.float64)
+                local_pose = np.asarray(getattr(self.env, "start_ego"), dtype=np.float64)
+                if cfs.shape == (4, 4) and local_pose.shape == (4, 4):
+                    world_pose = cfs @ local_pose
+            except Exception:
+                world_pose = None
+            if world_pose is None:
+                world_pose = np.asarray(getattr(self.env, "start_ego"), dtype=np.float64)
+
+            ego_x = float(world_pose[0, 3])
+            ego_y = float(world_pose[1, 3])
+            Rm = world_pose[:3, :3]
+            ego_yaw = float(math.atan2(float(Rm[1, 0]), float(Rm[0, 0])))
+
+            craft_cfg = {}
+            if isinstance(self.reward_cfg, dict):
+                craft_cfg = self.reward_cfg.get("CRAFT", {}) or {}
+            if not isinstance(craft_cfg, dict):
+                craft_cfg = {}
+            map_cfg = craft_cfg.get("map", {}) or {}
+            if not isinstance(map_cfg, dict):
+                map_cfg = {}
+            snap = self._augment_snapshot_from_pdm_context(snap, map_cfg=map_cfg)
+
+            return compute_craft_map_metrics(
+                snap,
+                ego_x=ego_x,
+                ego_y=ego_y,
+                ego_yaw=ego_yaw,
+                ego_length_m=float(map_cfg.get("ego_length_m", EGO_LENGTH)),
+                ego_width_m=float(map_cfg.get("ego_width_m", EGO_WIDTH)),
+                center_dev_max_m=float(map_cfg.get("center_dev_max_m", craft_cfg.get("center_dev_max_m", 2.0))),
+                heading_dev_max_deg=float(map_cfg.get("heading_dev_max_deg", craft_cfg.get("heading_max_deg", 90.0))),
+                reverse_dot_threshold=float(map_cfg.get("reverse_dot_threshold", -0.5)),
+                same_dir_dot_threshold=float(map_cfg.get("same_dir_dot_threshold", 0.2)),
+                same_dir_distance_margin_m=float(map_cfg.get("same_dir_distance_margin_m", 0.75)),
+                opposite_min_lateral_m=float(map_cfg.get("opposite_min_lateral_m", 0.0)),
+            )
+        except Exception:
+            print("⚠️ Warning: failed to compute map metrics from env_cache.")
+            return {}
+
+    def _compute_closed_loop_ea_metrics(self, *, previous_ego_pose: np.ndarray | None = None) -> Dict[str, Any]:
+        try:
+            scorer = getattr(self, "_closed_loop_ea_scorer", None)
+            if scorer is None:
+                ea_cfg = self.reward_cfg.get("ea", {}) if isinstance(self.reward_cfg, dict) else {}
+                scorer = ClosedLoopEAScorer(ea_cfg if isinstance(ea_cfg, dict) else {})
+                self._closed_loop_ea_scorer = scorer
+            ego_velocity_xy = getattr(self.env, "_status_vel_xy", None)
+            return dict(
+                scorer.score_current_step(
+                    scene_id=int(getattr(self.env, "scene", 0)),
+                    frame_idx=int(getattr(self.env, "now_frame", self._step_idx)),
+                    ego_pose=np.asarray(self.env.start_ego, dtype=np.float64),
+                    ego_velocity_xy=ego_velocity_xy,
+                    previous_ego_pose=previous_ego_pose,
+                    camera_front_start=getattr(self.env, "camera_front_start", None),
+                    dt_s=float((self.reward_cfg or {}).get("dt", 0.5)) if isinstance(self.reward_cfg, dict) else 0.5,
+                )
+            )
+        except Exception:
+            return {
+                "ea_enabled": bool(((self.reward_cfg or {}).get("ea", {}) or {}).get("enable", False)) if isinstance(self.reward_cfg, dict) else False,
+                "ea_available": False,
+                "ea_max": 0.0,
+                "ea_min": 0.0,
+                "ea_mean": 0.0,
+                "ea_risk": 0.0,
+                "ea_evaluated_pairs": 0.0,
+                "ea_error": "closed_loop_ea_failed",
+            }
+	    
+	#ADD
     def step(self, action: Tuple[float, float, float, int]):
         # Normalize action to env expected format.
         # Supported runtime actions:
@@ -185,6 +483,12 @@ class RLReconEnv:
             env_action = (x, y, yaw, flag)
         else:
             raise ValueError(f"Unsupported action format (len={len(action)}): {action}")
+
+        previous_ego_pose = None
+        try:
+            previous_ego_pose = np.asarray(self.env.start_ego, dtype=np.float64).copy()
+        except Exception:
+            previous_ego_pose = None
 
         obs, terminated, truncated, info = self.env.step(env_action)
 
@@ -226,6 +530,11 @@ class RLReconEnv:
         if isinstance(info, dict):
             info["static_collision"] = bool(static_collision)
             info["dynamic_collision"] = bool(dynamic_collision)
+            info.update(self._compute_front_obstacle_metrics())
+            info.update(self._compute_closed_loop_ea_metrics(previous_ego_pose=previous_ego_pose))
+            craft_cfg = self.reward_cfg.get("CRAFT", {}) if isinstance(self.reward_cfg, dict) else {}
+            if isinstance(craft_cfg, dict) and bool(craft_cfg.get("enable", False)):
+                info.update(self._compute_map_metrics())
 
         done = bool(terminated or truncated)
 

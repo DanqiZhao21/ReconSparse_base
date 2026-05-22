@@ -57,7 +57,8 @@ def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
     if agent_type in {"sparsedrive_v2", "sparsedrivev2", "sdv2"}:
         from framework.agent.policy_sparsedrive_v2 import SparseDriveV2Policy
 
-        trainable_prefixes = agent_cfg.get("trainable_prefixes", train_cfg.get("trainable_layers", []))
+        trainable_prefixes = agent_cfg.get("trainable_prefixes", [])
+        frozen_prefixes = agent_cfg.get("frozen_prefixes", [])
         nuscenes_scorer_config = dict(agent_cfg.get("nuscenes_scorer", {}) or {})
         for key in ("scene_cache_root", "agent_state_cache_root", "ea_project_src", "nuscenes_dataroot"):
             if key in nuscenes_scorer_config and nuscenes_scorer_config[key] is not None:
@@ -68,6 +69,7 @@ def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
             rl_lr=float(train_cfg.get("policy_lr", train_cfg.get("ddv2_lr", 1e-5))),
             execute_mode=policy_execute_mode,
             trainable_prefixes=trainable_prefixes,
+            frozen_prefixes=frozen_prefixes,
             nuscenes_scorer_config=nuscenes_scorer_config,
         )
     from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy

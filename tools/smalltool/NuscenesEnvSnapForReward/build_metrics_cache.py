@@ -64,7 +64,8 @@ def _ann_to_ground_poly(nusc: NuScenes, ann_token: str) -> tuple[list, str]:
     ann = nusc.get("sample_annotation", ann_token)
     cat = ann["category_name"]
     x, y, _ = ann["translation"]
-    l, w, _ = ann["size"]
+    # nuScenes sample_annotation.size is [width, length, height].
+    w, l, _ = ann["size"]
     yaw = quat_to_yaw(ann["rotation"]) if "rotation" in ann else 0.0
     # Construct oriented rectangle polygon and export coords
     # Avoid importing shapely rotation here; use quick 4-corner method on ground.

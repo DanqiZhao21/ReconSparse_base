@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
+from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
 
 
 def _write_scene_env_cache(root: Path, *, scene_id: int, frame_idx: int, payload: dict[str, object]) -> None:
@@ -80,7 +80,7 @@ def test_score_increases_progress_preference_when_progress_weight_is_increased(t
         dtype=torch.float32,
     )
 
-    scorer_default = NuScenesTokenScorer(
+    scorer_default = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
         progress_weight=5.0,
@@ -93,7 +93,7 @@ def test_score_increases_progress_preference_when_progress_weight_is_increased(t
         traj_xyyaw,
     )
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
         progress_weight=8.0,

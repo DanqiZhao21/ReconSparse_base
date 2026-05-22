@@ -55,6 +55,28 @@ ReinforcePP 的配置/规格容器。
 - 统一实现 PPO 目标函数、Reinforce 目标函数和对应 metrics 统计。
 - `framework/lightning/trajectory_module.py` 的 `training_step` 会直接依赖这里。
 
+### nuscenes_pdm_scorer.py
+
+NuScenes PDM 风格业务 scorer。
+
+- 作为默认的 NuScenes counterfactual scorer 后端。
+- 负责 sample context、occupancy、drivable area、collision TTC 等 PDM 评分逻辑。
+
+### nuscenes_craft_scorer.py
+
+NuScenes CRAFT/CARL 风格业务 scorer。
+
+- 负责 CRAFT CaRL forward-sim reward 评分。
+- 内部复用 PDM scorer 的 route / collision / map 工具。
+
+### nuscenes_scorer_utils.py
+
+NuScenes 共享工具层，不是独立业务 scorer。
+
+- 提供 `_wrap_angle`、`_polyline_arclength`、`_project_progress` 等基础函数。
+- 承载通用 map/context/visualization 辅助逻辑。
+- 供 PDM 和 CRAFT scorer 复用。
+
 ## 训练时如何经过这里
 
 Learner 端主流程大致是：

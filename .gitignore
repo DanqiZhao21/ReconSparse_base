@@ -48,8 +48,8 @@ wandb/
 
 tmp/
 
-/root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0311.py
-/root/clone/ReconDreamer-RL/script/train_actor_learner_v2_0307.py
+script/train_actor_learner_v2_0311.py
+script/train_actor_learner_v2_0307.py
 
 flash-attention/
 
@@ -57,3 +57,21 @@ egoADs/
 
 test/
 docs/
+
+script/configs/sparsedrive_v2/old/
+
+tools/
+
+AGENTS.md
+/README_old.md
+/craftdrive-keyu.pdf
+RL-cky/
+tools/smalltool/ReplaySize/
+tools/smalltool/NuscenesEnvSnapForReward/
+tools/smalltool/evaluateCache/
+tools/smalltool/debugVideo/
+tools/smalltool/compareCKPT/
+tools/smalltool/anchor/
+tools/smalltool/3DGSinfo/
+/tools/trytry.py
+

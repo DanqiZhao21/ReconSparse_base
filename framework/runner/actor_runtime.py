@@ -49,6 +49,41 @@ def resolve_actor_env_runtime(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _normalize_algo_key(value: Any) -> str:
+    text = str(value or "ppo").strip().lower()
+    if text in {"reinforce++", "reinforce_pp", "reinforce_clip"}:
+        return "reinforcepp"
+    if text in {"reinforce_vanilla", "vanilla_reinforce"}:
+        return "reinforce"
+    return text
+
+
+def resolve_store_obs(train_cfg: Dict[str, Any], actor_learner_cfg: Dict[str, Any], agent: Any) -> bool:
+    raw = actor_learner_cfg.get("store_obs", "auto")
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off"}:
+            return False
+        if text != "auto":
+            raise ValueError(f"Unsupported actor_learner.store_obs={raw!r}; expected true, false, or auto")
+    elif raw is not None:
+        return bool(raw)
+
+    algo_key = _normalize_algo_key(train_cfg.get("algo", "ppo"))
+    if not algo_key.startswith("ppo"):
+        return False
+
+    critic_use_agent_features = bool(train_cfg.get("critic_use_agent_features", True))
+    if not critic_use_agent_features:
+        return True
+
+    supports_value_features = bool(getattr(agent, "supports_value_features", lambda: False)())
+    has_feature_dim = getattr(agent, "value_feature_dim", None) is not None
+    return not bool(supports_value_features and has_feature_dim)
+
+
 def actor_main(
     cfg: Dict[str, Any],
     *,
@@ -125,6 +160,8 @@ def _actor_main_impl(
     eta = float(train_cfg.get("eta", train_cfg.get("ddv2_eta", 1.0)))
     mode_idx = int(train_cfg.get("mode_idx", train_cfg.get("ddv2_mode_idx", -1)))
     mode_select = str(train_cfg.get("policy_mode_select", train_cfg.get("ddv2_mode_select", "sample"))).strip().lower()
+    store_obs = resolve_store_obs(train_cfg, al_cfg, agent)
+    stage(f"[actor{actor_id}] store_obs={bool(store_obs)}")
     shard_idx = 0
     shard_idx_per_env = [0 for _ in range(int(num_envs_per_actor))]
     if bool(runtime_cfg["use_vector_env"]):
@@ -177,6 +214,7 @@ def _actor_main_impl(
                 actor_id=actor_id,
                 local_ver=local_ver,
                 shard_idx=shard_idx,
+                store_obs=bool(store_obs),
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=1):
                 break
@@ -257,6 +295,7 @@ def _actor_main_impl(
                 actor_id=actor_id,
                 local_ver=local_ver,
                 shard_idx_per_env=shard_idx_per_env,
+                store_obs=bool(store_obs),
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=len(shards)):
                 break
@@ -279,4 +318,4 @@ def _actor_main_impl(
                     stage(f"[actor{actor_id}] stop requested after sync wait; exiting")
                     break
 
-__all__ = ["actor_main", "resolve_actor_env_runtime"]
+__all__ = ["actor_main", "resolve_actor_env_runtime", "resolve_store_obs"]

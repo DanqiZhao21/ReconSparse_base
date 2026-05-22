@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
+from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
 
 
 def _write_scene_env_cache(root: Path, *, scene_id: int, frame_idx: int, payload: dict[str, object]) -> None:
@@ -73,7 +73,7 @@ def test_score_prefers_cached_drivable_candidate_over_offroad_gt_fit(tmp_path: P
         },
     )
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
     )
@@ -125,9 +125,9 @@ def test_score_with_details_reports_pdm_like_breakdown_and_collision_gate(tmp_pa
         payload={
             "sample_token": token,
             "ego_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
-            "drivable_polygons": [
-                [[-2.0, -3.0], [12.0, -3.0], [12.0, 3.0], [-2.0, 3.0], [-2.0, -3.0]],
-            ],
+                "drivable_polygons": [
+                    [[-2.0, -5.0], [12.0, -5.0], [12.0, 5.0], [-2.0, 5.0], [-2.0, -5.0]],
+                ],
             "lanes_centerlines": [
                 [[0.0, 0.0], [4.0, 0.0], [8.0, 0.0], [12.0, 0.0]],
             ],
@@ -136,7 +136,7 @@ def test_score_with_details_reports_pdm_like_breakdown_and_collision_gate(tmp_pa
         },
     )
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
     )
@@ -144,7 +144,7 @@ def test_score_with_details_reports_pdm_like_breakdown_and_collision_gate(tmp_pa
         [
             [
                 [[2.0, 0.0, 0.0], [4.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
-                [[2.0, 2.6, 0.0], [4.0, 2.6, 0.0], [6.0, 2.6, 0.0]],
+                [[2.0, 3.2, 0.0], [4.0, 3.2, 0.0], [6.0, 3.2, 0.0]],
             ]
         ],
         dtype=torch.float32,
@@ -212,7 +212,7 @@ def test_score_with_details_uses_continuous_ttc_for_projected_future_risk(tmp_pa
         },
     )
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
     )
@@ -277,7 +277,7 @@ def test_score_with_details_uses_continuous_driving_direction_gate(tmp_path: Pat
         },
     )
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
     )
@@ -353,7 +353,7 @@ def test_score_with_details_can_disable_driving_direction_gate(tmp_path: Path) -
         dtype=torch.float32,
     )
 
-    scorer_default = NuScenesTokenScorer(
+    scorer_default = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
     )
@@ -362,7 +362,7 @@ def test_score_with_details_can_disable_driving_direction_gate(tmp_path: Path) -
         traj_xyyaw,
     )
 
-    scorer_disabled = NuScenesTokenScorer(
+    scorer_disabled = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         scene_cache_root=cache_root,
         driving_direction_gate_enabled=False,

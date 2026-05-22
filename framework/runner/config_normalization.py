@@ -1,9 +1,34 @@
 from __future__ import annotations
 
 import math
+import re
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
+
+_RUN_TIMESTAMP_PREFIX_RE = re.compile(r"^\d{8}_\d{6}(?:_|$)")
+
+
+def timestamp_actor_learner_buffer_dir(cfg: Dict[str, Any], *, timestamp: str) -> str | None:
+    train_cfg = cfg.get("train", {}) or {}
+    al_cfg = train_cfg.get("actor_learner", {}) or {}
+    if not isinstance(al_cfg, dict) or len(al_cfg) == 0:
+        return None
+    if bool(al_cfg.get("timestamp_buffer_dir", True)) is False:
+        return None
+
+    buffer_dir = str(al_cfg.get("buffer_dir", "outputs/actor_learner"))
+    path = Path(buffer_dir)
+    name = path.name
+    if _RUN_TIMESTAMP_PREFIX_RE.match(name):
+        return None
+
+    resolved = str(path.with_name(f"{str(timestamp)}_{name}"))
+    al_cfg["buffer_dir"] = resolved
+    train_cfg["actor_learner"] = al_cfg
+    cfg["train"] = train_cfg
+    return resolved
 
 
 def _list_int(values: Any) -> List[int]:

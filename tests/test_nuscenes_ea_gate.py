@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
+from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
 from framework.utils.nuscenes_agent_state_cache import (
     build_scene_agent_state_cache_from_processed_scene,
 )
@@ -113,11 +113,11 @@ def test_score_with_ea_gate_is_optional_and_applies_multiplicative_metric(
         dtype=torch.float32,
     )
 
-    scorer_plain = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer_plain = NuScenesScorerUtils(token2vad_path=token2vad_path)
     _, plain_details = scorer_plain.score_with_details([{"sample_token": token, "scene_id": 8, "frame_idx": 0}], traj_xyyaw)
     assert "ea_safety" not in plain_details[0]["candidates"][0]["multiplicative_metrics"]
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         agent_state_cache_root=agent_cache_root,
         ea_gate_enabled=True,
@@ -253,7 +253,7 @@ def test_score_with_ea_gate_prefers_agent_future_truth_over_ctrv(
         ],
     )
 
-    scorer = NuScenesTokenScorer(
+    scorer = NuScenesScorerUtils(
         token2vad_path=token2vad_path,
         agent_state_cache_root=agent_cache_root,
         scene_cache_root=tmp_path / "scene_cache",
@@ -286,7 +286,7 @@ def test_score_with_ea_gate_prefers_agent_future_truth_over_ctrv(
 
 
 def test_sample_state_at_time_interpolates_future_series_and_clamps_out_of_range() -> None:
-    sampled = NuScenesTokenScorer._sample_state_at_time(
+    sampled = NuScenesScorerUtils._sample_state_at_time(
         current_state={
             "x": 0.0,
             "y": 0.0,
@@ -304,7 +304,7 @@ def test_sample_state_at_time_interpolates_future_series_and_clamps_out_of_range
     assert sampled["speed_mps"] == pytest.approx(4.0, abs=1.0e-4)
 
     assert (
-        NuScenesTokenScorer._sample_state_at_time(
+        NuScenesScorerUtils._sample_state_at_time(
             current_state={"x": 0.0, "y": 0.0, "yaw_rad": 0.0},
             future_xy=np.asarray([[1.0, 0.0], [3.0, 0.0], [5.0, 0.0]], dtype=np.float32),
             future_yaw=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),

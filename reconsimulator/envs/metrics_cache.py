@@ -7,7 +7,8 @@ _scene_env_cache: Dict[int, Dict[int, Dict[str, Any]]] = {}
 
 
 def _scene_dir(scene_id: int) -> str:
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "assets", "nus", "data", f"{scene_id:03d}")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(repo_root, "assets", "nus", "data", f"{scene_id:03d}")
 
 
 def _cache_path(scene_id: int) -> str:

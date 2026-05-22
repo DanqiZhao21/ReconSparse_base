@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
+from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
 from framework.lightning.config import ActorLearnerLightningConfig, LearnerOptimizerConfig
 from framework.lightning.trajectory_module import TrajectoryLightningModule
 
@@ -149,7 +149,7 @@ def test_nuscenes_debug_dump_exports_cumulative_gt_and_bev_scene_context(
             f,
         )
 
-    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path)
     monkeypatch.setattr(
         scorer,
         "_lookup_map_layers",
@@ -228,7 +228,7 @@ def test_nuscenes_scorer_prefers_candidates_aligned_with_cumulative_gt(
             f,
         )
 
-    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path)
     aligned = np.asarray(
         [
             [3.0, 1.0, 0.0],
@@ -283,7 +283,7 @@ def test_nuscenes_debug_dump_trims_zero_padded_gt_future(
             f,
         )
 
-    scorer = NuScenesTokenScorer(token2vad_path=token2vad_path)
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path)
     monkeypatch.setattr(
         scorer,
         "_lookup_map_layers",
@@ -318,7 +318,7 @@ def test_nuscenes_debug_dump_trims_zero_padded_gt_future(
 
 
 def test_nuscenes_render_layers_builds_filled_road_and_lane_guides() -> None:
-    render_layers = NuScenesTokenScorer._build_render_layers(
+    render_layers = NuScenesScorerUtils._build_render_layers(
         {
             "drivable_area": [
                 [[-8.0, -4.0], [8.0, -4.0], [8.0, 4.0], [-8.0, 4.0]],
@@ -361,10 +361,10 @@ def test_nuscenes_render_layers_builds_filled_road_and_lane_guides() -> None:
 
 
 def test_candidate_rank_style_uses_transparent_lines() -> None:
-    rank1 = NuScenesTokenScorer._candidate_line_style(rank=0, total=8)
-    rank3 = NuScenesTokenScorer._candidate_line_style(rank=2, total=8)
-    rank4 = NuScenesTokenScorer._candidate_line_style(rank=3, total=8)
-    rank8 = NuScenesTokenScorer._candidate_line_style(rank=7, total=8)
+    rank1 = NuScenesScorerUtils._candidate_line_style(rank=0, total=8)
+    rank3 = NuScenesScorerUtils._candidate_line_style(rank=2, total=8)
+    rank4 = NuScenesScorerUtils._candidate_line_style(rank=3, total=8)
+    rank8 = NuScenesScorerUtils._candidate_line_style(rank=7, total=8)
 
     assert 0.35 <= float(rank1["alpha"]) <= 0.75
     assert float(rank1["linewidth"]) >= 1.8

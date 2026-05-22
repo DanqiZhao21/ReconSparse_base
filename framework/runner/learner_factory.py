@@ -97,7 +97,6 @@ def build_algorithm_bundle(
     grad_accum_steps = int(((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))
     rpp_cfg = (train_cfg.get("reinforcepp", {}) or {})
     ppo_cfg = (train_cfg.get("ppo", {}) or {})
-    reinforce_cfg = (train_cfg.get("reinforce", {}) or {})
     policy_lr = _resolve_policy_lr(train_cfg, agent)
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
@@ -156,8 +155,8 @@ def build_algorithm_bundle(
             raise RuntimeError("No trainable policy parameters found for policy-gradient learner")
         algo = ReinforcePP(
             clip_eps=clip_eps,
-            kl_coef=float(reinforce_cfg.get("kl_coef", rpp_cfg.get("kl_coef", 0.0))) if algo_key in {"reinforce_kl", "reinforcepp"} else 0.0,
-            epochs=int(reinforce_cfg.get("epochs", rpp_cfg.get("epochs", 1))),
+            kl_coef=float(rpp_cfg.get("kl_coef", 0.0)) if algo_key == "reinforcepp" else 0.0,
+            epochs=int(rpp_cfg.get("epochs", 1)),
             minibatch_size=minibatch_size,
             max_grad_norm=max_grad_norm,
             grad_accum_steps=grad_accum_steps,
@@ -166,12 +165,10 @@ def build_algorithm_bundle(
             variant=algo_key,
             policy_lr=float(policy_lr),
             weight_decay=float(weight_decay),
-            forward_kl_coef=float(reinforce_cfg.get("forward_kl_coef", rpp_cfg.get("forward_kl_coef", 0.0))),
-            reverse_kl_coef=float(reinforce_cfg.get("reverse_kl_coef", rpp_cfg.get("reverse_kl_coef", 0.0))),
-            distill_temperature=float(reinforce_cfg.get("distill_temperature", rpp_cfg.get("distill_temperature", 1.0))),
-            teacher_ckpt=_resolve_optional_repo_path(
-                reinforce_cfg.get("teacher_ckpt", rpp_cfg.get("teacher_ckpt", None))
-            ),
+            forward_kl_coef=float(rpp_cfg.get("forward_kl_coef", 0.0)),
+            reverse_kl_coef=float(rpp_cfg.get("reverse_kl_coef", 0.0)),
+            distill_temperature=float(rpp_cfg.get("distill_temperature", 1.0)),
+            teacher_ckpt=_resolve_optional_repo_path(rpp_cfg.get("teacher_ckpt", None)),
         )
         value_net = None
 

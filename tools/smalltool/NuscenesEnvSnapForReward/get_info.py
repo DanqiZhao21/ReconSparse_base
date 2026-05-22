@@ -130,7 +130,7 @@ def check_dynamic_collision(frame_info: dict, nusc: NuScenes) -> list:
         if not (ann["category_name"].startswith("vehicle") or ann["category_name"].startswith("human")):
             continue
         x, y, _ = ann["translation"]
-        l, w, _ = ann["size"]
+        w, l, _ = ann["size"]
         yaw = quat_to_yaw(ann["rotation"]) if "rotation" in ann else 0.0
         poly = oriented_box(x, y, l, w, yaw)
         if ego_poly.intersects(poly):

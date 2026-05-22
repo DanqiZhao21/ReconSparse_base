@@ -82,9 +82,19 @@ def _normalize_trainable_prefixes(value: Any) -> List[str]:
     return [text] if text else []
 
 
-def _apply_trainable_prefixes(module: torch.nn.Module, prefixes: Sequence[str]) -> tuple[int, int]:
+def _apply_trainable_prefixes(
+    module: torch.nn.Module,
+    prefixes: Sequence[str],
+    *,
+    frozen_prefixes: Sequence[str] | None = None,
+) -> tuple[int, int]:
     normalized = [str(prefix).strip() for prefix in prefixes if str(prefix).strip()]
+    normalized_frozen = [str(prefix).strip() for prefix in (frozen_prefixes or []) if str(prefix).strip()]
     if len(normalized) == 0:
+        if len(normalized_frozen) > 0:
+            for name, param in module.named_parameters():
+                if any(name.startswith(prefix) for prefix in normalized_frozen):
+                    param.requires_grad = False
         total = sum(1 for _ in module.parameters())
         trainable = sum(1 for param in module.parameters() if getattr(param, "requires_grad", False))
         return total, trainable
@@ -98,6 +108,9 @@ def _apply_trainable_prefixes(module: torch.nn.Module, prefixes: Sequence[str]) 
         total += 1
         if any(name.startswith(prefix) for prefix in normalized):
             param.requires_grad = True
+        if any(name.startswith(prefix) for prefix in normalized_frozen):
+            param.requires_grad = False
+        if getattr(param, "requires_grad", False):
             trainable += 1
     return total, trainable
 
@@ -127,6 +140,7 @@ class SparseDriveV2Policy(Agent):
         rl_lr: float = 1e-5,
         execute_mode: str = "first_step",
         trainable_prefixes: Sequence[str] | None = None,
+        frozen_prefixes: Sequence[str] | None = None,
         nuscenes_scorer_config: Dict[str, Any] | None = None,
     ) -> None:
         try:
@@ -145,6 +159,7 @@ class SparseDriveV2Policy(Agent):
         self._device_override = device
         self._execute_mode = "first_step"
         self._trainable_prefixes = _normalize_trainable_prefixes(trainable_prefixes)
+        self._frozen_prefixes = _normalize_trainable_prefixes(frozen_prefixes)
         self._nuscenes_scorer_config = dict(nuscenes_scorer_config or {})
 
         self._cfg = self._SparseDriveConfig()
@@ -156,12 +171,17 @@ class SparseDriveV2Policy(Agent):
         self._model = self._SparseDriveModel(self._cfg)
         self.to(self.device)
         self._load_weights(self.ckpt_path)
-        _apply_trainable_prefixes(self._model, self._trainable_prefixes)
+        _apply_trainable_prefixes(
+            self._model,
+            self._trainable_prefixes,
+            frozen_prefixes=self._frozen_prefixes,
+        )
         trainable_names, total_tensors, trainable_tensors, total_params, trainable_params = _summarize_parameter_status(self._model)
         if len(self._trainable_prefixes) > 0:
             print(
                 "[SparseDriveV2Policy] trainable_prefixes="
-                f"{self._trainable_prefixes} -> trainable tensors {trainable_tensors}/{total_tensors}, "
+                f"{self._trainable_prefixes} frozen_prefixes={self._frozen_prefixes} "
+                f"-> trainable tensors {trainable_tensors}/{total_tensors}, "
                 f"trainable params {trainable_params}/{total_params}"
             )
             # for name in trainable_names:
@@ -170,7 +190,9 @@ class SparseDriveV2Policy(Agent):
                 print(f"[SparseDriveV2Policy] trainable_param[-1]={name}")
         else:
             print(
-                "[SparseDriveV2Policy] trainable_prefixes=[] -> training all currently-enabled parameters: "
+                "[SparseDriveV2Policy] trainable_prefixes=[] "
+                f"frozen_prefixes={self._frozen_prefixes} -> training all currently-enabled "
+                "parameters except frozen prefixes: "
                 f"trainable tensors {trainable_tensors}/{total_tensors}, trainable params {trainable_params}/{total_params}"
             )
 
@@ -181,9 +203,8 @@ class SparseDriveV2Policy(Agent):
 
         self._last_missing_feature_fields: List[str] = []
         self._teacher_model: torch.nn.Module | None = None
-        self._nuscenes_token_scorer: Any | None = None
         self._nuscenes_pdm_scorer: Any | None = None
-        self._nuscenes_pdm_gpu_scorer: Any | None = None
+        self._nuscenes_craft_scorer: Any | None = None
 
     @property
     def device(self) -> torch.device:
@@ -1098,31 +1119,16 @@ class SparseDriveV2Policy(Agent):
         return features.detach().clone()
 
     def _counterfactual_scorer_backend_name(self) -> str:
-        backend = str(self._nuscenes_scorer_config.get("backend", "token")).strip().lower()
-        if backend in {"pdm", "nuscenes_pdm"}:
+        backend = str(self._nuscenes_scorer_config.get("backend", "nuscenes_pdm")).strip().lower()
+        if backend in {"craft", "craft_carl", "carl", "nuscenes_craft"}:
+            return "craft_carl"
+        if backend in {"pdm", "nuscenes_pdm", "token", "nuscenes_token"}:
             return "nuscenes_pdm"
-        if backend in {"pdm_gpu", "nuscenes_pdm_gpu"}:
-            return "nuscenes_pdm_gpu"
-        return "token"
-
-    def _ensure_nuscenes_token_scorer(self):
-        if self._nuscenes_token_scorer is None:
-            from framework.algorithms.nuscenes_token_scorer import NuScenesTokenScorer
-
-            scorer_kwargs = {
-                key: value
-                for key, value in self._nuscenes_scorer_config.items()
-                if key != "backend"
-            }
-            self._nuscenes_token_scorer = NuScenesTokenScorer(
-                token2vad_path=nus_cfg.TOKEN2VAD_FILE,
-                **scorer_kwargs,
-            )
-        return self._nuscenes_token_scorer
+        return "nuscenes_pdm"
 
     def _ensure_nuscenes_pdm_scorer(self):
         if self._nuscenes_pdm_scorer is None:
-            from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+            from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
             scorer_kwargs = {
                 key: value
@@ -1135,49 +1141,35 @@ class SparseDriveV2Policy(Agent):
             )
         return self._nuscenes_pdm_scorer
 
-    def _ensure_nuscenes_pdm_gpu_scorer(self):
-        if self._nuscenes_pdm_gpu_scorer is None:
-            import importlib.util
-            import sys
-            from pathlib import Path
-
-            module_path = Path(__file__).resolve().parents[1] / "algorithms" / "nuscenes_pdm_backend-GPU.py"
-            module_name = "framework.algorithms.nuscenes_pdm_backend_gpu_runtime"
-            module = sys.modules.get(module_name)
-            if module is None:
-                spec = importlib.util.spec_from_file_location(module_name, module_path)
-                if spec is None or spec.loader is None:
-                    raise RuntimeError(f"Failed to load GPU scorer backend from {module_path}")
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-            scorer_cls = getattr(module, "NuScenesPDMScorer")
+    def _ensure_nuscenes_craft_scorer(self):
+        if not hasattr(self, "_nuscenes_craft_scorer"):
+            self._nuscenes_craft_scorer = None
+        if self._nuscenes_craft_scorer is None:
+            from framework.algorithms.nuscenes_craft_scorer import NuScenesCraftScorer
 
             scorer_kwargs = {
                 key: value
                 for key, value in self._nuscenes_scorer_config.items()
                 if key != "backend"
             }
-            self._nuscenes_pdm_gpu_scorer = scorer_cls(
+            self._nuscenes_craft_scorer = NuScenesCraftScorer(
                 token2vad_path=nus_cfg.TOKEN2VAD_FILE,
                 **scorer_kwargs,
             )
-        return self._nuscenes_pdm_gpu_scorer
+        return self._nuscenes_craft_scorer
 
     def _ensure_counterfactual_scorer_backend(self):
         backend_name = self._counterfactual_scorer_backend_name()
-        if backend_name == "nuscenes_pdm":
-            return self._ensure_nuscenes_pdm_scorer()
-        if backend_name == "nuscenes_pdm_gpu":
-            return self._ensure_nuscenes_pdm_gpu_scorer()
-        return self._ensure_nuscenes_token_scorer()
+        if backend_name == "craft_carl":
+            return self._ensure_nuscenes_craft_scorer()
+        return self._ensure_nuscenes_pdm_scorer()
 
     def pdm_score_counterfactuals_from_replay_batch(
         self,
         replays: Sequence[Dict[str, Any]],
         traj_xyyaw: torch.Tensor,
     ) -> torch.Tensor:
-        from framework.algorithms.pdm_scorer import _as_score_tensor
+        from framework.algorithms.trajectory_policy_core import _as_score_tensor
 
         scorer = self._ensure_counterfactual_scorer_backend()
         return _as_score_tensor(scorer.score(replays, traj_xyyaw), device=self.device)

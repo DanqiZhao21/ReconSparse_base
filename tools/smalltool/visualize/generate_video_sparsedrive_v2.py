@@ -7,6 +7,38 @@ Pipeline per step:
 3) Re-plan at next step.
 
 Unavailable parts are kept as placeholders (e.g., exact mode log-prob from V2).
+
+
+新参数：
+
+--reward-detail-format ipynb
+默认就是 ipynb。如果某次不想生成，可以用：
+
+--reward-detail-format none
+
+cd /root/clone/ReconDreamer-RL
+
+#在线生成reward可视化视频
+
+python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
+  --scene 123 \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260521_reinforcepp_closed_loop_sparsedrive_v2_craft_corrective_progress_grpo.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
+  --out /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_CraftGrpo+CraftCloseReward.ipynb.mp4 \
+  --traj-csv /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_CraftGrpo+CraftCloseReward_bev.csv \
+  --traj-plot /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_expert_vs_ego_traj_bev.svg \
+  --reward-detail-format ipynb \
+  --save-keyframes \
+  --debug
+
+绘制已经有shard:
+python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
+  --from-shard /root/clone/ReconDreamer-RL/outputs/actor_learner_reinforcepp_craft_safety/buffer/consumed/actor0_e0_v16_t1779248747_8378e3e7.pt \
+  --out /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/actor0_e0_v16_t1779248747_8378e3e7_shard_replay.mp4 \
+  --traj-csv /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/actor0_e0_v16_t1779248747_8378e3e7_shard_plan.csv \
+  --traj-plot /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/actor0_e0_v16_t1779248747_8378e3e7_shard_bev.svg \
+  --reward-detail-format ipynb \
+  --save-keyframes
 """
 
 from __future__ import annotations
@@ -23,11 +55,54 @@ from typing import Any, Dict, List
 import imageio
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import yaml
+import json
+from shapely.geometry import Polygon
 
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+def _prepend_env_path(env_key: str, values: list[str]) -> None:
+    existing = os.environ.get(env_key, "")
+    parts: list[str] = []
+    seen: set[str] = set()
+    for value in values + ([existing] if existing else []):
+        if not value:
+            continue
+        for item in str(value).split(os.pathsep):
+            item = item.strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            parts.append(item)
+    if parts:
+        os.environ[env_key] = os.pathsep.join(parts)
+
+
+def _prepare_cuda_extension_env() -> None:
+    cuda_home = os.environ.get("CUDA_HOME", "").strip() or "/usr/local/cuda"
+    os.environ["CUDA_HOME"] = cuda_home
+    include_dirs = [
+        os.path.join(cuda_home, "include"),
+        os.path.join(cuda_home, "targets", "x86_64-linux", "include"),
+    ]
+    library_dirs = [
+        os.path.join(cuda_home, "lib64"),
+        os.path.join(cuda_home, "targets", "x86_64-linux", "lib"),
+    ]
+    _prepend_env_path("CPATH", include_dirs)
+    _prepend_env_path("CPLUS_INCLUDE_PATH", include_dirs)
+    _prepend_env_path("LIBRARY_PATH", library_dirs)
+    _prepend_env_path("LD_LIBRARY_PATH", library_dirs)
+    os.environ.setdefault("TORCH_EXTENSIONS_DIR", os.path.join(_REPO_ROOT, ".cache", "torch_extensions"))
+    os.makedirs(os.environ["TORCH_EXTENSIONS_DIR"], exist_ok=True)
+
+
+_prepare_cuda_extension_env()
 
 def _resolve_ego_ads_subdir(name: str) -> str:
     preferred = os.path.join(_REPO_ROOT, "egoADs", str(name))
@@ -50,7 +125,7 @@ def _resolve_repo_path(path: str) -> str:
 
 
 _DEFAULT_CKPT = os.path.join(_resolve_ego_ads_subdir("SparseDriveV2"), "ckpt", "sparsedrive_navsimv2.ckpt")
-_DEFAULT_OUT_DIR = os.path.join(_REPO_ROOT, "outputs", "visualize", "sparsedriveV2")
+_DEFAULT_OUTPUT_ROOT = os.path.join(_REPO_ROOT, "outputs", "RewardCheckandVideo")
 
 
 def _lazy_import_runtime() -> tuple[Any, Any]:
@@ -67,10 +142,218 @@ def _lazy_import_runtime() -> tuple[Any, Any]:
         ) from e
 
 
+def _load_yaml(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
 def _ensure_parent(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _build_auto_run_paths(
+    *,
+    scene: int,
+    timestamp: str,
+    output_root: str = _DEFAULT_OUTPUT_ROOT,
+) -> Dict[str, str]:
+    scene_dir = os.path.join(str(output_root), f"scene{int(scene):03d}-{timestamp}")
+    artifacts_dir = os.path.join(scene_dir, "artifacts")
+    return {
+        "run_dir": scene_dir,
+        "artifacts_dir": artifacts_dir,
+        "run_manifest": os.path.join(scene_dir, "run_info.md"),
+        "video_path": os.path.join(artifacts_dir, f"scene{int(scene):03d}_{timestamp}_sparsedrivev2_rollout.mp4"),
+        "traj_csv": os.path.join(artifacts_dir, f"scene{int(scene):03d}_{timestamp}_sparsedrivev2_plan_frontframe.csv"),
+        "traj_plot": os.path.join(artifacts_dir, f"scene{int(scene):03d}_{timestamp}_sparsedrivev2_expert_vs_ego_traj.svg"),
+    }
+
+
+def _write_run_manifest(
+    *,
+    manifest_path: str,
+    scene: int,
+    config_path: str,
+    ckpt_path: str,
+    timestamp: str,
+    extra_lines: List[str] | None = None,
+) -> str:
+    _ensure_parent(manifest_path)
+    run_dir = os.path.dirname(manifest_path)
+    lines = [
+        f"# SparseDriveV2 rollout run\n",
+        f"- run_dir: `{run_dir}`\n",
+        f"- scene: {int(scene):03d}\n",
+        f"- timestamp: {timestamp}\n",
+        f"- config: `{config_path}`\n",
+        f"- ckpt: `{ckpt_path}`\n",
+    ]
+    for line in extra_lines or []:
+        text = str(line).rstrip("\n")
+        if not text:
+            continue
+        if text.startswith("- "):
+            lines.append(text + "\n")
+        else:
+            lines.append(f"- {text}\n")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    return manifest_path
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if torch.is_tensor(value):
+        arr = value.detach().cpu()
+        if arr.ndim == 0:
+            return _json_safe(arr.item())
+        return arr.tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _markdown_table(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
+    if not rows:
+        return "_No rows._\n"
+    header = "| " + " | ".join(fieldnames) + " |"
+    sep = "| " + " | ".join(["---"] * len(fieldnames)) + " |"
+    body = []
+    for row in rows:
+        vals = []
+        for key in fieldnames:
+            val = _json_safe(row.get(key, ""))
+            if isinstance(val, (dict, list)):
+                text = json.dumps(val, ensure_ascii=False, sort_keys=True)
+            else:
+                text = str(val)
+            vals.append(text.replace("|", "\\|").replace("\n", "<br>"))
+        body.append("| " + " | ".join(vals) + " |")
+    return "\n".join([header, sep, *body]) + "\n"
+
+
+def _new_markdown_cell(text: str) -> Dict[str, Any]:
+    return {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
+
+
+def _new_code_cell(code: str) -> Dict[str, Any]:
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": code.splitlines(keepends=True),
+    }
+
+
+def _save_reward_detail_notebook(
+    *,
+    out_path: str,
+    scene: int,
+    reward_rows: List[Dict[str, Any]],
+    debug_shard: Dict[str, Any],
+    reward_cfg: Dict[str, Any],
+    video_path: str,
+    reward_csv_path: str,
+    debug_shard_path: str,
+) -> str:
+    _ensure_parent(out_path)
+    meta_rows = debug_shard.get("meta", []) if isinstance(debug_shard, dict) else []
+    info_by_step: Dict[int, Dict[str, Any]] = {}
+    for item in meta_rows if isinstance(meta_rows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            step = int(item.get("step", len(info_by_step)))
+        except Exception:
+            continue
+        info = item.get("info", {})
+        info_by_step[step] = dict(info) if isinstance(info, dict) else {"info": info}
+
+    reward_fields = [
+        "step",
+        "frame_before",
+        "frame_after",
+        "reward",
+        "cum_reward",
+        "progress_reward",
+        "cost_reward",
+        "done",
+        "done_reason",
+        "dynamic_collision",
+        "static_collision",
+        "collision_tokens",
+    ]
+    reward_fields = [k for k in reward_fields if any(k in row for row in reward_rows)]
+    if not reward_fields and reward_rows:
+        reward_fields = sorted({str(k) for row in reward_rows for k in row.keys()})
+
+    cfg_preview = json.dumps(_json_safe(reward_cfg), ensure_ascii=False, indent=2, sort_keys=True)
+    cells: List[Dict[str, Any]] = [
+        _new_markdown_cell(
+            f"# Scene {int(scene):03d} Reward Detail\n\n"
+            "This notebook is generated by `generate_video_sparsedrive_v2.py` during rollout export.\n\n"
+            f"- video: `{video_path}`\n"
+            f"- reward_csv: `{reward_csv_path}`\n"
+            f"- debug_shard: `{debug_shard_path}`\n"
+            f"- steps: `{len(reward_rows)}`\n"
+        ),
+        _new_markdown_cell("## Reward Config\n\n```json\n" + cfg_preview + "\n```\n"),
+        _new_code_cell(
+            "import pandas as pd\n"
+            "from IPython.display import Video, display\n\n"
+            f"reward_csv = {reward_csv_path!r}\n"
+            f"video_path = {video_path!r}\n"
+            "df = pd.read_csv(reward_csv)\n"
+            "display(df)\n"
+            "display(Video(video_path, embed=False))\n"
+        ),
+        _new_markdown_cell("## Per-Step Reward Summary\n\n" + _markdown_table(reward_rows, reward_fields)),
+    ]
+
+    for row in reward_rows:
+        try:
+            step = int(row.get("step", len(cells)))
+        except Exception:
+            step = len(cells)
+        info = info_by_step.get(step, {})
+        info_rows = [{"key": str(k), "value": _json_safe(v)} for k, v in sorted(info.items(), key=lambda kv: str(kv[0]))]
+        cells.append(
+            _new_markdown_cell(
+                f"## Step {step}\n\n"
+                "### Reward Row\n\n"
+                + _markdown_table([row], sorted(str(k) for k in row.keys()))
+                + "\n### Env Info Detail\n\n"
+                + _markdown_table(info_rows, ["key", "value"])
+            )
+        )
+
+    notebook = {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "pygments_lexer": "ipython3"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(notebook, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return out_path
 
 
 def _grid_frame(observation: Dict[str, np.ndarray]) -> np.ndarray:
@@ -79,6 +362,287 @@ def _grid_frame(observation: Dict[str, np.ndarray]) -> np.ndarray:
     row1 = np.concatenate(imgs[:3], axis=1)
     row2 = np.concatenate(imgs[3:], axis=1)
     return np.concatenate([row1, row2], axis=0)
+
+
+def _obs_tensor_to_camera_observation(obs_t: Any) -> Dict[str, np.ndarray]:
+    if torch.is_tensor(obs_t):
+        arr = obs_t.detach().cpu().numpy()
+    else:
+        arr = np.asarray(obs_t)
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[0] != 18:
+        raise RuntimeError(f"Expected obs tensor shape (18,H,W), got {arr.shape}")
+    arr = np.clip(arr.reshape(6, 3, arr.shape[1], arr.shape[2]).transpose(0, 2, 3, 1), 0.0, 1.0)
+    arr_u8 = np.rint(arr * 255.0).astype(np.uint8)
+    keys = ["front_left", "front", "front_right", "back_left", "back", "back_right"]
+    return {key: arr_u8[i] for i, key in enumerate(keys)}
+
+
+def _overlay_debug_text(frame: np.ndarray, lines: List[str]) -> np.ndarray:
+    if len(lines) == 0:
+        return frame
+    try:
+        import cv2
+    except Exception:
+        return frame
+    out = frame.copy()
+    h, w = out.shape[:2]
+    box_h = min(h - 10, 26 + 22 * len(lines))
+    box_w = min(w - 10, 920)
+    x0, y0 = 8, 8
+    roi = out[y0 : y0 + box_h, x0 : x0 + box_w].copy()
+    shade = roi.copy()
+    cv2.rectangle(shade, (0, 0), (box_w - 1, box_h - 1), (16, 16, 16), thickness=-1)
+    out[y0 : y0 + box_h, x0 : x0 + box_w] = cv2.addWeighted(shade, 0.50, roi, 0.50, 0)
+    y = y0 + 22
+    for line in lines:
+        cv2.putText(out, str(line), (x0 + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (236, 236, 236), 1, cv2.LINE_AA)
+        y += 22
+    return out
+
+
+def _tensor_seq_value(seq: Any, idx: int, default: Any = None) -> Any:
+    if seq is None:
+        return default
+    try:
+        value = seq[idx]
+    except Exception:
+        return default
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        return value.detach().cpu()
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return value.item()
+    return value
+
+
+def _maybe_int(value: Any, default: int = -1) -> int:
+    try:
+        if value is None:
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _maybe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _build_shard_reward_rows(shard: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rewards = shard.get("reward", [])
+    replay_rows = shard.get("replay", [])
+    if torch.is_tensor(rewards):
+        num_steps = int(rewards.numel())
+    else:
+        num_steps = len(rewards)
+    reward_rows: List[Dict[str, Any]] = []
+    reward_sum = 0.0
+    for step in range(num_steps):
+        replay = replay_rows[step] if isinstance(replay_rows, list) and step < len(replay_rows) and isinstance(replay_rows[step], dict) else {}
+        reward_v = _maybe_float(_tensor_seq_value(rewards, step, 0.0))
+        reward_sum += reward_v
+        done_v = bool(_maybe_float(_tensor_seq_value(shard.get("done"), step, 0.0)) > 0.5)
+        old_logp = _maybe_float(_tensor_seq_value(shard.get("old_logp"), step, 0.0))
+        try:
+            traj_points = int(_traj_xyyaw_from_replay(replay).shape[0])
+        except Exception:
+            traj_points = 0
+        reward_rows.append(
+            {
+                "step": int(step),
+                "scene_id": _maybe_int(replay.get("scene_id", -1)),
+                "frame_idx": _maybe_int(replay.get("frame_idx", -1)),
+                "timestamp_s": _maybe_float(replay.get("timestamp_s", 0.0)),
+                "mode_idx": _maybe_int(replay.get("mode_idx", -1)),
+                "old_logp": float(old_logp),
+                "reward": float(reward_v),
+                "cum_reward": float(reward_sum),
+                "done": bool(done_v),
+                "traj_points": int(traj_points),
+            }
+        )
+    return reward_rows
+
+
+def _draw_shard_plan_bev(
+    frame: np.ndarray,
+    traj_xyyaw: np.ndarray | None,
+    *,
+    view_m: float = 25.0,
+) -> np.ndarray:
+    if traj_xyyaw is None:
+        return frame
+    try:
+        import cv2
+    except Exception:
+        return frame
+
+    traj = np.asarray(traj_xyyaw, dtype=np.float64)
+    if traj.ndim != 2 or traj.shape[1] < 2 or traj.shape[0] == 0:
+        return frame
+
+    out = frame.copy()
+    h, w = out.shape[:2]
+    box_w, box_h = 320, 320
+    x0, y0 = w - box_w - 10, 10
+    cv2.rectangle(out, (x0, y0), (x0 + box_w, y0 + box_h), (20, 20, 20), -1)
+    cv2.rectangle(out, (x0, y0), (x0 + box_w, y0 + box_h), (120, 120, 120), 1)
+    cx, cy = x0 + box_w // 2, y0 + int(box_h * 0.78)
+    scale = float(min(box_w, box_h) * 0.42 / max(1e-6, view_m))
+
+    def local_to_px(xy: np.ndarray) -> np.ndarray:
+        pts = np.asarray(xy, dtype=np.float64)
+        px = np.zeros((pts.shape[0], 2), dtype=np.int32)
+        px[:, 0] = np.rint(cx + pts[:, 1] * scale).astype(np.int32)
+        px[:, 1] = np.rint(cy - pts[:, 0] * scale).astype(np.int32)
+        return px
+
+    grid_color = (70, 70, 70)
+    for m in range(0, int(view_m) + 1, 5):
+        y = int(round(cy - float(m) * scale))
+        if y0 <= y <= y0 + box_h:
+            cv2.line(out, (x0 + 6, y), (x0 + box_w - 6, y), grid_color, 1)
+    center_line = local_to_px(np.asarray([[0.0, 0.0], [view_m, 0.0]], dtype=np.float64))
+    cv2.line(out, tuple(center_line[0]), tuple(center_line[1]), (90, 90, 90), 1)
+
+    ego = local_to_px(np.asarray([[0.0, 0.0]], dtype=np.float64))[0]
+    cv2.circle(out, tuple(ego), 5, (255, 255, 255), -1)
+    cv2.putText(out, "EGO", (int(ego[0]) + 7, int(ego[1]) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    pts = local_to_px(traj[:, :2])
+    if pts.shape[0] >= 2:
+        cv2.polylines(out, [pts.reshape(-1, 1, 2)], False, (0, 220, 255), 2)
+    for idx, pt in enumerate(pts):
+        cv2.circle(out, tuple(pt), 4 if idx == 0 else 3, (255, 160, 0) if idx == 0 else (0, 220, 255), -1)
+        if idx in {0, pts.shape[0] - 1}:
+            cv2.putText(out, str(idx), (int(pt[0]) + 4, int(pt[1]) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 235, 235), 1, cv2.LINE_AA)
+    cv2.putText(out, "BEV plan view", (x0 + 8, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+    return out
+
+
+def _resize_frame_min_width(frame: np.ndarray, min_width: int) -> np.ndarray:
+    if int(frame.shape[1]) >= int(min_width):
+        return frame
+    try:
+        import cv2
+    except Exception:
+        return frame
+    scale = float(min_width) / float(max(1, int(frame.shape[1])))
+    out_w = int(round(float(frame.shape[1]) * scale))
+    out_h = int(round(float(frame.shape[0]) * scale))
+    return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _load_env_cache(scene: int) -> Dict[int, Dict[str, Any]]:
+    p = os.path.join(_REPO_ROOT, "assets", "nus", "data", f"{int(scene):03d}", "env_cache.json")
+    if not os.path.isfile(p):
+        return {}
+    data = json.load(open(p, "r", encoding="utf-8"))
+    if isinstance(data, dict) and "meta" in data:
+        data = {k: v for k, v in data.items() if k != "meta"}
+    out: Dict[int, Dict[str, Any]] = {}
+    for k, v in (data.items() if isinstance(data, dict) else []):
+        try:
+            out[int(k)] = dict(v)
+        except Exception:
+            continue
+    return out
+
+
+def _world_pose_from_sim(sim: Any) -> np.ndarray:
+    cfs = np.asarray(getattr(sim, "camera_front_start"), dtype=np.float64)
+    local = np.asarray(getattr(sim, "start_ego"), dtype=np.float64)
+    if cfs.shape == (4, 4) and local.shape == (4, 4):
+        return cfs @ local
+    return local
+
+
+def _ego_poly_world(world_pose: np.ndarray, ego_len: float = 4.2, ego_w: float = 1.9) -> np.ndarray:
+    x = float(world_pose[0, 3])
+    y = float(world_pose[1, 3])
+    yaw = float(np.arctan2(float(world_pose[1, 0]), float(world_pose[0, 0])))
+    c, s = float(np.cos(yaw)), float(np.sin(yaw))
+    hl, hw = float(ego_len) * 0.5, float(ego_w) * 0.5
+    pts = np.asarray([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]], dtype=np.float64)
+    R = np.asarray([[c, -s], [s, c]], dtype=np.float64)
+    return (pts @ R.T) + np.asarray([[x, y]], dtype=np.float64)
+
+
+def _draw_collision_bev(
+    frame: np.ndarray,
+    *,
+    world_pose: np.ndarray,
+    snap: Dict[str, Any] | None,
+    view_m: float = 25.0,
+) -> tuple[np.ndarray, List[str]]:
+    if not isinstance(snap, dict):
+        return frame, []
+    try:
+        import cv2
+    except Exception:
+        return frame, []
+
+    out = frame.copy()
+    h, w = out.shape[:2]
+    box_w, box_h = 320, 320
+    x0, y0 = w - box_w - 10, 10
+    cv2.rectangle(out, (x0, y0), (x0 + box_w, y0 + box_h), (20, 20, 20), -1)
+    cv2.rectangle(out, (x0, y0), (x0 + box_w, y0 + box_h), (120, 120, 120), 1)
+
+    ego_xy = np.asarray([float(world_pose[0, 3]), float(world_pose[1, 3])], dtype=np.float64)
+    yaw = float(np.arctan2(float(world_pose[1, 0]), float(world_pose[0, 0])))
+    c, s = float(np.cos(-yaw)), float(np.sin(-yaw))
+    R = np.asarray([[c, -s], [s, c]], dtype=np.float64)
+    scale = float(min(box_w, box_h) * 0.45 / max(1e-6, view_m))
+    cx, cy = x0 + box_w // 2, y0 + box_h // 2
+
+    def world_to_px(poly_xy: np.ndarray) -> np.ndarray:
+        rel = np.asarray(poly_xy, dtype=np.float64) - ego_xy[None, :]
+        loc = rel @ R.T
+        px = np.zeros_like(loc)
+        px[:, 0] = cx + loc[:, 0] * scale
+        px[:, 1] = cy - loc[:, 1] * scale
+        return px.astype(np.int32)
+
+    ego_poly = _ego_poly_world(world_pose)
+    ego_shapely = Polygon(ego_poly.tolist())
+    ego_px = world_to_px(ego_poly)
+    # Colors are RGB (frame is written by imageio in RGB space).
+    cv2.polylines(out, [ego_px.reshape(-1, 1, 2)], True, (255, 255, 255), 2)
+    cv2.putText(out, "EGO", (int(np.mean(ego_px[:, 0])) + 4, int(np.mean(ego_px[:, 1])) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    collided_tokens: List[str] = []
+    for obj in snap.get("dynamic_objects", []) or []:
+        poly = obj.get("poly", None)
+        if not (isinstance(poly, list) and len(poly) >= 3):
+            continue
+        poly_xy = np.asarray(poly, dtype=np.float64)
+        shp = Polygon(poly_xy.tolist())
+        is_hit = bool(ego_shapely.intersects(shp))
+        clr = (255, 0, 0) if is_hit else (0, 200, 255)
+        if is_hit:
+            tok = str(obj.get("token", obj.get("id", "unknown")))
+            collided_tokens.append(tok)
+        px = world_to_px(poly_xy)
+        if is_hit:
+            overlay = out.copy()
+            cv2.fillPoly(overlay, [px.reshape(-1, 1, 2)], (255, 0, 0))
+            out = cv2.addWeighted(overlay, 0.35, out, 0.65, 0)
+            cv2.polylines(out, [px.reshape(-1, 1, 2)], True, (255, 0, 0), 2)
+            ccx, ccy = int(np.mean(px[:, 0])), int(np.mean(px[:, 1]))
+            cv2.putText(out, "HIT", (ccx + 3, ccy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 80, 80), 1, cv2.LINE_AA)
+        else:
+            cv2.polylines(out, [px.reshape(-1, 1, 2)], True, clr, 1)
+
+    cv2.putText(out, "BEV collision view", (x0 + 8, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+    return out, collided_tokens
 
 
 def _pose_matrix_from_xyyaw(x: float, y: float, yaw: float) -> np.ndarray:
@@ -385,9 +949,247 @@ def _save_traj_plot_xz(scene: int, expert_xz: np.ndarray, ego_xz: np.ndarray, ou
     return True
 
 
+def _save_shard_plan_plot(reward_rows: List[Dict[str, Any]], replay_rows: List[Dict[str, Any]], out_path: str) -> bool:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print("[shard-traj-plot] matplotlib not installed, skip export")
+        return False
+
+    _ensure_parent(out_path)
+    fig, ax = plt.subplots(figsize=(8.0, 8.0), dpi=140)
+    cmap = plt.get_cmap("viridis")
+    num_steps = max(1, len(replay_rows))
+    plotted = 0
+    for step, replay in enumerate(replay_rows):
+        if not isinstance(replay, dict):
+            continue
+        try:
+            traj = _traj_xyyaw_from_replay(replay)
+        except Exception:
+            continue
+        color = cmap(float(step) / float(max(1, num_steps - 1)))
+        ax.plot(traj[:, 1], traj[:, 0], color=color, linewidth=1.4, alpha=0.75)
+        ax.scatter([traj[0, 1]], [traj[0, 0]], color=[color], s=12)
+        if step % 5 == 0 or step == num_steps - 1:
+            ax.annotate(str(step), (float(traj[0, 1]), float(traj[0, 0])), xytext=(3, 3), textcoords="offset points", fontsize=7)
+        plotted += 1
+    ax.scatter([0.0], [0.0], color="#d62728", s=35, marker="x", label="ego")
+    done_steps = [int(row["step"]) for row in reward_rows if bool(row.get("done", False))]
+    title = "Shard SparseDriveV2 local BEV plans"
+    if done_steps:
+        title += f" (done at {','.join(str(v) for v in done_steps)})"
+    ax.set_title(title)
+    ax.set_xlabel("local y / lateral (m)")
+    ax.set_ylabel("local x / forward (m)")
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path, format="svg" if out_path.lower().endswith(".svg") else None)
+    plt.close(fig)
+    return plotted > 0
+
+
+def _write_csv_rows(path: str, rows: List[Dict[str, Any]]) -> None:
+    _ensure_parent(path)
+    fieldnames = sorted({str(k) for row in rows for k in row.keys()}) if rows else []
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if fieldnames:
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def _export_shard_replay(args: argparse.Namespace) -> None:
+    shard_path = _resolve_repo_path(str(args.from_shard))
+    if not os.path.isfile(shard_path):
+        raise FileNotFoundError(f"Shard not found: {shard_path}")
+
+    shard = torch.load(shard_path, map_location="cpu")
+    if not isinstance(shard, dict):
+        raise RuntimeError(f"Expected shard dict, got {type(shard)}")
+    obs_all = shard.get("obs", None)
+    if not torch.is_tensor(obs_all):
+        raise RuntimeError("Shard missing tensor field `obs`")
+    if obs_all.ndim != 4 or int(obs_all.shape[1]) != 18:
+        raise RuntimeError(f"Expected shard obs shape (T,18,H,W), got {tuple(obs_all.shape)}")
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    stem = os.path.splitext(os.path.basename(shard_path))[0]
+    shard_root = os.path.join(_DEFAULT_OUTPUT_ROOT, f"{stem}-{ts}")
+    shard_artifacts_dir = os.path.join(shard_root, "artifacts")
+    out_path = args.out or os.path.join(shard_artifacts_dir, f"{stem}_{ts}_shard_replay.mp4")
+    traj_csv = args.traj_csv or os.path.join(shard_artifacts_dir, f"{stem}_{ts}_shard_plan.csv")
+    traj_plot = args.traj_plot or os.path.join(shard_artifacts_dir, f"{stem}_{ts}_shard_bev.svg")
+    _ensure_parent(out_path)
+    _ensure_parent(traj_csv)
+    _ensure_parent(traj_plot)
+    if args.out is None and args.traj_csv is None and args.traj_plot is None:
+        _write_run_manifest(
+            manifest_path=os.path.join(shard_root, "run_info.md"),
+            scene=0,
+            config_path="actor_learner_shard",
+            ckpt_path=shard_path,
+            timestamp=ts,
+            extra_lines=[f"from_shard={shard_path}", f"artifacts_dir={shard_artifacts_dir}"],
+        )
+
+    reward_rows = _build_shard_reward_rows(shard)
+    replay_rows = list(shard.get("replay", [])) if isinstance(shard.get("replay", []), list) else []
+    max_steps = min(int(obs_all.shape[0]), len(reward_rows))
+    if max_steps <= 0:
+        raise RuntimeError("Shard has no steps to render")
+    fps = float(args.fps) if args.fps is not None else 2.0
+
+    print("==== generate_video_sparsedrive_v2 shard replay ====")
+    print(f"from_shard={shard_path}")
+    print(f"steps={max_steps} fps={fps:.3f}")
+    print(f"out_video={out_path}")
+    print(f"out_traj_csv={traj_csv}")
+    print(f"out_traj_plot={traj_plot}")
+
+    writer = imageio.get_writer(
+        out_path,
+        mode="I",
+        fps=float(fps),
+        macro_block_size=1,
+        codec="libx264",
+        ffmpeg_log_level="error",
+        input_params=["-framerate", str(float(fps))],
+        output_params=["-pix_fmt", "yuv420p"],
+    )
+
+    rendered_frames: List[np.ndarray] = []
+    traj_rows: List[Dict[str, Any]] = []
+    debug_shard: Dict[str, Any] = {"reward": [], "done": [], "replay": replay_rows[:max_steps], "meta": []}
+    try:
+        for step in range(max_steps):
+            row = reward_rows[step]
+            replay = replay_rows[step] if step < len(replay_rows) and isinstance(replay_rows[step], dict) else {}
+            obs = _obs_tensor_to_camera_observation(obs_all[step])
+            try:
+                traj_xyyaw = _traj_xyyaw_from_replay(replay)
+            except Exception:
+                traj_xyyaw = None
+
+            lines = [
+                f"shard step={step} scene={row.get('scene_id', -1)} frame={row.get('frame_idx', -1)}",
+                f"reward={float(row.get('reward', 0.0)):.5f} cum_reward={float(row.get('cum_reward', 0.0)):.5f} done={bool(row.get('done', False))}",
+                f"mode_idx={row.get('mode_idx', -1)} old_logp={float(row.get('old_logp', 0.0)):.5f} sample={str(replay.get('sample_token', ''))[:12]}",
+            ]
+            frame_out = _resize_frame_min_width(_grid_frame(obs), 960)
+            frame_out = _overlay_debug_text(frame_out, lines)
+            frame_out = _draw_shard_plan_bev(frame_out, traj_xyyaw, view_m=25.0)
+            writer.append_data(frame_out)
+            rendered_frames.append(frame_out.copy())
+
+            if traj_xyyaw is not None:
+                for pt_idx in range(int(traj_xyyaw.shape[0])):
+                    traj_rows.append(
+                        {
+                            "step": int(step),
+                            "scene_id": row.get("scene_id", -1),
+                            "frame_idx": row.get("frame_idx", -1),
+                            "mode_idx": row.get("mode_idx", -1),
+                            "point_idx": int(pt_idx),
+                            "local_x": float(traj_xyyaw[pt_idx, 0]),
+                            "local_y": float(traj_xyyaw[pt_idx, 1]),
+                            "local_yaw": float(traj_xyyaw[pt_idx, 2]),
+                        }
+                    )
+
+            debug_shard["reward"].append(float(row.get("reward", 0.0)))
+            debug_shard["done"].append(bool(row.get("done", False)))
+            debug_shard["meta"].append({"step": int(step), "info": dict(row)})
+    finally:
+        writer.close()
+
+    _write_csv_rows(traj_csv, traj_rows)
+    print(f"traj_saved={traj_csv}")
+
+    reward_csv = os.path.splitext(traj_csv)[0] + "_step_reward.csv"
+    _write_csv_rows(reward_csv, reward_rows[:max_steps])
+    print(f"reward_csv_saved={reward_csv}")
+
+    reward_plot = os.path.splitext(traj_plot)[0] + "_reward_curve.png"
+    try:
+        xs = [int(r["step"]) for r in reward_rows[:max_steps]]
+        ys = [float(r["reward"]) for r in reward_rows[:max_steps]]
+        cs = [float(r["cum_reward"]) for r in reward_rows[:max_steps]]
+        fig, ax1 = plt.subplots(figsize=(9, 4), dpi=150)
+        ax1.plot(xs, ys, color="#d62728", label="step_reward")
+        ax1.axhline(0.0, color="#888888", linewidth=1.0)
+        ax2 = ax1.twinx()
+        ax2.plot(xs, cs, color="#1f77b4", label="cum_reward")
+        for row in reward_rows[:max_steps]:
+            if bool(row.get("done", False)):
+                ax1.axvline(int(row["step"]), color="#444444", linestyle="--", linewidth=1.0, alpha=0.6)
+        ax1.set_xlabel("step")
+        ax1.set_ylabel("reward")
+        ax2.set_ylabel("cum_reward")
+        ax1.set_title("Shard Reward Curve")
+        fig.tight_layout()
+        fig.savefig(reward_plot)
+        plt.close(fig)
+        print(f"reward_plot_saved={reward_plot}")
+    except Exception as e:
+        print(f"[reward-plot] failed: {e}")
+
+    if _save_shard_plan_plot(reward_rows[:max_steps], replay_rows[:max_steps], traj_plot):
+        print(f"traj_plot_saved={traj_plot}")
+
+    debug_shard_path = os.path.splitext(traj_csv)[0] + "_debug_shard.pt"
+    try:
+        torch.save(debug_shard, debug_shard_path)
+        print(f"debug_shard_saved={debug_shard_path}")
+    except Exception as e:
+        print(f"[debug-shard] failed: {e}")
+
+    if str(args.reward_detail_format) == "ipynb":
+        detail_ipynb = os.path.splitext(traj_csv)[0] + "_reward_detail.ipynb"
+        try:
+            first_scene = _maybe_int(reward_rows[0].get("scene_id", 0), 0) if reward_rows else 0
+            _save_reward_detail_notebook(
+                out_path=detail_ipynb,
+                scene=first_scene,
+                reward_rows=reward_rows[:max_steps],
+                debug_shard=debug_shard,
+                reward_cfg={"source": "actor_learner_shard", "shard_path": shard_path, "meta": shard.get("meta", {})},
+                video_path=out_path,
+                reward_csv_path=reward_csv,
+                debug_shard_path=debug_shard_path,
+            )
+            print(f"reward_detail_notebook_saved={detail_ipynb}")
+        except Exception as e:
+            print(f"[reward-detail-notebook] failed: {e}")
+
+    if bool(args.save_keyframes) and reward_rows and rendered_frames:
+        try:
+            key_root = os.path.splitext(traj_plot)[0] + "_keyframes"
+            os.makedirs(key_root, exist_ok=True)
+            order = sorted(range(max_steps), key=lambda i: float(reward_rows[i]["reward"]))
+            for idx in order[: max(1, int(args.keyframes_k))]:
+                out_png = os.path.join(key_root, f"step{idx:03d}_reward{float(reward_rows[idx]['reward']):+.4f}.png")
+                imageio.imwrite(out_png, rendered_frames[idx])
+            print(f"keyframes_saved={key_root}")
+        except Exception as e:
+            print(f"[keyframes] failed: {e}")
+
+    print(f"video_saved={out_path}")
+    print("==== shard replay done ====")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate SparseDriveV2 rollout video in 3DGS env")
-    ap.add_argument("--scene", type=int, required=True)
+    ap.add_argument(
+        "--config",
+        type=str,
+        default=os.path.join(_REPO_ROOT, "script", "configs", "sparsedrive_v2", "reinforcepp_closed_loop_sparsedrive_v2_no_grpo.yaml"),
+        help="Config file providing env.reward and rollout defaults",
+    )
+    ap.add_argument("--from-shard", type=str, default=None, help="Render an existing actor-learner shard instead of running live policy rollout.")
+    ap.add_argument("--scene", type=int, default=None)
     ap.add_argument("--ckpt", type=str, default=_DEFAULT_CKPT)
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--traj-csv", type=str, default=None)
@@ -403,27 +1205,66 @@ def main() -> None:
     ap.add_argument("--mode-select", type=str, default="greedy", choices=["greedy", "sample"])
     ap.add_argument("--expert-high", dest="expert_high", action="store_true", default=True)
     ap.add_argument("--no-expert-high", dest="expert_high", action="store_false")
+    ap.add_argument("--save-keyframes", action="store_true", help="Save low-reward keyframes as PNG")
+    ap.add_argument("--keyframes-k", type=int, default=8)
+    ap.add_argument("--draw-collision-bev", action="store_true", default=True)
+    ap.add_argument(
+        "--reward-detail-format",
+        type=str,
+        default="ipynb",
+        choices=["none", "ipynb"],
+        help="Export detailed per-step reward report. Default writes an .ipynb next to the reward CSV.",
+    )
     args = ap.parse_args()
 
+    if args.from_shard:
+        _export_shard_replay(args)
+        return
+
+    if args.scene is None:
+        raise SystemExit("--scene is required unless --from-shard is used")
     scene = int(args.scene)
     RLReconEnv, SparseDriveV2Policy = _lazy_import_runtime()
     ckpt_path = _resolve_repo_path(str(args.ckpt))
+    config_path = _resolve_repo_path(str(args.config))
+    cfg = _load_yaml(config_path)
+    env_cfg = cfg.get("env", {}) if isinstance(cfg, dict) else {}
+    reward_cfg = env_cfg.get("reward", {}) if isinstance(env_cfg, dict) else {}
 
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"SparseDriveV2 ckpt not found: {ckpt_path}")
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    out_path = args.out or os.path.join(_DEFAULT_OUT_DIR, f"scene{scene:03d}_{ts}_sparsedrivev2_rollout.mp4")
-    traj_csv = args.traj_csv or os.path.join(_DEFAULT_OUT_DIR, f"scene{scene:03d}_{ts}_sparsedrivev2_plan_frontframe.csv")
-    traj_plot = args.traj_plot or os.path.join(_DEFAULT_OUT_DIR, f"scene{scene:03d}_{ts}_sparsedrivev2_expert_vs_ego_traj.svg")
+    auto_paths = _build_auto_run_paths(scene=scene, timestamp=ts)
+    out_path = args.out or auto_paths["video_path"]
+    traj_csv = args.traj_csv or auto_paths["traj_csv"]
+    traj_plot = args.traj_plot or auto_paths["traj_plot"]
     _ensure_parent(out_path)
     _ensure_parent(traj_csv)
     _ensure_parent(traj_plot)
+    _write_run_manifest(
+        manifest_path=auto_paths["run_manifest"],
+        scene=scene,
+        config_path=config_path,
+        ckpt_path=ckpt_path,
+        timestamp=ts,
+        extra_lines=[
+            f"artifacts_dir={auto_paths['artifacts_dir']}",
+            f"video={out_path}",
+            f"traj_csv={traj_csv}",
+            f"traj_plot={traj_plot}",
+            f"start_frame={int(args.start_frame)}",
+            f"step_frames={int(args.step_frames)}",
+            f"cuda={int(args.cuda)}",
+            f"mode_select={args.mode_select}",
+            f"reward_detail_format={args.reward_detail_format}",
+        ],
+    )
 
     env = RLReconEnv(
         cuda=int(args.cuda),
         scene=scene,
-        reward_cfg={},
+        reward_cfg=reward_cfg,
         debug=bool(args.debug),
         render_w=(int(args.render_w) if args.render_w is not None else None),
         render_h=(int(args.render_h) if args.render_h is not None else None),
@@ -475,6 +1316,11 @@ def main() -> None:
     expert_xz_online: List[List[float]] = []
     online_summary_rows: List[Dict[str, float | int]] = []
     online_rollout_rows: List[Dict[str, float | int]] = []
+    reward_rows: List[Dict[str, Any]] = []
+    debug_shard: Dict[str, List[Any]] = {"reward": [], "done": [], "replay": [], "meta": []}
+    reward_sum = 0.0
+    rendered_frames: List[np.ndarray] = []
+    env_cache = _load_env_cache(scene=scene)
 
     start_pose = np.asarray(getattr(sim, "start_ego"), dtype=np.float64)
     ego_xz.append([float(start_pose[0, 3]), float(start_pose[2, 3])])
@@ -491,7 +1337,16 @@ def main() -> None:
     done = False
     steps = 0
     frames = 0
-    writer.append_data(_grid_frame(obs))
+    first = _grid_frame(obs)
+    first = _overlay_debug_text(
+        first,
+        [
+            f"scene={scene:03d} step=0 frame={int(getattr(sim, 'now_frame', -1))}",
+            "reward=NA cum_reward=0.000",
+        ],
+    )
+    writer.append_data(first)
+    rendered_frames.append(first.copy())
     frames += 1
 
     while (max_steps is None or steps < max_steps) and not done:
@@ -538,6 +1393,9 @@ def main() -> None:
 
         obs, _reward, terminated, truncated, _info = env.step(action)
         done = bool(terminated or truncated)
+        info = dict(_info or {})
+        reward_v = float(_reward)
+        reward_sum += reward_v
 
         pose_after = np.asarray(obs.get("ego_pose", getattr(sim, "start_ego")), dtype=np.float64)
         ego_xz.append([float(pose_after[0, 3]), float(pose_after[2, 3])])
@@ -567,6 +1425,27 @@ def main() -> None:
             expert_after_xz = np.asarray([np.nan, np.nan], dtype=np.float64)
         cmd_obs, vel_obs, acc_obs = _extract_status_from_obs(obs)
         cmd_ds, vel_ds, acc_ds = _dataset_status_from_sim(sim, frame_after)
+        reward_rows.append(
+            {
+                "step": int(steps),
+                "frame_before": int(now_frame),
+                "frame_after": int(frame_after),
+                "reward": float(reward_v),
+                "cum_reward": float(reward_sum),
+                "done": bool(done),
+                "done_reason": str(info.get("done_reason", "")),
+                "dynamic_collision": bool(info.get("dynamic_collision", False)),
+                "static_collision": bool(info.get("static_collision", False)),
+                "cost_reward": float(info.get("cost_reward", 0.0)),
+                "progress_reward": float(info.get("progress_reward", 0.0)),
+                "craft_safety_cost": float(info.get("craft_safety_cost", 0.0)),
+                "craft_forward_progress": float(info.get("craft_forward_progress", 0.0)),
+            }
+        )
+        debug_shard["reward"].append(float(reward_v))
+        debug_shard["done"].append(bool(done))
+        debug_shard["replay"].append(replay)
+        debug_shard["meta"].append({"step": int(steps), "frame_before": int(now_frame), "frame_after": int(frame_after), "info": info})
 
         online_summary_rows.append(
             {
@@ -627,7 +1506,24 @@ def main() -> None:
             f"acc_dataset={np.array2string(acc_ds, precision=6, suppress_small=False)}"
         )
 
-        writer.append_data(_grid_frame(obs))
+        snap = env_cache.get(int(frame_after), None)
+        world_pose = _world_pose_from_sim(sim)
+        dbg = [
+            f"scene={scene:03d} step={int(steps)} frame={int(frame_after)}",
+            f"reward={reward_v:.5f} cum_reward={reward_sum:.5f}",
+            f"progress={float(info.get('progress_reward', 0.0)):.5f} cost={float(info.get('cost_reward', 0.0)):.5f}",
+            f"dyn_col={bool(info.get('dynamic_collision', False))} static_col={bool(info.get('static_collision', False))} done_reason={info.get('done_reason', '')}",
+        ]
+        frame_out = _overlay_debug_text(_grid_frame(obs), dbg)
+        if bool(args.draw_collision_bev):
+            frame_out, hit_tokens = _draw_collision_bev(frame_out, world_pose=world_pose, snap=snap, view_m=25.0)
+            if len(hit_tokens) > 0:
+                dbg2 = [f"collision_tokens={','.join(hit_tokens[:2])}"]
+                frame_out = _overlay_debug_text(frame_out, dbg + dbg2)
+                if isinstance(reward_rows[-1], dict):
+                    reward_rows[-1]["collision_tokens"] = "|".join(hit_tokens)
+        writer.append_data(frame_out)
+        rendered_frames.append(frame_out.copy())
         frames += 1
         steps += 1
 
@@ -652,6 +1548,74 @@ def main() -> None:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
+    reward_csv = os.path.splitext(traj_csv)[0] + "_step_reward.csv"
+    _ensure_parent(reward_csv)
+    if reward_rows:
+        with open(reward_csv, "w", newline="", encoding="utf-8") as f:
+            fieldnames = sorted({str(k) for row in reward_rows for k in row.keys()})
+            rw = csv.DictWriter(f, fieldnames=fieldnames)
+            rw.writeheader()
+            rw.writerows(reward_rows)
+        print(f"reward_csv_saved={reward_csv}")
+
+    reward_plot = os.path.splitext(traj_plot)[0] + "_reward_curve.png"
+    try:
+        if reward_rows:
+            xs = [int(r["step"]) for r in reward_rows]
+            ys = [float(r["reward"]) for r in reward_rows]
+            cs = [float(r["cum_reward"]) for r in reward_rows]
+            fig, ax1 = plt.subplots(figsize=(9, 4), dpi=150)
+            ax1.plot(xs, ys, color="#d62728", label="step_reward")
+            ax1.axhline(0.0, color="#888888", linewidth=1.0)
+            ax2 = ax1.twinx()
+            ax2.plot(xs, cs, color="#1f77b4", label="cum_reward")
+            ax1.set_xlabel("step")
+            ax1.set_ylabel("reward")
+            ax2.set_ylabel("cum_reward")
+            ax1.set_title(f"Scene {scene:03d} Reward Curve")
+            fig.tight_layout()
+            fig.savefig(reward_plot)
+            plt.close(fig)
+            print(f"reward_plot_saved={reward_plot}")
+    except Exception as e:
+        print(f"[reward-plot] failed: {e}")
+
+    shard_path = os.path.splitext(traj_csv)[0] + "_debug_shard.pt"
+    try:
+        torch.save(debug_shard, shard_path)
+        print(f"debug_shard_saved={shard_path}")
+    except Exception as e:
+        print(f"[debug-shard] failed: {e}")
+    if str(args.reward_detail_format) == "ipynb":
+        detail_ipynb = os.path.splitext(traj_csv)[0] + "_reward_detail.ipynb"
+        try:
+            _save_reward_detail_notebook(
+                out_path=detail_ipynb,
+                scene=scene,
+                reward_rows=reward_rows,
+                debug_shard=debug_shard,
+                reward_cfg=reward_cfg,
+                video_path=out_path,
+                reward_csv_path=reward_csv,
+                debug_shard_path=shard_path,
+            )
+            print(f"reward_detail_notebook_saved={detail_ipynb}")
+        except Exception as e:
+            print(f"[reward-detail-notebook] failed: {e}")
+
+    if bool(args.save_keyframes) and reward_rows and rendered_frames:
+        try:
+            key_root = os.path.splitext(traj_plot)[0] + "_keyframes"
+            os.makedirs(key_root, exist_ok=True)
+            order = sorted(range(len(reward_rows)), key=lambda i: float(reward_rows[i]["reward"]))
+            for idx in order[: max(1, int(args.keyframes_k))]:
+                step_i = int(reward_rows[idx]["step"])
+                img_i = min(step_i + 1, len(rendered_frames) - 1)
+                out_png = os.path.join(key_root, f"step{step_i:03d}_reward{float(reward_rows[idx]['reward']):+.4f}.png")
+                imageio.imwrite(out_png, rendered_frames[img_i])
+            print(f"keyframes_saved={key_root}")
+        except Exception as e:
+            print(f"[keyframes] failed: {e}")
 
     ego_xz_np = np.asarray(ego_xz, dtype=np.float64)
     expert_xz_np = np.asarray(expert_xz_online, dtype=np.float64)

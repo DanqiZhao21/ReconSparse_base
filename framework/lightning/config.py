@@ -20,6 +20,7 @@ class ActorLearnerLightningConfig:
     vf_coef: float = 0.0
     value_clip_eps: float = 0.0
     kl_coef: float = 0.0
+    closed_loop_loss_coef: float = 1.0
     forward_kl_coef: float = 0.0
     reverse_kl_coef: float = 0.0
     distill_temperature: float = 1.0
@@ -32,6 +33,8 @@ class ActorLearnerLightningConfig:
     grpo_norm_eps: float = 1e-6
     grpo_use_rank_adv: bool = False
     grpo_score_clip: float | None = None
+    grpo_objective: str = "logprob"
+    grpo_temperature: float = 1.0
     grpo_debug_visualize: bool = False
     grpo_debug_dir: str | None = None
     grpo_debug_max_batches: int = 0
@@ -70,54 +73,27 @@ def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(shared_cfg, dict):
         shared_cfg = {}
 
-    reinforce_cfg = train_cfg.get("reinforce", {}) or {}
-    if not isinstance(reinforce_cfg, dict):
-        reinforce_cfg = {}
-    reinforcepp_cfg = train_cfg.get("reinforcepp", {}) or {}
-    if not isinstance(reinforcepp_cfg, dict):
-        reinforcepp_cfg = {}
-
-    legacy = {
-        "coef": float(reinforce_cfg.get("grpo_coef", reinforcepp_cfg.get("grpo_coef", 0.0))),
-        "num_candidates": int(reinforce_cfg.get("grpo_num_candidates", reinforcepp_cfg.get("grpo_num_candidates", 0))),
-        "candidate_select": str(
-            reinforce_cfg.get("grpo_candidate_select", reinforcepp_cfg.get("grpo_candidate_select", "topk"))
-        ),
-        "norm_eps": float(reinforce_cfg.get("grpo_norm_eps", reinforcepp_cfg.get("grpo_norm_eps", 1e-6))),
-        "use_rank_adv": bool(
-            reinforce_cfg.get("grpo_use_rank_adv", reinforcepp_cfg.get("grpo_use_rank_adv", False))
-        ),
-        "score_clip": reinforce_cfg.get("grpo_score_clip", reinforcepp_cfg.get("grpo_score_clip", None)),
-        "debug_visualize": bool(
-            reinforce_cfg.get("grpo_debug_visualize", reinforcepp_cfg.get("grpo_debug_visualize", False))
-        ),
-        "debug_dir": reinforce_cfg.get("grpo_debug_dir", reinforcepp_cfg.get("grpo_debug_dir", None)),
-        "debug_max_batches": int(
-            reinforce_cfg.get("grpo_debug_max_batches", reinforcepp_cfg.get("grpo_debug_max_batches", 0))
-        ),
-        "debug_top_k": int(reinforce_cfg.get("grpo_debug_top_k", reinforcepp_cfg.get("grpo_debug_top_k", 4))),
-    }
-
     config_path = shared_cfg.get("config_path", None)
     if config_path is not None and str(config_path).strip() != "":
         raise NotImplementedError(
             "train.grpo.config_path is reserved for future external-yaml merging and is not supported yet"
         )
 
-    shared_present = len(shared_cfg) > 0
     resolved = {
-        "enabled": bool(shared_cfg.get("enable", legacy["coef"] > 0.0)) if shared_present else bool(legacy["coef"] > 0.0),
+        "enabled": bool(shared_cfg.get("enable", False)),
         "config_path": None if config_path is None else str(config_path),
-        "coef": float(shared_cfg.get("coef", legacy["coef"])) if shared_present else float(legacy["coef"]),
-        "num_candidates": int(shared_cfg.get("num_candidates", legacy["num_candidates"])) if shared_present else int(legacy["num_candidates"]),
-        "candidate_select": str(shared_cfg.get("candidate_select", legacy["candidate_select"])) if shared_present else str(legacy["candidate_select"]),
-        "norm_eps": float(shared_cfg.get("norm_eps", legacy["norm_eps"])) if shared_present else float(legacy["norm_eps"]),
-        "use_rank_adv": bool(shared_cfg.get("use_rank_adv", legacy["use_rank_adv"])) if shared_present else bool(legacy["use_rank_adv"]),
-        "score_clip": shared_cfg.get("score_clip", legacy["score_clip"]) if shared_present else legacy["score_clip"],
-        "debug_visualize": bool(shared_cfg.get("debug_visualize", legacy["debug_visualize"])) if shared_present else bool(legacy["debug_visualize"]),
-        "debug_dir": shared_cfg.get("debug_dir", legacy["debug_dir"]) if shared_present else legacy["debug_dir"],
-        "debug_max_batches": int(shared_cfg.get("debug_max_batches", legacy["debug_max_batches"])) if shared_present else int(legacy["debug_max_batches"]),
-        "debug_top_k": int(shared_cfg.get("debug_top_k", legacy["debug_top_k"])) if shared_present else int(legacy["debug_top_k"]),
+        "coef": float(shared_cfg.get("coef", 0.0)),
+        "num_candidates": int(shared_cfg.get("num_candidates", 0)),
+        "candidate_select": str(shared_cfg.get("candidate_select", "topk")),
+        "norm_eps": float(shared_cfg.get("norm_eps", 1e-6)),
+        "use_rank_adv": bool(shared_cfg.get("use_rank_adv", False)),
+        "score_clip": shared_cfg.get("score_clip", None),
+        "objective": str(shared_cfg.get("objective", "logprob")),
+        "temperature": float(shared_cfg.get("temperature", 1.0)),
+        "debug_visualize": bool(shared_cfg.get("debug_visualize", False)),
+        "debug_dir": shared_cfg.get("debug_dir", None),
+        "debug_max_batches": int(shared_cfg.get("debug_max_batches", 0)),
+        "debug_top_k": int(shared_cfg.get("debug_top_k", 4)),
     }
     if not bool(resolved["enabled"]):
         resolved["coef"] = 0.0
@@ -151,6 +127,12 @@ def actor_learner_lightning_config_from_algorithm(
         vf_coef=float(getattr(algo, "vf_coef", 0.0)),
         value_clip_eps=float(getattr(algo, "value_clip_eps", algo_meta.get("value_clip_eps", 0.0))),
         kl_coef=float(getattr(algo, "kl_coef", 0.0)),
+        closed_loop_loss_coef=float(
+            (train_cfg.get("reinforcepp", {}) or {}).get(
+                "policy_grad_weight",
+                1.0,
+            )
+        ),
         forward_kl_coef=float(getattr(algo, "forward_kl_coef", 0.0)),
         reverse_kl_coef=float(getattr(algo, "reverse_kl_coef", 0.0)),
         distill_temperature=float(getattr(algo, "distill_temperature", 1.0)),
@@ -163,6 +145,8 @@ def actor_learner_lightning_config_from_algorithm(
         grpo_norm_eps=float(grpo_cfg["norm_eps"]),
         grpo_use_rank_adv=bool(grpo_cfg["use_rank_adv"]),
         grpo_score_clip=grpo_cfg["score_clip"],
+        grpo_objective=str(grpo_cfg["objective"]),
+        grpo_temperature=float(grpo_cfg["temperature"]),
         grpo_debug_visualize=bool(grpo_cfg["debug_visualize"]),
         grpo_debug_dir=grpo_cfg["debug_dir"],
         grpo_debug_max_batches=int(grpo_cfg["debug_max_batches"]),
@@ -172,7 +156,7 @@ def actor_learner_lightning_config_from_algorithm(
         gae_lambda=float(train_cfg.get("gae_lambda", 0.95)),
         ddp_seed=int(getattr(algo, "ddp_seed", ((train_cfg.get("ddp", {}) or {}).get("seed", 0)))),
         minibatch_size=int(getattr(algo, "minibatch_size", train_cfg.get("minibatch_size", 64))),
-        include_obs=bool(algo_kind.startswith("ppo")),
+        include_obs=bool(algo_kind.startswith("ppo") and not bool(algo_meta.get("critic_use_agent_features", False))),
         use_distributed_sampler=bool(getattr(algo, "use_distributed_sampler", True)),
         mode=str(actor_learner_cfg.get("mode", "async")).strip().lower(),
         num_actors=int(actor_learner_cfg.get("num_actors", 1)),

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from framework.agent.policy_sparsedrive_v2 import SparseDriveV2Policy
+from framework.agent.policy_sparsedrive_v2 import SparseDriveV2Policy, _apply_trainable_prefixes
 
 
 def _write_token2vad(path: Path) -> None:
@@ -29,17 +29,54 @@ def _write_token2vad(path: Path) -> None:
         pickle.dump(payload, handle)
 
 
+def test_apply_trainable_prefixes_can_freeze_backbone_while_training_other_modules() -> None:
+    module = torch.nn.Module()
+    module._backbone = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    module._status_encoding = torch.nn.Linear(2, 2)
+    module._trajectory_head = torch.nn.Sequential(torch.nn.Linear(2, 2))
+
+    total, trainable = _apply_trainable_prefixes(
+        module,
+        prefixes=[],
+        frozen_prefixes=["_backbone"],
+    )
+
+    assert total == 6
+    assert trainable == 4
+    assert all(not param.requires_grad for param in module._backbone.parameters())
+    assert all(param.requires_grad for param in module._status_encoding.parameters())
+    assert all(param.requires_grad for param in module._trajectory_head.parameters())
+
+
 def test_policy_uses_nuscenes_pdm_backend_when_configured(monkeypatch) -> None:
     policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
     policy._nuscenes_scorer_config = {"backend": "nuscenes_pdm"}
-    policy._nuscenes_token_scorer = None
     policy._nuscenes_pdm_scorer = None
 
     class DummyBackend:
         pass
 
     monkeypatch.setattr(
-        "framework.algorithms.nuscenes_pdm_backend.NuScenesPDMScorer",
+        "framework.algorithms.nuscenes_pdm_scorer.NuScenesPDMScorer",
+        lambda **kwargs: DummyBackend(),
+    )
+
+    scorer = policy._ensure_counterfactual_scorer_backend()
+
+    assert isinstance(scorer, DummyBackend)
+    assert policy._nuscenes_pdm_scorer is scorer
+
+
+def test_policy_defaults_to_nuscenes_pdm_backend(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._nuscenes_scorer_config = {}
+    policy._nuscenes_pdm_scorer = None
+
+    class DummyBackend:
+        pass
+
+    monkeypatch.setattr(
+        "framework.algorithms.nuscenes_pdm_scorer.NuScenesPDMScorer",
         lambda **kwargs: DummyBackend(),
     )
 
@@ -183,7 +220,7 @@ def test_nuscenes_pdm_backend_returns_batch_candidate_scores(tmp_path: Path) -> 
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     traj_xyyaw = torch.tensor(
@@ -206,7 +243,7 @@ def test_nuscenes_pdm_backend_drivable_area_only_score_ignores_other_terms(monke
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path, score_mode="drivable_area_only")
 
@@ -257,7 +294,7 @@ def test_nuscenes_pdm_backend_dac_weight_scores_drivable_area_as_weighted_term(
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -314,7 +351,7 @@ def test_nuscenes_pdm_backend_builds_candidate_geometry_in_candidate_batch(tmp_p
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     traj_xyyaw = torch.tensor(
@@ -337,7 +374,7 @@ def test_nuscenes_pdm_backend_builds_candidate_geometry_in_candidate_batch(tmp_p
 
 
 def test_nuscenes_pdm_drivable_map_contains_points_in_candidate_batch() -> None:
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMDrivableMap
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMDrivableMap
 
     drivable_map = NuScenesPDMDrivableMap(
         polygons_xy=[
@@ -364,7 +401,7 @@ def test_nuscenes_pdm_backend_builds_ttc_projection_geometry_in_candidate_batch(
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     centers_xy = np.asarray(
@@ -392,7 +429,7 @@ def test_nuscenes_pdm_backend_query_hits_accepts_batched_polygons(tmp_path: Path
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     scene_objects = [
@@ -426,7 +463,7 @@ def test_nuscenes_pdm_backend_builds_sample_context_once_per_sample(monkeypatch,
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -489,7 +526,7 @@ def test_nuscenes_pdm_backend_reuses_persisted_derived_context_across_instances(
     scene_cache_root = tmp_path / "scene_cache"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer_first = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -553,7 +590,7 @@ def test_nuscenes_pdm_backend_builds_sample_occupancy_context_once_per_sample(mo
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -611,7 +648,7 @@ def test_nuscenes_pdm_backend_builds_batched_candidate_polygon_arrays(tmp_path: 
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     traj_xyyaw = torch.tensor(
@@ -639,7 +676,7 @@ def test_nuscenes_pdm_backend_collision_ttc_uses_batch_query_shapes(monkeypatch,
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
 
@@ -684,11 +721,59 @@ def test_nuscenes_pdm_backend_collision_ttc_uses_batch_query_shapes(monkeypatch,
     assert sorted(shape[0] for shape in query_shapes) == [6, 18]
 
 
+def test_nuscenes_pdm_backend_returns_step_level_collision_matrix(monkeypatch, tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    traj_xyyaw = torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+    sample_context.ttc_agent_states = []
+
+    class NonEmptyOccupancyMap:
+        def __len__(self) -> int:
+            return 1
+
+        def query(self, geometry, predicate=None):
+            del predicate
+            return np.zeros((2, 0), dtype=np.int64)
+
+    sample_context.occupancy_map = NonEmptyOccupancyMap()
+
+    step_hits = np.asarray(
+        [
+            [False, True, False],
+            [False, False, False],
+        ],
+        dtype=bool,
+    )
+    monkeypatch.setattr(
+        scorer,
+        "_query_hits_per_candidate_grid",
+        lambda occupancy_map, polygons_grid, *, predicate="intersects": step_hits.copy()
+        if np.asarray(polygons_grid, dtype=object).shape == (2, 3)
+        else np.zeros((2, 9), dtype=bool),
+    )
+
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["no_collision"].tolist() == pytest.approx([0.0, 1.0])
+    assert metrics["collision_matrix"].shape == (2, 3)
+    assert np.array_equal(metrics["collision_matrix"], step_hits)
+
+
 def test_nuscenes_pdm_backend_prebuilds_ttc_projection_polygon_arrays(tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     traj_xyyaw = torch.tensor(
@@ -718,7 +803,7 @@ def test_nuscenes_pdm_backend_batch_drivable_and_lane_queries_return_expected_sh
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     traj_xyyaw = torch.tensor(
@@ -790,7 +875,7 @@ def test_nuscenes_pdm_backend_drivable_area_uses_ego_box_corners(tmp_path: Path)
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     traj_xyyaw = torch.tensor(
@@ -844,12 +929,50 @@ def test_nuscenes_pdm_backend_drivable_area_uses_ego_box_corners(tmp_path: Path)
     assert metrics["drivable_area"][0] == pytest.approx(0.0)
 
 
+def test_nuscenes_pdm_backend_driving_direction_prefers_plausible_same_direction_lane(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
+    horizon = 8
+    traj_xyyaw = torch.zeros((1, 1, horizon, 3), dtype=torch.float32)
+    traj_xyyaw[0, 0, :, 0] = torch.arange(horizon, dtype=torch.float32)
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+
+    sample_context = scorer._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
+    sample_context.centerline_segments_xy = np.asarray(
+        [
+            [[10.0, 2.24], [0.0, 2.24]],
+            [[0.0, -2.50], [10.0, -2.50]],
+        ],
+        dtype=np.float32,
+    )
+    sample_context.centerline_tangents_xy = np.asarray(
+        [
+            [-1.0, 0.0],
+            [1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    metrics = scorer._batch_map_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert metrics["driving_direction"].shape == (1,)
+    assert metrics["driving_direction"][0] == pytest.approx(1.0)
+
+
 def test_nuscenes_pdm_backend_batch_project_progress_matches_scalar_reference(tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
-    from framework.algorithms.nuscenes_token_scorer import _project_progress
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_scorer_utils import _project_progress
 
     scorer = NuScenesPDMScorer(token2vad_path=token2vad_path)
     final_points_xy = np.asarray(
@@ -889,7 +1012,7 @@ def test_nuscenes_pdm_backend_ea_gate_is_optional_and_gates_batched_candidates(
     scene_cache_root = tmp_path / "scene_cache"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     traj_xyyaw = torch.tensor(
         [
@@ -972,7 +1095,7 @@ def test_nuscenes_pdm_backend_can_disable_driving_direction_gate(
     scene_cache_root = tmp_path / "scene_cache"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     traj_xyyaw = torch.tensor(
         [
@@ -1032,7 +1155,7 @@ def test_nuscenes_pdm_backend_ttc_uses_agent_future_truth_boxes(
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -1110,7 +1233,7 @@ def test_nuscenes_pdm_backend_ttc_falls_back_to_ctrv_when_future_truth_missing(
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -1170,7 +1293,7 @@ def test_nuscenes_pdm_backend_no_collision_uses_future_agent_boxes_not_static_sn
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -1246,7 +1369,7 @@ def test_nuscenes_pdm_backend_no_collision_detects_future_agent_box_overlap(
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,
@@ -1322,7 +1445,7 @@ def test_nuscenes_pdm_backend_no_collision_aligns_future_agents_to_candidate_ste
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)
 
-    from framework.algorithms.nuscenes_pdm_backend import NuScenesPDMScorer
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
 
     scorer = NuScenesPDMScorer(
         token2vad_path=token2vad_path,

@@ -10,12 +10,12 @@
 """
 #你之后可以直接这样跑全流程：
 cd /root/clone/ReconDreamer-RL
-bash tools/run_train_eval_pipeline.sh
+bash script/run_train_eval_pipeline.sh
 
 #你之后可以直接这样跑全流程：
 cd /root/clone/ReconDreamer-RL
-bash tools/run_train_eval_pipeline.sh --skip-reinforcepp
+bash script/run_train_eval_pipeline.sh --skip-reinforcepp
 
 #如果你想先小规模试跑，比如只跑前 4 个场景：
 cd /root/clone/ReconDreamer-RL
-bash tools/run_train_eval_pipeline.sh --max-scenes 4
+bash script/run_train_eval_pipeline.sh --max-scenes 4

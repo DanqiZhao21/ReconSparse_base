@@ -137,6 +137,7 @@ def build_training_batch(
         and bool(getattr(value_module, "expects_value_features", False))
         and callable(getattr(agent, "value_features_from_replay_batch", None))
     )
+    requires_shard_obs = bool(is_ppo_family and not use_agent_value_features)
 
     if is_ppo_family:
         if value_net is None:
@@ -145,7 +146,13 @@ def build_training_batch(
         with torch.inference_mode():
             for fp in selected:
                 shard = torch.load(fp, map_location="cpu")
-                obs_i = shard["obs"].to(device=device, dtype=torch.float32)
+                obs_raw = shard.get("obs", None)
+                if requires_shard_obs and not torch.is_tensor(obs_raw):
+                    raise RuntimeError(
+                        "PPO fallback critic requires shard['obs']; enable actor_learner.store_obs "
+                        "or set train.critic_use_agent_features=true for replay-feature critics"
+                    )
+                obs_i = obs_raw.to(device=device, dtype=torch.float32) if torch.is_tensor(obs_raw) else None
                 old_logp_i = shard["old_logp"].to(device=device, dtype=torch.float32).view(-1)
                 rewards_i = shard["reward"].to(device=device, dtype=torch.float32).view(-1)
                 dones_i = shard["done"].to(device=device, dtype=torch.float32).view(-1)
@@ -177,7 +184,11 @@ def build_training_batch(
                     )
                 )
                 next_obs = shard.get("next_obs", None)
-                next_obs_t = obs_i[-1] if next_obs is None else next_obs.to(device=device, dtype=torch.float32)
+                next_obs_t = None
+                if torch.is_tensor(next_obs):
+                    next_obs_t = next_obs.to(device=device, dtype=torch.float32)
+                elif obs_i is not None:
+                    next_obs_t = obs_i[-1]
                 bootstrap_allowed = terminated_last < 0.5
                 if use_agent_value_features:
                     value_features_i = agent.value_features_from_replay_batch(replay_i).to(device=device, dtype=torch.float32)
@@ -195,6 +206,11 @@ def build_training_batch(
                             else torch.zeros((), device=device, dtype=values_i.dtype if int(values_i.numel()) > 0 else torch.float32)
                         )
                 else:
+                    if obs_i is None or next_obs_t is None:
+                        raise RuntimeError(
+                            "PPO fallback critic requires shard['obs'] and shard['next_obs']; "
+                            "enable actor_learner.store_obs or use replay value features"
+                        )
                     values_i = value_net(obs_i).detach().view(-1)
                     last_value = (
                         value_net(next_obs_t.unsqueeze(0)).detach().view(-1)[0]
@@ -211,7 +227,8 @@ def build_training_batch(
                     gae_lambda=float(gae_lambda),
                 )
 
-                obs_all.append(obs_i)
+                if obs_i is not None:
+                    obs_all.append(obs_i)
                 old_logp_all.append(old_logp_i)
                 old_value_all.append(values_i)
                 adv_all.append(adv_i)
@@ -256,7 +273,7 @@ def build_training_batch(
     n = int(adv.shape[0])
 
     if is_ppo_family:
-        if int(obs_batch.shape[0]) != n:
+        if requires_shard_obs and int(obs_batch.shape[0]) != n:
             raise RuntimeError(f"obs_batch length mismatch: obs={int(obs_batch.shape[0])} adv={n}")
         if int(old_logp.shape[0]) != n:
             raise RuntimeError(f"old_logp length mismatch: old_logp={int(old_logp.shape[0])} adv={n}")

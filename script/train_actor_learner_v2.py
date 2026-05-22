@@ -1,6 +1,8 @@
 import argparse
 import os
 import sys
+import time
+from pathlib import Path
 from typing import Any, Dict
 
 import torch
@@ -11,7 +13,13 @@ if REPO_ROOT not in sys.path:
 
 import yaml
 
+'''
+cd /root/clone/ReconDreamer-RL
 
+PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
+  --role orchestrator \
+  --config script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+'''
 def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
@@ -65,6 +73,32 @@ def load_runner_entrypoints() -> Dict[str, Any]:
     }
 
 
+def materialize_orchestrator_config(
+    cfg: Dict[str, Any],
+    *,
+    config_path: str,
+    timestamp: str | None = None,
+    generated_config_dir: str | os.PathLike[str] | None = None,
+) -> str:
+    from framework.runner.config_normalization import timestamp_actor_learner_buffer_dir
+
+    run_timestamp = timestamp or time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    resolved_buffer_dir = timestamp_actor_learner_buffer_dir(cfg, timestamp=run_timestamp)
+    if resolved_buffer_dir is None:
+        return str(config_path)
+
+    root = Path(generated_config_dir) if generated_config_dir is not None else Path(resolved_buffer_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    resolved_path = root / f"{run_timestamp}_{Path(config_path).stem}.yaml"
+    cfg.setdefault("train", {}).setdefault("actor_learner", {})["resolved_from_config"] = str(config_path)
+    cfg["train"]["actor_learner"]["run_timestamp"] = str(run_timestamp)
+    cfg["train"]["actor_learner"]["resolved_buffer_dir"] = str(resolved_buffer_dir)
+    cfg["train"]["actor_learner"]["resolved_config_path"] = str(resolved_path)
+    with resolved_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(cfg, handle, sort_keys=False)
+    return str(resolved_path)
+
+
 def main() -> None:
     torch.set_float32_matmul_precision("high")
     args = parse_args()
@@ -73,7 +107,8 @@ def main() -> None:
     entrypoints["normalize_actor_learner_cfg"](cfg)
 
     if args.role == "orchestrator":
-        entrypoints["orchestrator_main"](cfg, config_path=args.config)
+        config_path = materialize_orchestrator_config(cfg, config_path=args.config)
+        entrypoints["orchestrator_main"](cfg, config_path=config_path)
         return
     if args.role == "actor":
         entrypoints["actor_main"](

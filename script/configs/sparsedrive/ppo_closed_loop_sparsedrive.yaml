@@ -27,11 +27,9 @@ env:
       yaw_huber_delta_deg: 10.0
       severe_lateral_error_m: 3.0
       severe_yaw_error_deg: 30.0
+      severe_lateral_cost: 3.0
+      severe_yaw_cost: 2.0
       severe_gate_scale: 0.0
-      w_anchor_progress: 0.0
-      w_anchor_lateral: 0.0
-      anchor_free_m: 0.2
-      anchor_cap_m: 1.0
     comfort:
       w_longitudinal_jerk: 0.05
       longitudinal_jerk_free: 1.5
@@ -51,7 +49,7 @@ env:
         prefix: rl
     terminal:
       enable: true
-      xz_err_m_max: 5.0
+      xz_err_m_max: 25.0
       yaw_err_deg_max: 45.0
       terminate_on_xz_err: true
       terminate_on_yaw_err: true
@@ -62,7 +60,7 @@ env:
       apply_on_timeout: false
       apply_on_env_done: false
       yaw_err_patience_steps: 5
-      xy_err_patience_steps: 1
+      xy_err_patience_steps: 4
 
 train:
   wandb:

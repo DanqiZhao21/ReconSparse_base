@@ -179,7 +179,7 @@ def check_dynamic_collision(frame_info: dict, nusc: NuScenes) -> list:
         if not (ann["category_name"].startswith("vehicle") or ann["category_name"].startswith("human")):
             continue
         x, y, _ = ann["translation"]
-        l, w, _ = ann["size"]
+        w, l, _ = ann["size"]
         yaw = quat_to_yaw(ann["rotation"]) if "rotation" in ann else 0.0
         poly = oriented_box(x, y, l, w, yaw)
         if ego_poly.intersects(poly):
@@ -246,7 +246,7 @@ def render_frame_with_agents(frame_info: dict, nusc_map: NuScenesMapExplorer, nu
     for ann_token in sample_rec["anns"]:
         ann = nusc.get("sample_annotation", ann_token)
         x, y, _ = ann["translation"]
-        l, w, _ = ann["size"]
+        w, l, _ = ann["size"]
         yaw = quat_to_yaw(ann["rotation"]) if "rotation" in ann else 0.0
         poly = oriented_box(x, y, l, w, yaw)
         if ann["category_name"].startswith("vehicle"):

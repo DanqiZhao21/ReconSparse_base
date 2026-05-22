@@ -23,6 +23,13 @@ def _reward_summary_defaults() -> Dict[str, float]:
         "terminal_failure_count": 0.0,
         "terminal_timeout_count": 0.0,
         "terminal_env_done_count": 0.0,
+        "ea_available_count": 0.0,
+        "ea_evaluated_pairs_sum": 0.0,
+        "ea_cost_sum": 0.0,
+        "ea_risk_sum": 0.0,
+        "ea_max_value": 0.0,
+        "ea_min_value": 0.0,
+        "ea_mean_sum": 0.0,
         "step_count": 0.0,
     }
 
@@ -57,6 +64,21 @@ def _accumulate_reward_summary(summary: Dict[str, float], info: Any, *, reward: 
         summary["terminal_timeout_count"] += 1.0
     elif terminal_kind == "env_done":
         summary["terminal_env_done_count"] += 1.0
+    if bool(info.get("ea_available", False)):
+        summary["ea_available_count"] += 1.0
+        summary["ea_evaluated_pairs_sum"] += float(info.get("ea_evaluated_pairs", 0.0) or 0.0)
+        summary["ea_cost_sum"] += float(info.get("ea_cost", 0.0) or 0.0)
+        summary["ea_risk_sum"] += float(info.get("ea_risk", 0.0) or 0.0)
+        ea_max = float(info.get("ea_max", 0.0) or 0.0)
+        ea_min = float(info.get("ea_min", ea_max) or 0.0)
+        ea_mean = float(info.get("ea_mean", ea_max) or 0.0)
+        if summary["ea_available_count"] <= 1.0:
+            summary["ea_max_value"] = ea_max
+            summary["ea_min_value"] = ea_min
+        else:
+            summary["ea_max_value"] = max(float(summary["ea_max_value"]), ea_max)
+            summary["ea_min_value"] = min(float(summary["ea_min_value"]), ea_min)
+        summary["ea_mean_sum"] += ea_mean
 
 
 def _default_obs_tensor(obs: Any) -> torch.Tensor:
@@ -137,6 +159,7 @@ def collect_single_env_shard(
     actor_id: int,
     local_ver: int,
     shard_idx: int,
+    store_obs: bool = True,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -159,9 +182,11 @@ def collect_single_env_shard(
     while step_count < int(horizon):
         obs_decision = obs
         step_timing: Dict[str, float] = {}
-        t0 = time.perf_counter()
-        obs_t = _default_obs_tensor(obs_decision)
-        step_timing["obs_tensor_s"] = float(time.perf_counter() - t0)
+        obs_t: torch.Tensor | None = None
+        if bool(store_obs):
+            t0 = time.perf_counter()
+            obs_t = _default_obs_tensor(obs_decision)
+            step_timing["obs_tensor_s"] = float(time.perf_counter() - t0)
         t0 = time.perf_counter()
         action0, logp, replay = agent.act(obs_decision, eta=eta, mode_idx=mode_idx, mode_select=mode_select)
         step_timing["act_s"] = float(time.perf_counter() - t0)
@@ -174,7 +199,8 @@ def collect_single_env_shard(
         next_obs_after = obs
         _accumulate_reward_summary(reward_summary, _info, reward=float(reward))
 
-        obs_buf.append(obs_t)
+        if obs_t is not None:
+            obs_buf.append(obs_t)
         old_logp_buf.append(logp.detach().cpu().float())
         replay_buf.append(replay)
         rew_buf.append(float(reward))
@@ -183,7 +209,8 @@ def collect_single_env_shard(
         truncated_buf.append(1.0 if bool(truncated) else 0.0)
         step_count += 1
 
-        last_next_obs_t = _default_obs_tensor(next_obs_after)
+        if bool(store_obs):
+            last_next_obs_t = _default_obs_tensor(next_obs_after)
         last_done = 1.0 if done else 0.0
         last_terminated = 1.0 if bool(terminated) else 0.0
 
@@ -195,7 +222,9 @@ def collect_single_env_shard(
             counters["reset_count"] += 1
         step_records.append(step_timing)
 
-    next_obs_t = last_next_obs_t if last_next_obs_t is not None else _default_obs_tensor(obs)
+    next_obs_t = None
+    if bool(store_obs):
+        next_obs_t = last_next_obs_t if last_next_obs_t is not None else _default_obs_tensor(obs)
     next_value_feature_t0 = time.perf_counter()
     next_value_feature = _next_value_feature(agent, next_obs_after if step_count > 0 else obs)
     next_value_feature_s = float(time.perf_counter() - next_value_feature_t0)
@@ -207,13 +236,11 @@ def collect_single_env_shard(
         counters=counters,
     )
     shard = {
-        "obs": torch.stack(obs_buf, dim=0),
         "old_logp": torch.stack(old_logp_buf, dim=0).view(-1),
         "reward": torch.tensor(rew_buf, dtype=torch.float32),
         "done": torch.tensor(done_buf, dtype=torch.float32),
         "terminated": torch.tensor(terminated_buf, dtype=torch.float32),
         "truncated": torch.tensor(truncated_buf, dtype=torch.float32),
-        "next_obs": next_obs_t,
         "done_last": torch.tensor(float(last_done), dtype=torch.float32),
         "terminated_last": torch.tensor(float(last_terminated), dtype=torch.float32),
         "replay": replay_buf,
@@ -228,6 +255,9 @@ def collect_single_env_shard(
             "reward_summary": reward_summary,
         },
     }
+    if bool(store_obs):
+        shard["obs"] = torch.stack(obs_buf, dim=0)
+        shard["next_obs"] = next_obs_t
     if next_value_feature is not None:
         shard["next_value_feature"] = next_value_feature
     return shard, obs
@@ -246,6 +276,7 @@ def collect_vector_env_shards(
     actor_id: int,
     local_ver: int,
     shard_idx_per_env: List[int],
+    store_obs: bool = True,
 ) -> tuple[List[Dict[str, Any]], List[Any]]:
     obs_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
     old_logp_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
@@ -266,7 +297,7 @@ def collect_vector_env_shards(
     collect_t0 = time.perf_counter()
     while step_count < int(horizon):
         act_t0 = time.perf_counter()
-        obs_t_list = [_default_obs_tensor(obs) for obs in obs_list]
+        obs_t_list = [_default_obs_tensor(obs) for obs in obs_list] if bool(store_obs) else []
         actions0, logps, replays = agent.act_batch(
             obs_list,
             eta=eta,
@@ -296,7 +327,8 @@ def collect_vector_env_shards(
         obs_list = next_obs_list
 
         for i in range(int(num_envs_per_actor)):
-            obs_bufs[i].append(obs_t_list[i])
+            if bool(store_obs):
+                obs_bufs[i].append(obs_t_list[i])
             old_logp_bufs[i].append(logps[i].detach().cpu().float())
             replay_bufs[i].append(replays[i])
             rew_bufs[i].append(float(reward_list[i]))
@@ -304,7 +336,8 @@ def collect_vector_env_shards(
             done_bufs[i].append(1.0 if step_done[i] else 0.0)
             terminated_bufs[i].append(1.0 if bool(term_list[i]) else 0.0)
             truncated_bufs[i].append(1.0 if bool(trunc_list[i]) else 0.0)
-            last_next_obs_ts[i] = _default_obs_tensor(step_next_obs[i])
+            if bool(store_obs):
+                last_next_obs_ts[i] = _default_obs_tensor(step_next_obs[i])
             last_next_obs_raw[i] = step_next_obs[i]
             last_dones[i] = 1.0 if step_done[i] else 0.0
             last_terminateds[i] = 1.0 if bool(term_list[i]) else 0.0
@@ -321,7 +354,9 @@ def collect_vector_env_shards(
 
     shards: List[Dict[str, Any]] = []
     for i in range(int(num_envs_per_actor)):
-        next_obs_t = last_next_obs_ts[i] if last_next_obs_ts[i] is not None else _default_obs_tensor(obs_list[i])
+        next_obs_t = None
+        if bool(store_obs):
+            next_obs_t = last_next_obs_ts[i] if last_next_obs_ts[i] is not None else _default_obs_tensor(obs_list[i])
         next_value_feature_t0 = time.perf_counter()
         next_value_feature = _next_value_feature(
             agent,
@@ -335,15 +370,12 @@ def collect_vector_env_shards(
             next_value_feature_s=float(next_value_feature_s),
             counters=counters_by_env[i],
         )
-        shards.append(
-            {
-                "obs": torch.stack(obs_bufs[i], dim=0),
+        shard_i = {
                 "old_logp": torch.stack(old_logp_bufs[i], dim=0).view(-1),
                 "reward": torch.tensor(rew_bufs[i], dtype=torch.float32),
                 "done": torch.tensor(done_bufs[i], dtype=torch.float32),
                 "terminated": torch.tensor(terminated_bufs[i], dtype=torch.float32),
                 "truncated": torch.tensor(truncated_bufs[i], dtype=torch.float32),
-                "next_obs": next_obs_t,
                 "done_last": torch.tensor(float(last_dones[i]), dtype=torch.float32),
                 "terminated_last": torch.tensor(float(last_terminateds[i]), dtype=torch.float32),
                 "replay": replay_bufs[i],
@@ -358,7 +390,10 @@ def collect_vector_env_shards(
                     "reward_summary": reward_summaries_by_env[i],
                 },
             }
-        )
+        if bool(store_obs):
+            shard_i["obs"] = torch.stack(obs_bufs[i], dim=0)
+            shard_i["next_obs"] = next_obs_t
+        shards.append(shard_i)
         if next_value_feature is not None:
             shards[-1]["next_value_feature"] = next_value_feature
     return shards, obs_list

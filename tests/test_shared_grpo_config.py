@@ -44,6 +44,8 @@ def test_shared_train_grpo_overrides_algorithm_grpo_fields() -> None:
             "norm_eps": 1.0e-6,
             "use_rank_adv": False,
             "score_clip": 1.5,
+            "objective": "expected_prob",
+            "temperature": 0.7,
             "debug_visualize": False,
             "debug_dir": "outputs/grpo",
             "debug_max_batches": 2,
@@ -64,13 +66,15 @@ def test_shared_train_grpo_overrides_algorithm_grpo_fields() -> None:
     assert learner_cfg.grpo_norm_eps == 1.0e-6
     assert learner_cfg.grpo_use_rank_adv is False
     assert learner_cfg.grpo_score_clip == 1.5
+    assert learner_cfg.grpo_objective == "expected_prob"
+    assert learner_cfg.grpo_temperature == 0.7
     assert learner_cfg.grpo_debug_visualize is False
     assert learner_cfg.grpo_debug_dir == "outputs/grpo"
     assert learner_cfg.grpo_debug_max_batches == 2
     assert learner_cfg.grpo_debug_top_k == 3
 
 
-def test_legacy_reinforcepp_grpo_fields_still_backfill_when_shared_grpo_missing() -> None:
+def test_missing_shared_grpo_disables_grpo_without_legacy_backfill() -> None:
     algo = SimpleNamespace(
         variant="reinforcepp",
         policy_lr=1.0e-4,
@@ -90,16 +94,13 @@ def test_legacy_reinforcepp_grpo_fields_still_backfill_when_shared_grpo_missing(
         "gae_lambda": 0.95,
         "minibatch_size": 4,
         "reinforcepp": {
-            "grpo_coef": 0.7,
-            "grpo_num_candidates": 6,
-            "grpo_candidate_select": "all",
-            "grpo_norm_eps": 1.0e-5,
-            "grpo_use_rank_adv": True,
-            "grpo_score_clip": 2.5,
-            "grpo_debug_visualize": True,
-            "grpo_debug_dir": "legacy/grpo",
-            "grpo_debug_max_batches": 4,
-            "grpo_debug_top_k": 2,
+            "norm_eps": 1.0e-8,
+            "kl_coef": 0.0,
+            "epochs": 1,
+            "policy_grad_weight": 0.5,
+            "forward_kl_coef": 0.0,
+            "reverse_kl_coef": 0.0,
+            "distill_temperature": 1.0,
         },
     }
 
@@ -110,16 +111,17 @@ def test_legacy_reinforcepp_grpo_fields_still_backfill_when_shared_grpo_missing(
         algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2, "rpp_norm_eps": 1.0e-8},
     )
 
-    assert learner_cfg.grpo_coef == 0.7
-    assert learner_cfg.grpo_num_candidates == 6
-    assert learner_cfg.grpo_candidate_select == "all"
-    assert learner_cfg.grpo_norm_eps == 1.0e-5
-    assert learner_cfg.grpo_use_rank_adv is True
-    assert learner_cfg.grpo_score_clip == 2.5
-    assert learner_cfg.grpo_debug_visualize is True
-    assert learner_cfg.grpo_debug_dir == "legacy/grpo"
-    assert learner_cfg.grpo_debug_max_batches == 4
-    assert learner_cfg.grpo_debug_top_k == 2
+    assert learner_cfg.grpo_enabled is False
+    assert learner_cfg.grpo_coef == 0.0
+    assert learner_cfg.grpo_num_candidates == 0
+    assert learner_cfg.grpo_candidate_select == "topk"
+    assert learner_cfg.grpo_norm_eps == 1.0e-6
+    assert learner_cfg.grpo_use_rank_adv is False
+    assert learner_cfg.grpo_score_clip is None
+    assert learner_cfg.grpo_debug_visualize is False
+    assert learner_cfg.grpo_debug_dir is None
+    assert learner_cfg.grpo_debug_max_batches == 0
+    assert learner_cfg.grpo_debug_top_k == 4
 
 
 def test_grpo_only_algorithm_builds_policy_only_learner_config() -> None:
@@ -161,3 +163,62 @@ def test_grpo_only_algorithm_builds_policy_only_learner_config() -> None:
     assert learner_cfg.grpo_enabled is True
     assert learner_cfg.grpo_coef == 1.0
     assert learner_cfg.include_obs is False
+
+
+def test_explicit_grpo_objective_is_respected() -> None:
+    algo = SimpleNamespace(
+        variant="reinforcepp",
+        policy_lr=1.0e-4,
+        value_lr=None,
+        weight_decay=0.0,
+        eta=1.0,
+        clip_eps=0.2,
+        kl_coef=0.0,
+        epochs=1,
+        grad_accum_steps=1,
+        max_grad_norm=0.5,
+        use_distributed_sampler=True,
+        ddp_seed=0,
+    )
+    train_cfg = {
+        "grpo": {"enable": True, "coef": 0.2, "num_candidates": 4, "objective": "logprob"},
+    }
+
+    learner_cfg = actor_learner_lightning_config_from_algorithm(
+        algo,
+        train_cfg=train_cfg,
+        actor_learner_cfg={"mode": "async", "num_actors": 1, "shards_per_update": 1},
+        algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2, "rpp_norm_eps": 1.0e-8},
+    )
+
+    assert learner_cfg.grpo_objective == "logprob"
+
+
+def test_reinforcepp_policy_grad_weight_sets_closed_loop_loss_coef() -> None:
+    algo = SimpleNamespace(
+        variant="reinforcepp",
+        policy_lr=1.0e-4,
+        value_lr=None,
+        weight_decay=0.0,
+        eta=1.0,
+        clip_eps=0.2,
+        kl_coef=0.0,
+        epochs=1,
+        grad_accum_steps=1,
+        max_grad_norm=0.5,
+        use_distributed_sampler=True,
+        ddp_seed=0,
+    )
+    train_cfg = {
+        "reinforcepp": {"policy_grad_weight": 0.5},
+        "grpo": {"enable": True, "coef": 1.0, "num_candidates": 4},
+    }
+
+    learner_cfg = actor_learner_lightning_config_from_algorithm(
+        algo,
+        train_cfg=train_cfg,
+        actor_learner_cfg={"mode": "async", "num_actors": 1, "shards_per_update": 1},
+        algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2, "rpp_norm_eps": 1.0e-8},
+    )
+
+    assert learner_cfg.closed_loop_loss_coef == 0.5

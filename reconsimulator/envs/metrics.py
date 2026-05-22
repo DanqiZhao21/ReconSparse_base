@@ -242,7 +242,8 @@ def check_dynamic_collision(frame_info: dict, nusc: NuScenes) -> list:
         if not (ann["category_name"].startswith("vehicle") or ann["category_name"].startswith("human")):
             continue
         x, y, _ = ann["translation"]
-        l, w, _ = ann["size"]
+        # nuScenes sample_annotation.size is [width, length, height].
+        w, l, _ = ann["size"]
         yaw = quat_to_yaw(ann["rotation"]) if "rotation" in ann else 0.0
         poly = oriented_box(x, y, l, w, yaw)
         if ego_poly.intersects(poly):
@@ -452,7 +453,7 @@ def compute_step_metrics(*, scene_id: int, step_idx: int, dataroot: Optional[str
 #         if not (ann["category_name"].startswith("vehicle") or ann["category_name"].startswith("human")):
 #             continue
 #         x, y, _ = ann["translation"]
-#         l, w, _ = ann["size"]
+#         w, l, _ = ann["size"]
 #         p_rel = np.array([float(x - ego_x), float(y - ego_y)], dtype=np.float32)
 #         v_ann = _ann_velocity(nusc, ann_token)
 #         v_rel = v_ann - ego_v
@@ -520,7 +521,7 @@ def compute_step_metrics(*, scene_id: int, step_idx: int, dataroot: Optional[str
 #         if not (ann["category_name"].startswith("vehicle") or ann["category_name"].startswith("human")):
 #             continue
 #         x, y, _ = ann["translation"]
-#         l, w, _ = ann["size"]
+#         w, l, _ = ann["size"]
 #         yaw = quat_to_yaw(ann["rotation"]) if "rotation" in ann else 0.0
 #         v_ann = _ann_velocity(nusc, ann_token)
 #         agents.append({

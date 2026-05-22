@@ -7,7 +7,6 @@ from typing import Any, Dict
 import torch
 import torch.nn.functional as F
 
-from framework.algorithms.pdm_scorer import score_counterfactual_trajectories
 from framework.algorithms.trajectory_policy_core import (
     agent_logp_from_replay_batch,
     compute_grpo_objective,
@@ -15,6 +14,7 @@ from framework.algorithms.trajectory_policy_core import (
     compute_ppo_objective,
     compute_reinforce_metrics,
     compute_reinforce_objective,
+    score_counterfactual_trajectories,
 )
 from framework.lightning.config import ActorLearnerLightningConfig
 from framework.lightning_compat import L
@@ -198,9 +198,12 @@ class TrajectoryLightningModule(L.LightningModule):
         grpo_loss = compute_grpo_objective(
             candidate_log_probs=candidate_log_probs,
             candidate_scores=candidate_scores,
+            candidate_score_logits=candidates.get("score_logits", None),
             score_norm_eps=float(self.learner_config.grpo_norm_eps),
             use_rank_adv=bool(self.learner_config.grpo_use_rank_adv),
             score_clip=self.learner_config.grpo_score_clip,
+            objective=str(getattr(self.learner_config, "grpo_objective", "logprob")),
+            temperature=float(getattr(self.learner_config, "grpo_temperature", 1.0)),
         )
         objective_s = float(time.perf_counter() - t0)
         if timing_parts is not None:
@@ -512,7 +515,12 @@ class TrajectoryLightningModule(L.LightningModule):
                         loss=ppo_loss,
                     )
                     timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
-                    loss = ppo_loss.loss
+                    loss = ppo_loss.loss * float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0))
+                    metrics["closed_loop_loss_coef"] = torch.as_tensor(
+                        float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0)),
+                        device=device,
+                        dtype=torch.float32,
+                    )
                 else:
                     reinforce_old_logp = old_logp if self.learner_config.algo_kind in {"reinforcepp", "reinforce_kl"} else None
                     t0 = time.perf_counter()
@@ -532,7 +540,12 @@ class TrajectoryLightningModule(L.LightningModule):
                         loss=r_loss,
                     )
                     timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
-                    loss = r_loss.loss
+                    loss = r_loss.loss * float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0))
+                    metrics["closed_loop_loss_coef"] = torch.as_tensor(
+                        float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0)),
+                        device=device,
+                        dtype=torch.float32,
+                    )
 
                 loss, metrics = self._maybe_apply_grpo_loss(
                     replay=replay,

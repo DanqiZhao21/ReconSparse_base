@@ -10,7 +10,7 @@ def build_gsplat_warmup_cmd(python_executable: str) -> List[str]:
     return [
         str(python_executable),
         '-c',
-        'from framework.utils.gsplat_backend import ensure_gsplat_backend; ensure_gsplat_backend()',
+        'from framework.utils.gsplat_backend import ensure_gsplat_legacy_backend; ensure_gsplat_legacy_backend()',
     ]
 
 

@@ -210,6 +210,73 @@ def test_ppo_training_step_adds_shared_grpo_auxiliary_loss(monkeypatch) -> None:
     assert torch.allclose(loss.detach(), torch.tensor(3.2, dtype=torch.float32))
 
 
+def test_training_step_applies_closed_loop_loss_coef_before_grpo(monkeypatch) -> None:
+    agent = _DummyAgent()
+    learner_config = ActorLearnerLightningConfig(
+        algo_kind="reinforcepp",
+        optimizer_config=LearnerOptimizerConfig(policy_lr=1.0e-4, value_lr=None, weight_decay=0.0),
+        eta=1.0,
+        clip_eps=0.2,
+        closed_loop_loss_coef=0.5,
+        grpo_enabled=True,
+        grpo_coef=1.0,
+        grpo_num_candidates=3,
+        grpo_candidate_select="topk",
+        grpo_norm_eps=1.0e-6,
+        grpo_use_rank_adv=False,
+        grpo_score_clip=None,
+    )
+    module = TrajectoryLightningModule(agent=agent, learner_config=learner_config)
+
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.agent_logp_from_replay_batch",
+        lambda *args, **kwargs: torch.tensor([0.1, 0.2], dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.compute_reinforce_objective",
+        lambda **kwargs: SimpleNamespace(
+            loss=torch.tensor(2.0, dtype=torch.float32),
+            loss_pi=torch.tensor(2.0, dtype=torch.float32),
+            approx_kl=torch.tensor(0.0, dtype=torch.float32),
+            clip_frac=torch.tensor(0.0, dtype=torch.float32),
+            ratio_mean=torch.tensor(1.0, dtype=torch.float32),
+            adv_mean=torch.tensor(0.0, dtype=torch.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.compute_reinforce_metrics",
+        lambda **kwargs: {"loss_pi": torch.tensor(2.0, dtype=torch.float32)},
+    )
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.score_counterfactual_trajectories",
+        lambda *args, **kwargs: torch.tensor([[1.0, 0.0, -1.0], [0.5, 0.0, -0.5]], dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.compute_grpo_objective",
+        lambda **kwargs: TrajectoryGRPOObjective(
+            loss=torch.tensor(3.0, dtype=torch.float32),
+            advantages=torch.zeros((2, 3), dtype=torch.float32),
+            score_mean=torch.tensor(0.0, dtype=torch.float32),
+            score_std=torch.tensor(1.0, dtype=torch.float32),
+            score_min=torch.tensor(-1.0, dtype=torch.float32),
+            score_max=torch.tensor(1.0, dtype=torch.float32),
+        ),
+    )
+
+    batch = {
+        "replay": [{"step": 0}, {"step": 1}],
+        "adv": torch.tensor([0.2, 0.4], dtype=torch.float32),
+        "ret": torch.tensor([1.0, 1.5], dtype=torch.float32),
+        "old_logp": torch.tensor([0.0, 0.0], dtype=torch.float32),
+    }
+
+    loss = module.training_step(batch, batch_idx=0)
+
+    assert torch.is_tensor(loss)
+    assert torch.allclose(loss.detach(), torch.tensor(4.0, dtype=torch.float32))
+    assert module.latest_metrics["closed_loop_loss_coef"] == 0.5
+
+
 def test_training_step_records_update_timing_parts(monkeypatch) -> None:
     agent = _DummyAgent()
     learner_config = ActorLearnerLightningConfig(
