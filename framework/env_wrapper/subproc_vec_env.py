@@ -47,6 +47,9 @@ class SceneSamplingEnv:
         render_w: int | None = None,
         render_h: int | None = None,
         step_frames: int | None = None,
+        env_backend: str = "recon",
+        hugsim_scenarios: List[Dict[str, str]] | None = None,
+        hugsim_kwargs: Dict[str, Any] | None = None,
     ) -> None:
         self._cuda = int(cuda)
         self._reward_cfg = reward_cfg or {}
@@ -55,6 +58,9 @@ class SceneSamplingEnv:
         self._render_w = (int(render_w) if render_w is not None else None)
         self._render_h = (int(render_h) if render_h is not None else None)
         self._step_frames = (int(step_frames) if step_frames is not None else None)
+        self._env_backend = str(env_backend or "recon").strip().lower()
+        self._hugsim_scenarios = list(hugsim_scenarios or [])
+        self._hugsim_kwargs = dict(hugsim_kwargs or {})
 
         self._scene_ids: List[int] = list(spec.scene_ids) if len(spec.scene_ids) else [0]
         self._scene_sampling = str(spec.scene_sampling or "random").lower()
@@ -64,16 +70,10 @@ class SceneSamplingEnv:
         self._reset_counter = 0
         self._scene_start_cursor: Dict[int, int] = {}
 
-        # Create once; scene switches via env.reset(scene=...)
+        # Create once; Recon scene switches via env.reset(scene=...). HUGSIM
+        # recreates when its sampled scenario index changes.
         init_scene = int(self._scene_ids[0])
-        self._env = RLReconEnv(
-            cuda=self._cuda,
-            scene=init_scene,
-            reward_cfg=self._reward_cfg,
-            debug=self._debug,
-            render_w=self._render_w,
-            render_h=self._render_h,
-        )
+        self._env = self._create_env_for_scene(init_scene)
         self._current_scene: int = int(init_scene)
 
         # Cache last (obs, info) so the main process can temporarily idle this worker
@@ -84,6 +84,29 @@ class SceneSamplingEnv:
     @property
     def env(self) -> RLReconEnv:
         return self._env
+
+    def _create_env_for_scene(self, scene_id: int):
+        if self._env_backend == "hugsim_ori":
+            from .hugsim_adapter import HUGSIMReconEnv
+
+            if not self._hugsim_scenarios:
+                raise RuntimeError("env_backend=hugsim_ori requires at least one HUGSIM scenario")
+            scenario = self._hugsim_scenarios[int(scene_id) % len(self._hugsim_scenarios)]
+            return HUGSIMReconEnv(
+                scenario_name=str(scenario["official_scene_name"]),
+                scenario_path=str(scenario["scenario_path"]),
+                reward_cfg=self._reward_cfg,
+                **self._hugsim_kwargs,
+            )
+
+        return RLReconEnv(
+            cuda=self._cuda,
+            scene=int(scene_id),
+            reward_cfg=self._reward_cfg,
+            debug=self._debug,
+            render_w=self._render_w,
+            render_h=self._render_h,
+        )
 
     def set_external_plan_local_xyyaw(self, plan: Any) -> None:
         self._env.set_external_plan_local_xyyaw(plan)
@@ -175,6 +198,8 @@ class SceneSamplingEnv:
             try:
                 sf = self._sample_start_frame(scene_id=sid)
                 self._reset_counter += 1
+                if self._env_backend == "hugsim_ori" and int(sid) != int(self._current_scene):
+                    self._env = self._create_env_for_scene(int(sid))
                 obs, info = self._env.reset(scene=int(sid), start_frame=int(sf), step_frames=self._step_frames)
                 self._current_scene = int(sid)
                 if info is None:
@@ -186,6 +211,10 @@ class SceneSamplingEnv:
                     except Exception:
                         pass
                     info.setdefault("start_frame", int(sf))
+                    if self._env_backend == "hugsim_ori" and self._hugsim_scenarios:
+                        scenario = self._hugsim_scenarios[int(sid) % len(self._hugsim_scenarios)]
+                        info.setdefault("official_scene_name", str(scenario["official_scene_name"]))
+                        info.setdefault("hugsim_scenario_path", str(scenario["scenario_path"]))
                 self._last_obs = obs
                 self._last_info = dict(info) if isinstance(info, dict) else {}
                 return obs, info
@@ -240,6 +269,9 @@ def make_scene_sampling_env(
     render_w: int | None = None,
     render_h: int | None = None,
     step_frames: int | None = None,
+    env_backend: str = "recon",
+    hugsim_scenarios: List[Dict[str, str]] | None = None,
+    hugsim_kwargs: Dict[str, Any] | None = None,
 ) -> SceneSamplingEnv:
     spec = SceneSamplingSpec(
         scene_ids=list(scene_ids),
@@ -262,6 +294,9 @@ def make_scene_sampling_env(
         render_w=(int(render_w) if render_w is not None else None),
         render_h=(int(render_h) if render_h is not None else None),
         step_frames=(int(step_frames) if step_frames is not None else None),
+        env_backend=str(env_backend),
+        hugsim_scenarios=hugsim_scenarios,
+        hugsim_kwargs=hugsim_kwargs,
     )
 
 

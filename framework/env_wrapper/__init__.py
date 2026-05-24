@@ -8,6 +8,7 @@ Backward-compatible re-exports exist under `reconsimulator.envs.*`.
 
 __all__ = [
     "RLReconEnv",
+    "HUGSIMReconEnv",
     "SceneSamplingEnv",
     "SceneSamplingSpec",
     "make_scene_sampling_env",
@@ -28,6 +29,10 @@ def __getattr__(name: str):
         from .rl_wrapper import RLReconEnv
 
         return RLReconEnv
+    if name == "HUGSIMReconEnv":
+        from .hugsim_adapter import HUGSIMReconEnv
+
+        return HUGSIMReconEnv
     if name in {"SceneSamplingEnv", "SceneSamplingSpec", "make_scene_sampling_env", "SerialVecEnv", "SubprocVecEnv"}:
         from .subproc_vec_env import (
             SceneSamplingEnv,

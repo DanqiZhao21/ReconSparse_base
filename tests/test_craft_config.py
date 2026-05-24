@@ -4,12 +4,49 @@ from pathlib import Path
 
 import yaml
 
+from framework.runner.config_normalization import normalize_actor_learner_cfg
+
 
 TEMPLATE_CONFIGS = [
     "20260519_reinforcepp_closed_loop_sparsedrive_v2_craft_onlyGRPO.yaml",
     "202605211154_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCorrection_openGrpo.yaml",
     "202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml",
 ]
+
+FOUR_WAY_20260524_CONFIGS = {
+    "202605241004_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCorrection_openGRPOCraft-FullPara.yaml": {
+        "algo": "reinforcepp",
+        "craft_enabled": True,
+        "corrective_progress_enabled": True,
+        "trainable_prefixes": [],
+        "frozen_prefixes": [],
+        "run_key": "CloseCorrection_OpenGRPOCraft_FullPara",
+    },
+    "202605241004_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCorrection_openGRPOCraft-MetricsPara.yaml": {
+        "algo": "reinforcepp",
+        "craft_enabled": True,
+        "corrective_progress_enabled": True,
+        "trainable_prefixes": ["_trajectory_head.decoder.layers.1.metric_heads"],
+        "frozen_prefixes": ["_backbone"],
+        "run_key": "CloseCorrection_OpenGRPOCraft_MetricsPara",
+    },
+    "202605241004_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPOCraft-FullPara.yaml": {
+        "algo": "grpo_only",
+        "craft_enabled": False,
+        "corrective_progress_enabled": False,
+        "trainable_prefixes": [],
+        "frozen_prefixes": [],
+        "run_key": "CloseNo_OpenGRPOCraft_FullPara",
+    },
+    "202605241004_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPOCraft-MetricsPara.yaml": {
+        "algo": "grpo_only",
+        "craft_enabled": False,
+        "corrective_progress_enabled": False,
+        "trainable_prefixes": ["_trajectory_head.decoder.layers.1.metric_heads"],
+        "frozen_prefixes": ["_backbone"],
+        "run_key": "CloseNo_OpenGRPOCraft_MetricsPara",
+    },
+}
 
 
 def _key_paths(obj: object, prefix: str = "") -> set[str]:
@@ -95,3 +132,66 @@ def test_sparsedrive_v2_training_templates_use_canonical_grpo_and_craft_keys() -
         assert "CRAFT" in reward_cfg
         assert "craft" not in reward_cfg
         assert "corrective_progress" in reward_cfg["CRAFT"]
+
+
+def test_20260524_sparsedrive_v2_four_way_craft_configs_match_intended_ablation() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "script/configs/sparsedrive_v2"
+    for name, expected in FOUR_WAY_20260524_CONFIGS.items():
+        cfg = yaml.safe_load((config_dir / name).read_text(encoding="utf-8"))
+        train_cfg = cfg["train"]
+        actor_learner = train_cfg["actor_learner"]
+        grpo = train_cfg["grpo"]
+        craft = cfg["env"]["reward"]["CRAFT"]
+        agent = cfg["agent"]
+
+        assert train_cfg["algo"] == expected["algo"]
+        assert train_cfg["wandb"]["group"] == expected["run_key"]
+        assert actor_learner["buffer_dir"].endswith(expected["run_key"])
+        assert actor_learner["actor_gpu_pool"] == [2, 3, 4, 5, 6, 7]
+        assert actor_learner["actors_per_gpu"] == 4
+        assert actor_learner["shards_per_update"] == 24
+        assert actor_learner["learner_gpu_id"] == 0
+
+        normalized_cfg = yaml.safe_load((config_dir / name).read_text(encoding="utf-8"))
+        normalize_actor_learner_cfg(normalized_cfg)
+        normalized_al = normalized_cfg["train"]["actor_learner"]
+        assert normalized_al["num_actors"] == 24
+        assert normalized_al["actor_gpu_ids"] == [
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            4,
+            4,
+            4,
+            4,
+            5,
+            5,
+            5,
+            5,
+            6,
+            6,
+            6,
+            6,
+            7,
+            7,
+            7,
+            7,
+        ]
+
+        assert grpo["enable"] is True
+        assert grpo["coef"] == 1.0
+        assert grpo["num_candidates"] == 8
+        assert grpo["debug_dir"].endswith(expected["run_key"])
+
+        assert craft["enable"] is expected["craft_enabled"]
+        assert craft["real_reward_model"] == "corrective"
+        assert craft["corrective_progress"]["enable"] is expected["corrective_progress_enabled"]
+
+        assert agent["trainable_prefixes"] == expected["trainable_prefixes"]
+        assert agent["frozen_prefixes"] == expected["frozen_prefixes"]
+        assert agent["nuscenes_scorer"]["backend"] == "craft_carl"

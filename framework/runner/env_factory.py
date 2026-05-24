@@ -1,7 +1,35 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import yaml
+
+
+@dataclass(frozen=True)
+class HUGSIMScenarioSpec:
+    official_scene_name: str
+    scenario_path: str
+
+
+def discover_hugsim_scenarios(scenario_dir: str) -> List[HUGSIMScenarioSpec]:
+    out: List[HUGSIMScenarioSpec] = []
+    root = Path(scenario_dir)
+    for path in sorted(root.glob("*.yaml")):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = yaml.safe_load(handle) or {}
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        scene_name = payload.get("scene_name")
+        if scene_name is None:
+            continue
+        out.append(HUGSIMScenarioSpec(official_scene_name=str(scene_name), scenario_path=str(path)))
+    return out
 
 
 def discover_scene_ids(base_dir: str, *, require_ckpt: bool) -> List[int]:
@@ -34,6 +62,7 @@ def build_actor_env(
     from framework.env_wrapper import make_scene_sampling_env
 
     env_cfg = cfg.get("env", {}) or {}
+    backend = str(env_cfg.get("backend", "recon")).strip().lower()
     render_w = env_cfg.get("render_w", None)
     render_h = env_cfg.get("render_h", None)
     step_frames = env_cfg.get("step_frames", None)
@@ -50,12 +79,47 @@ def build_actor_env(
     scene0 = int(env_cfg.get("scene", 0))
     al_cfg = ((cfg.get("train", {}) or {}).get("actor_learner", {}) or {})
 
-    from reconsimulator.envs import nus_config as nus_cfg
-
     scene_ids = [scene0]
+    hugsim_scenarios: List[Dict[str, str]] | None = None
+    hugsim_kwargs: Dict[str, Any] | None = None
+    if backend == "hugsim_ori":
+        from framework.env_wrapper.hugsim_scene_index import HUGSIMSceneIndex
+
+        hugsim_cfg = env_cfg.get("hugsim", {}) or {}
+        scenario_dir = str(hugsim_cfg.get("scenario_dir", "/root/clone/HUGSIM-ORI/configs/scenarios/nuscenes"))
+        discovered_scenarios = discover_hugsim_scenarios(scenario_dir)
+        scene_filter = hugsim_cfg.get("scenes", None)
+        if scene_filter:
+            allowed = {str(name) for name in scene_filter}
+            discovered_scenarios = [s for s in discovered_scenarios if s.official_scene_name in allowed]
+        if not discovered_scenarios:
+            raise RuntimeError(f"No HUGSIM scenarios discovered under {scenario_dir}")
+        hugsim_scenarios = [
+            {"official_scene_name": spec.official_scene_name, "scenario_path": spec.scenario_path}
+            for spec in discovered_scenarios
+        ]
+        scene_ids = list(range(len(hugsim_scenarios)))
+        scene_index = HUGSIMSceneIndex(
+            nuscenes_root=hugsim_cfg.get("nuscenes_root", "assets/nuscenes/v1.0-trainval"),
+            frame2token_dir=hugsim_cfg.get("frame2token_dir", "assets/nus/information/frame2token"),
+        )
+        hugsim_kwargs = {
+            "scene_index": scene_index,
+            "hugsim_repo": hugsim_cfg.get("repo", "/root/clone/HUGSIM-ORI"),
+            "base_path": hugsim_cfg.get("base_path", None),
+            "camera_path": hugsim_cfg.get("camera_path", None),
+            "kinematic_path": hugsim_cfg.get("kinematic_path", None),
+            "substeps_per_rl_step": int(hugsim_cfg.get("substeps_per_rl_step", 2)),
+            "output_root": hugsim_cfg.get("output_root", "outputs/hugsim_rl"),
+        }
+    else:
+        from reconsimulator.envs import nus_config as nus_cfg
+
+        if use_all_scenes:
+            discovered = discover_scene_ids(nus_cfg.BASE_DATA_DIR, require_ckpt=require_ckpt) or [scene0]
+            scene_ids = list(discovered)
+
     if use_all_scenes:
-        discovered = discover_scene_ids(nus_cfg.BASE_DATA_DIR, require_ckpt=require_ckpt) or [scene0]
-        scene_ids = list(discovered)
         if bool(al_cfg.get("scene_shard_by_actor", True)) and int(total_actors) > 1 and len(scene_ids) > 0:
             shard_strategy = str(al_cfg.get("scene_shard_strategy", "round_robin")).strip().lower()
             aid = int(actor_id)
@@ -93,4 +157,7 @@ def build_actor_env(
         render_w=(int(render_w) if render_w is not None else None),
         render_h=(int(render_h) if render_h is not None else None),
         step_frames=(int(step_frames) if step_frames is not None else None),
+        env_backend=backend,
+        hugsim_scenarios=hugsim_scenarios,
+        hugsim_kwargs=hugsim_kwargs,
     )
