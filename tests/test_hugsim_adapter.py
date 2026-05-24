@@ -2,6 +2,7 @@ import numpy as np
 
 from framework.env_wrapper.hugsim_adapter import build_recondreamer_obs_from_hugsim
 from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+from framework.rewards import TrackingRewardResult
 
 
 def _camera_cfg():
@@ -179,3 +180,182 @@ def test_hugsim_recon_env_reset_and_step(monkeypatch, tmp_path):
     assert info["scene_id"] == 12
     assert info["frame_idx"] == 5
     assert info["sample_token"] == "tok1"
+
+
+def test_hugsim_reward_proxy_loads_recon_expert_trajectory(tmp_path):
+    from framework.env_wrapper.hugsim_adapter import HUGSIMRewardProxy
+
+    scene_dir = tmp_path / "012" / "ego_pose"
+    scene_dir.mkdir(parents=True)
+    for frame, x in [(0, 0.0), (5, 1.0), (10, 2.0)]:
+        pose = np.eye(4, dtype=np.float64)
+        pose[0, 3] = x
+        np.savetxt(scene_dir / f"{frame:03d}.txt", pose)
+
+    proxy = HUGSIMRewardProxy(recon_data_root=tmp_path)
+    proxy.update_from_hugsim_info(
+        recon_scene_id=12,
+        frame_idx=5,
+        hugsim_info={
+            "ego_pos": [1.0, 0.0, 0.0],
+            "ego_rot": [0.0, 0.0, 0.0],
+            "ego_velo": 2.0,
+            "accelerate": 0.5,
+            "command": 2,
+        },
+    )
+
+    assert proxy.scene == 12
+    assert proxy.now_frame == 5
+    assert len(proxy.all_expert_ego) == 3
+    assert len(proxy.expert_pair) > 3
+    assert np.asarray(proxy.expert_pair)[0].tolist() == [0.0, 0.0]
+    assert np.asarray(proxy.expert_pair)[-1].tolist() == [2.0, 0.0]
+    assert proxy._status_vel_xy.tolist() == [2.0, 0.0]
+    assert proxy._status_acc_xy.tolist() == [0.5, 0.0]
+
+
+def test_hugsim_recon_env_uses_recondreamer_reward_not_hugsim_reward(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok1",
+                frame_idx=5,
+                sample_index=1,
+                sample_relative_time_s=0.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    class FakeEnv:
+        def reset(self):
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+    calls = []
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            self.reward_cfg = reward_cfg
+
+        def reset(self):
+            calls.append(("reset",))
+
+        def compute(self, *, env, info, step_idx, done):
+            calls.append(("compute", env.scene, env.now_frame, info["hugsim_base_reward"], step_idx, done))
+            out = dict(info)
+            out["reward_mode"] = "fake_recondreamer"
+            out["reward"] = 7.5
+            return TrackingRewardResult(reward=7.5, info=out)
+
+    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        hugsim_adapter,
+        "execute_hugsim_control_horizon",
+        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
+            _fake_hugsim_obs(image),
+            123.0,
+            False,
+            False,
+            _fake_hugsim_info(0.5),
+        ),
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={"mode": "step_path"},
+        output_root=tmp_path,
+        recon_data_root=tmp_path,
+    )
+
+    env.reset()
+    _obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert reward == 7.5
+    assert info["reward_mode"] == "fake_recondreamer"
+    assert info["hugsim_base_reward"] == 123.0
+    assert not terminated
+    assert not truncated
+    assert ("compute", 12, 5, 123.0, 5, False) in calls
+
+
+def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok1",
+                frame_idx=5,
+                sample_index=1,
+                sample_relative_time_s=0.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    class FakeEnv:
+        def reset(self):
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            pass
+
+        def compute(self, *, env, info, step_idx, done):
+            out = dict(info)
+            out["reward"] = -3.0
+            return TrackingRewardResult(reward=-3.0, info=out)
+
+    terminal_info = _fake_hugsim_info(0.5)
+    terminal_info["collision"] = True
+    terminal_info["rc"] = 0.25
+
+    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        hugsim_adapter,
+        "execute_hugsim_control_horizon",
+        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
+            _fake_hugsim_obs(image),
+            -100.0,
+            True,
+            False,
+            terminal_info,
+        ),
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={"mode": "step_path"},
+        output_root=tmp_path,
+        recon_data_root=tmp_path,
+    )
+
+    env.reset()
+    _obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert reward == -3.0
+    assert terminated
+    assert not truncated
+    assert info["dynamic_collision"] is True
+    assert info["static_collision"] is False
+    assert info["collision"] is True
+    assert info["terminal_kind"] == "failure"
+    assert info["done_reason"] == "hugsim_collision"

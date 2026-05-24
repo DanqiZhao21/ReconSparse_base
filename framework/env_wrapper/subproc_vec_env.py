@@ -96,6 +96,7 @@ class SceneSamplingEnv:
                 scenario_name=str(scenario["official_scene_name"]),
                 scenario_path=str(scenario["scenario_path"]),
                 reward_cfg=self._reward_cfg,
+                cuda=self._cuda,
                 **self._hugsim_kwargs,
             )
 

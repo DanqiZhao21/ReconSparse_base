@@ -111,7 +111,14 @@ def build_actor_env(
             "kinematic_path": hugsim_cfg.get("kinematic_path", None),
             "substeps_per_rl_step": int(hugsim_cfg.get("substeps_per_rl_step", 2)),
             "output_root": hugsim_cfg.get("output_root", "outputs/hugsim_rl"),
+            "recon_data_root": hugsim_cfg.get("recon_data_root", "assets/nus/data"),
+            "launch_mode": hugsim_cfg.get("launch_mode", "direct"),
+            "pixi_cmd": hugsim_cfg.get("pixi_cmd", "pixi"),
+            "fifo_timeout_s": float(hugsim_cfg.get("fifo_timeout_s", 300.0)),
+            "fifo_poll_interval_s": float(hugsim_cfg.get("fifo_poll_interval_s", 0.2)),
         }
+        if hugsim_cfg.get("fifo_runner_path", None) is not None:
+            hugsim_kwargs["fifo_runner_path"] = hugsim_cfg.get("fifo_runner_path")
     else:
         from reconsimulator.envs import nus_config as nus_cfg
 
