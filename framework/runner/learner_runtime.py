@@ -38,6 +38,16 @@ def _restore_learner_checkpoint_if_available(*, agent: Any, paths: BufferPaths, 
     return int(version)
 
 
+def _restore_rank_checkpoint_if_available(*, agent: Any, paths: BufferPaths, rank: int, stage_fn: Any) -> int:
+    def rank_stage(message: str) -> None:
+        if int(rank) == 0:
+            stage_fn(message)
+        else:
+            stage_fn(f"[learner rank={int(rank)}] {message}")
+
+    return _restore_learner_checkpoint_if_available(agent=agent, paths=paths, stage_fn=rank_stage)
+
+
 def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
     del learner_rank
     train_cfg = cfg.get("train", {}) or {}
@@ -111,8 +121,9 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
                 agent.save_checkpoint(paths.latest_ckpt)
             except Exception as exc:
                 stage(f"[learner] initial save failed: {exc}")
-        else:
-            _restore_learner_checkpoint_if_available(agent=agent, paths=paths, stage_fn=stage)
+    if ddp_enabled:
+        dist.barrier()
+    _restore_rank_checkpoint_if_available(agent=agent, paths=paths, rank=int(rank), stage_fn=stage)
     if ddp_enabled:
         dist.barrier()
 

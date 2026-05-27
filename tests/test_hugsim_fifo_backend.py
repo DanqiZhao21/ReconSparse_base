@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 
 import numpy as np
@@ -20,6 +21,9 @@ def _fake_hugsim_obs(image):
             "CAM_FRONT_LEFT": image,
             "CAM_FRONT": image + 1,
             "CAM_FRONT_RIGHT": image + 2,
+            "CAM_BACK_LEFT": image + 3,
+            "CAM_BACK": image + 4,
+            "CAM_BACK_RIGHT": image + 5,
         }
     }
 
@@ -37,6 +41,9 @@ def _fake_hugsim_info(timestamp):
             "CAM_FRONT_LEFT": _camera_cfg(),
             "CAM_FRONT": _camera_cfg(),
             "CAM_FRONT_RIGHT": _camera_cfg(),
+            "CAM_BACK_LEFT": _camera_cfg(),
+            "CAM_BACK": _camera_cfg(),
+            "CAM_BACK_RIGHT": _camera_cfg(),
         },
     }
 
@@ -117,6 +124,37 @@ def test_hugsim_fifo_client_launches_pixi_runner(monkeypatch, tmp_path: Path):
     assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     output_idx = launched["cmd"].index("--output_dir") + 1
     assert Path(launched["cmd"][output_idx]).is_absolute()
+
+
+def test_hugsim_fifo_client_removes_stale_pipes_before_launch(monkeypatch, tmp_path: Path):
+    from framework.env_wrapper.hugsim_adapter import HUGSIMFifoClient
+
+    obs_pipe = tmp_path / "obs_pipe"
+    plan_pipe = tmp_path / "plan_pipe"
+    os.mkfifo(obs_pipe)
+    os.mkfifo(plan_pipe)
+    (tmp_path / "status.json").write_text('{"state": "error"}', encoding="utf-8")
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+
+    client = HUGSIMFifoClient(
+        hugsim_repo="/root/clone/HUGSIM-ORI",
+        scenario_path="/tmp/scenario.yaml",
+        base_path="/tmp/base.yaml",
+        camera_path="/tmp/camera.yaml",
+        kinematic_path="/tmp/kinematic.yaml",
+        output_dir=tmp_path,
+        pixi_cmd="pixi",
+    )
+    client.start()
+
+    assert not obs_pipe.exists()
+    assert not plan_pipe.exists()
+    assert not (tmp_path / "status.json").exists()
 
 
 def test_hugsim_recon_env_fifo_mode_uses_client(monkeypatch, tmp_path: Path):
@@ -204,3 +242,34 @@ def test_hugsim_recon_env_fifo_mode_uses_client(monkeypatch, tmp_path: Path):
     assert init_kwargs["fifo_timeout_s"] == 120.0
     assert init_kwargs["cuda"] == 1
     assert Path(init_kwargs["output_dir"]).is_absolute()
+
+
+def test_hugsim_recon_env_fifo_output_dir_is_unique_per_scenario(monkeypatch, tmp_path: Path):
+    from framework.env_wrapper import hugsim_adapter
+
+    output_dirs = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            output_dirs.append(Path(kwargs["output_dir"]))
+
+    monkeypatch.setattr(hugsim_adapter, "HUGSIMFifoClient", FakeClient)
+
+    for scenario_path in [
+        "/tmp/scene-0013-easy-00.yaml",
+        "/tmp/scene-0013-medium-00.yaml",
+    ]:
+        hugsim_adapter.HUGSIMReconEnv(
+            scenario_name="scene-0013",
+            scenario_path=scenario_path,
+            scene_index=object(),
+            reward_cfg={},
+            output_root=tmp_path,
+            launch_mode="fifo",
+            recon_data_root=tmp_path,
+        )
+
+    assert len(output_dirs) == 2
+    assert output_dirs[0] != output_dirs[1]
+    assert output_dirs[0].name == "scene-0013-easy-00"
+    assert output_dirs[1].name == "scene-0013-medium-00"

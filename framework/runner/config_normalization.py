@@ -56,6 +56,13 @@ def _list_int(values: Any) -> List[int]:
     return []
 
 
+def resolve_learner_gpu_ids(al_cfg: Dict[str, Any]) -> List[int]:
+    explicit = _list_int(al_cfg.get("learner_gpu_ids", None))
+    if len(explicit) > 0:
+        return explicit
+    return [int(al_cfg.get("learner_gpu_id", 0))]
+
+
 def resolve_actor_gpu_ids(al_cfg: Dict[str, Any], *, num_actors: int) -> List[int]:
     n = max(1, int(num_actors))
     explicit = _list_int(al_cfg.get("actor_gpu_ids", None))
@@ -68,11 +75,16 @@ def resolve_actor_gpu_ids(al_cfg: Dict[str, Any], *, num_actors: int) -> List[in
         return [-1 for _ in range(n)]
 
     visible = list(range(int(torch.cuda.device_count())))
-    learner_gpu = int(al_cfg.get("learner_gpu_id", 0))
+    learner_gpu_ids = resolve_learner_gpu_ids(al_cfg)
+    learner_gpu = int(learner_gpu_ids[0])
     actor_per_gpu = max(1, int(al_cfg.get("actor_per_gpu", 1)))
-    ordered = [learner_gpu] + [gid for gid in visible if gid != learner_gpu]
-    if len(ordered) == 0:
-        ordered = [0]
+    if len(learner_gpu_ids) > 1:
+        learner_gpu_set = {int(gid) for gid in learner_gpu_ids}
+        ordered = [gid for gid in visible if gid not in learner_gpu_set]
+        if len(ordered) == 0:
+            ordered = [learner_gpu]
+    else:
+        ordered = [learner_gpu] + [gid for gid in visible if gid != learner_gpu]
 
     plan: List[int] = []
     idx = 0
@@ -93,6 +105,10 @@ def normalize_actor_learner_cfg(cfg: Dict[str, Any]) -> None:
         return
 
     explicit_ids = _list_int(al_cfg.get("actor_gpu_ids", None))
+    learner_gpu_ids = resolve_learner_gpu_ids(al_cfg)
+    al_cfg["learner_gpu_ids"] = list(learner_gpu_ids)
+    al_cfg["learner_gpu_id"] = int(learner_gpu_ids[0])
+
     actor_gpu_pool = _list_int(al_cfg.get("actor_gpu_pool", None) or al_cfg.get("gpu_ids", None) or al_cfg.get("gpus", None))
     actors_per_gpu = al_cfg.get("actors_per_gpu", None)
     if actors_per_gpu is None:

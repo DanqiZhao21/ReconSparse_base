@@ -279,7 +279,7 @@ class TrackingRewardComputer:
         progress_backward_cap = float(path_cfg.get("progress_backward_cap_m", 0.5))
         w_progress = float(path_cfg.get("w_progress", 0.0))
         progress_reward = float(np.clip(progress_delta_s, -progress_backward_cap, progress_forward_cap))
-        progress_term = w_progress * progress_reward
+        progress_term = w_progress * progress_reward #1*【2.-0.5】
         
         ###safety相关的奖励
         front_obstacle_active = False

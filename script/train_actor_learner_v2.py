@@ -18,7 +18,7 @@ cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
   --role orchestrator \
-  --config script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605261115_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCloseloop_openGRPOCraft-MetricsPara-cuda2.yaml
 '''
 def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:

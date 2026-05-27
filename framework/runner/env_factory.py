@@ -91,7 +91,13 @@ def build_actor_env(
         scene_filter = hugsim_cfg.get("scenes", None)
         if scene_filter:
             allowed = {str(name) for name in scene_filter}
-            discovered_scenarios = [s for s in discovered_scenarios if s.official_scene_name in allowed]
+            discovered_scenarios = [
+                s
+                for s in discovered_scenarios
+                if s.official_scene_name in allowed
+                or Path(s.scenario_path).stem in allowed
+                or Path(s.scenario_path).name in allowed
+            ]
         if not discovered_scenarios:
             raise RuntimeError(f"No HUGSIM scenarios discovered under {scenario_dir}")
         hugsim_scenarios = [
@@ -112,11 +118,22 @@ def build_actor_env(
             "substeps_per_rl_step": int(hugsim_cfg.get("substeps_per_rl_step", 2)),
             "output_root": hugsim_cfg.get("output_root", "outputs/hugsim_rl"),
             "recon_data_root": hugsim_cfg.get("recon_data_root", "assets/nus/data"),
+            "hugsim_model_base": hugsim_cfg.get("model_base", None),
             "launch_mode": hugsim_cfg.get("launch_mode", "direct"),
             "pixi_cmd": hugsim_cfg.get("pixi_cmd", "pixi"),
             "fifo_timeout_s": float(hugsim_cfg.get("fifo_timeout_s", 300.0)),
             "fifo_poll_interval_s": float(hugsim_cfg.get("fifo_poll_interval_s", 0.2)),
         }
+        alignment_cfg = hugsim_cfg.get("alignment", {}) or {}
+        if isinstance(alignment_cfg, dict):
+            hugsim_kwargs.update(
+                {
+                    "alignment_enabled": bool(alignment_cfg.get("enabled", True)),
+                    "alignment_max_rmse_m": float(alignment_cfg.get("max_rmse_m", 2.0)),
+                    "use_recon_cache_objects": bool(alignment_cfg.get("use_recon_cache_objects", True)),
+                    "use_hugsim_inserted_objects": bool(alignment_cfg.get("use_hugsim_inserted_objects", True)),
+                }
+            )
         if hugsim_cfg.get("fifo_runner_path", None) is not None:
             hugsim_kwargs["fifo_runner_path"] = hugsim_cfg.get("fifo_runner_path")
     else:

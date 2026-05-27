@@ -20,9 +20,9 @@ cd /root/clone/ReconDreamer-RL
 
 #在线生成reward可视化视频
 
-python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
+CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
   --scene 123 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260521_reinforcepp_closed_loop_sparsedrive_v2_craft_corrective_progress_grpo.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/old/20260521_reinforcepp_closed_loop_sparsedrive_v2_craft_corrective_progress_grpo.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
   --out /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_CraftGrpo+CraftCloseReward.ipynb.mp4 \
   --traj-csv /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_CraftGrpo+CraftCloseReward_bev.csv \
@@ -39,6 +39,12 @@ python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
   --traj-plot /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/actor0_e0_v16_t1779248747_8378e3e7_shard_bev.svg \
   --reward-detail-format ipynb \
   --save-keyframes
+  
+精简版本：
+CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
+  --scene 36 \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605250049_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCloseloop_openGRPOCraft-FullPara.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
 """
 
 from __future__ import annotations

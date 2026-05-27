@@ -44,6 +44,8 @@ DEFAULT_EVAL_OUTPUT_ROOT = HUGSIM_ROOT / "outputs" / "evaluate-auto"
 DEFAULT_PPO_CONFIG = REPO_ROOT / "script" / "configs" / "sparsedrive_v2" / "ppo_closed_loop_sparsedrive_v2.yaml"
 DEFAULT_REINFORCEPP_CONFIG = REPO_ROOT / "script" / "configs" / "sparsedrive_v2" / "reinforcepp_closed_loop_sparsedrive_v2.yaml"
 DEFAULT_RUN_ROOT = REPO_ROOT / "outputs" / "TrainEvaluationAuto"
+DEFAULT_EVAL_SLOTS = ["0:0", "1:1", "2:2", "3:3", "4:4", "5:5", "6:6", "7:7"]
+DEFAULT_MAX_SCENES = 88
 
 
 @dataclass(frozen=True)
@@ -416,7 +418,7 @@ def _run_eval_existing_ckpt(
     _run_command(cmd=cmd, cwd=REPO_ROOT, env=env, log_path=log_path)
 
 
-def _parse_args() -> argparse.Namespace:
+def parse_train_eval_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO/Reinforce++ and auto-evaluate on HUGSIM-ORI.")
     parser.add_argument("--train-python", type=Path, default=DEFAULT_TRAIN_PYTHON)
     parser.add_argument("--ppo-config", type=Path, default=DEFAULT_PPO_CONFIG)
@@ -426,9 +428,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hugsim-template", type=Path, default=DEFAULT_HUGSIM_TEMPLATE)
     parser.add_argument("--eval-output-root", type=Path, default=DEFAULT_EVAL_OUTPUT_ROOT)
     parser.add_argument("--repeat-evals", type=int, default=2)
-    parser.add_argument("--slots", nargs="+", default=["0:0", "1:1", "2:2", "3:3"])
+    parser.add_argument("--slots", nargs="+", default=list(DEFAULT_EVAL_SLOTS))
     parser.add_argument("--scenario-dir", type=Path, default=DEFAULT_SCENARIO_DIR)
-    parser.add_argument("--max-scenes", type=int, default=None)
+    parser.add_argument("--max-scenes", type=int, default=DEFAULT_MAX_SCENES)
     parser.add_argument("--retry-count", type=int, default=2)
     parser.add_argument("--ppo", action="store_true", help="Run PPO in addition to the default ReinforcePP run")
     parser.add_argument("--skip-reinforcepp", action="store_true", help="Skip the default ReinforcePP run")
@@ -436,7 +438,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--no-default-eval-seed", action="store_true")
     parser.add_argument("--hugsim-random-seed", type=str, default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def _parse_args() -> argparse.Namespace:
+    return parse_train_eval_args()
 
 
 def main() -> int:

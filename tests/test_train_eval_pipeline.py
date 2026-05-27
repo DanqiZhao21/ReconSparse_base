@@ -14,6 +14,7 @@ from tools.train_eval_pipeline import (
     build_training_summary,
     cleanup_training_artifacts,
     detect_next_version,
+    parse_train_eval_args,
     prepare_training_config,
     rewrite_hugsim_eval_config,
     write_run_manifest,
@@ -290,6 +291,23 @@ def test_build_eval_existing_ckpt_command_targets_promoted_ckpt_and_all_scenes()
     assert cmd[cmd.index("--scenario-dir") + 1] == "/hugsim/configs/scenarios/nuscenes"
     assert "--max-scenes" not in cmd
     assert cmd[-3:] == ["--slots", "0:0", "1:1"]
+
+
+def test_parse_train_eval_args_defaults_to_hugsim_ori_88_scenes_two_repeats_and_8_slots() -> None:
+    args = parse_train_eval_args([])
+
+    assert args.repeat_evals == 2
+    assert args.max_scenes == 88
+    assert args.scenario_dir == Path("/root/clone/HUGSIM-ORI/configs/scenarios/nuscenes")
+    assert args.slots == ["0:0", "1:1", "2:2", "3:3", "4:4", "5:5", "6:6", "7:7"]
+    assert args.no_default_eval_seed is False
+
+
+def test_parse_train_eval_args_allows_overriding_default_88_scene_limit() -> None:
+    args = parse_train_eval_args(["--max-scenes", "12", "--slots", "0:0"])
+
+    assert args.max_scenes == 12
+    assert args.slots == ["0:0"]
 
 
 def test_write_run_manifest_persists_key_training_metadata(tmp_path: Path) -> None:

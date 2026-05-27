@@ -22,6 +22,7 @@ from framework.io.buffer import (
 from framework.rollout import collect_single_env_shard, collect_vector_env_shards
 from framework.rollout.timing import format_rollout_timing_summary
 from framework.runner.agent_factory import build_agent
+from framework.runner.config_normalization import resolve_learner_gpu_ids
 from framework.runner.env_factory import build_actor_env
 from framework.runner.logging import stage
 
@@ -31,6 +32,15 @@ def _stop_before_writing_shard(paths: BufferPaths, *, actor_id: int, shard_count
         return False
     stage(f"[actor{actor_id}] stop requested after collecting {shard_count} shard(s); discarding unsaved shard(s)")
     return True
+
+
+def _actor_should_pause_for_learner(al_cfg: Dict[str, Any], *, cuda: int) -> bool:
+    if int(cuda) < 0:
+        return False
+    if not bool(al_cfg.get("pause_actor_on_learner_gpu", True)):
+        return False
+    learner_gpu_ids = {int(gpu_id) for gpu_id in resolve_learner_gpu_ids(al_cfg)}
+    return int(cuda) in learner_gpu_ids
 
 
 def resolve_actor_env_runtime(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -143,7 +153,6 @@ def _actor_main_impl(
         cuda = -1
         device = torch.device("cpu")
 
-    learner_gpu_id = int(al_cfg.get("learner_gpu_id", 0))
     pause_actor_on_learner_gpu = bool(al_cfg.get("pause_actor_on_learner_gpu", True))
     training_lock_file = os.path.join(paths.root, "TRAINING_LOCK")
     agent = build_agent(cfg, device=device)
@@ -179,7 +188,7 @@ def _actor_main_impl(
             if stop_requested(paths):
                 stage(f"[actor{actor_id}] stop requested; exiting")
                 break
-            if pause_actor_on_learner_gpu and int(cuda) >= 0 and int(cuda) == int(learner_gpu_id):
+            if pause_actor_on_learner_gpu and _actor_should_pause_for_learner(al_cfg, cuda=int(cuda)):
                 while os.path.exists(training_lock_file):
                     if stop_requested(paths):
                         stage(f"[actor{actor_id}] stop requested during learner-train pause; exiting")
@@ -260,7 +269,7 @@ def _actor_main_impl(
             if stop_requested(paths):
                 stage(f"[actor{actor_id}] stop requested; exiting")
                 break
-            if pause_actor_on_learner_gpu and int(cuda) >= 0 and int(cuda) == int(learner_gpu_id):
+            if pause_actor_on_learner_gpu and _actor_should_pause_for_learner(al_cfg, cuda=int(cuda)):
                 while os.path.exists(training_lock_file):
                     if stop_requested(paths):
                         stage(f"[actor{actor_id}] stop requested during learner-train pause; exiting")
