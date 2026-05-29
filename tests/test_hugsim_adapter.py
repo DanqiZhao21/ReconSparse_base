@@ -324,6 +324,80 @@ def test_hugsim_recon_env_uses_recondreamer_reward_not_hugsim_reward(monkeypatch
     assert ("compute", 12, 5, 123.0, 5, False) in calls
 
 
+def test_hugsim_recon_env_terminates_before_short_gt_route_token(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok-reset" if relative_time_s < 0.25 else "tok-short",
+                frame_idx=0 if relative_time_s < 0.25 else 190,
+                sample_index=0 if relative_time_s < 0.25 else 38,
+                sample_relative_time_s=0.0 if relative_time_s < 0.25 else 19.0,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+        def remaining_future_sample_count(self, official_scene_name, sample_index):
+            return 1
+
+    class FakeEnv:
+        def reset(self):
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            pass
+
+        def compute(self, *, env, info, step_idx, done):
+            out = dict(info)
+            out["reward"] = 0.0
+            out["seen_done"] = bool(done)
+            return TrackingRewardResult(reward=0.0, info=out)
+
+    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        hugsim_adapter,
+        "execute_hugsim_control_horizon",
+        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
+            _fake_hugsim_obs(image),
+            0.0,
+            False,
+            False,
+            _fake_hugsim_info(0.5),
+        ),
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={"mode": "step_path"},
+        output_root=tmp_path,
+        recon_data_root=tmp_path,
+        min_gt_route_points=2,
+    )
+
+    env.reset()
+    _obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert reward == 0.0
+    assert terminated
+    assert not truncated
+    assert info["terminal_kind"] == "env_done"
+    assert info["done_reason"] == "short_gt_route"
+    assert info["remaining_future_sample_count"] == 1
+    assert info["seen_done"] is True
+
+
 def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_path):
     from framework.env_wrapper import hugsim_adapter
     from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
@@ -341,6 +415,9 @@ def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_p
                 sample_relative_time_s=0.5,
                 hugsim_relative_time_s=relative_time_s,
             )
+
+        def remaining_future_sample_count(self, official_scene_name, sample_index):
+            return 1
 
     class FakeEnv:
         def reset(self):
@@ -385,6 +462,7 @@ def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_p
         reward_cfg={"mode": "step_path"},
         output_root=tmp_path,
         recon_data_root=tmp_path,
+        min_gt_route_points=2,
     )
 
     env.reset()

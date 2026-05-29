@@ -457,8 +457,8 @@ class NuScenesScorerUtils:
                 "velocity_xy": velocity_xy.reshape(2),
                 "yaw_rad": float(box[6]) if box.shape[0] > 6 else 0.0,
                 "speed_mps": float(np.linalg.norm(velocity_xy)),
-                "length_m": float(abs(box[4])) if box.shape[0] > 4 else 1.0,
-                "width_m": float(abs(box[3])) if box.shape[0] > 3 else 1.0,
+                "length_m": float(abs(box[3])) if box.shape[0] > 3 else 1.0,
+                "width_m": float(abs(box[4])) if box.shape[0] > 4 else 1.0,
             }
             if fut_trajs.ndim >= 2 and idx < fut_trajs.shape[0]:
                 traj_local = self._sanitize_local_traj_xy(
@@ -510,8 +510,8 @@ class NuScenesScorerUtils:
             y = float(box[1])
             if max(abs(x), abs(y)) > float(patch_radius) * 1.2 and math.hypot(x, y) > float(patch_radius) * 1.4:
                 continue
-            width = float(abs(box[3])) if box.shape[0] > 3 else 1.0
-            length = float(abs(box[4])) if box.shape[0] > 4 else 1.0
+            length = float(abs(box[3])) if box.shape[0] > 3 else 1.0
+            width = float(abs(box[4])) if box.shape[0] > 4 else 1.0
             yaw = float(box[6]) if box.shape[0] > 6 else 0.0
             speed = float(np.linalg.norm(velocities[idx])) if idx < velocities.shape[0] else 0.0
             category = str(names[idx]) if idx < names.shape[0] else "unknown"
@@ -858,7 +858,7 @@ class NuScenesScorerUtils:
         return self.sample_context_cache_root / self._sample_context_cache_filename(sample_token, cache_variant=cache_variant)
 
     def _sample_context_cache_variant(self) -> str:
-        return f"ea-{int(bool(self.ea_gate_enabled))}"
+        return f"box-lw-v2-ea-{int(bool(self.ea_gate_enabled))}"
 
     def _load_persisted_static_sample_context(self, sample_token: str) -> dict[str, Any] | None:
         path = self._sample_context_cache_path(sample_token, cache_variant=self._sample_context_cache_variant())
@@ -991,8 +991,8 @@ class NuScenesScorerUtils:
             center = np.asarray(box[:2], dtype=np.float32)
             if float(np.linalg.norm(center)) > float(patch_radius) * 1.5:
                 continue
-            width = float(abs(box[3])) if box.shape[0] > 3 else 1.0
-            length = float(abs(box[4])) if box.shape[0] > 4 else 1.0
+            length = float(abs(box[3])) if box.shape[0] > 3 else 1.0
+            width = float(abs(box[4])) if box.shape[0] > 4 else 1.0
             yaw = float(box[6]) if box.shape[0] > 6 else 0.0
             category = str(names[idx]) if idx < names.shape[0] else "unknown"
             velocity_xy = velocities[idx, :2].astype(np.float32) if idx < velocities.shape[0] else np.zeros((2,), dtype=np.float32)
@@ -1013,6 +1013,86 @@ class NuScenesScorerUtils:
             )
         return objects
 
+    @staticmethod
+    def _has_replay_object_context_override(replay: dict[str, Any]) -> bool:
+        return any(
+            key in replay
+            for key in (
+                "scene_objects_override",
+                "ea_agent_states_override",
+                "ttc_agent_states_override",
+            )
+        )
+
+    @staticmethod
+    def _poly_heading_length_width(poly_xy: np.ndarray) -> tuple[float, float, float]:
+        poly = np.asarray(poly_xy, dtype=np.float32)
+        if poly.ndim != 2 or poly.shape[0] < 2 or poly.shape[1] < 2:
+            return 0.0, 1.0, 1.0
+        if poly.shape[0] >= 4:
+            front_mid = 0.5 * (poly[0, :2] + poly[1, :2])
+            rear_mid = 0.5 * (poly[2, :2] + poly[3, :2])
+            heading = front_mid - rear_mid
+            yaw = float(math.atan2(float(heading[1]), float(heading[0]))) if float(np.linalg.norm(heading)) > 1.0e-9 else 0.0
+            length = float(max(1.0e-6, np.linalg.norm(front_mid - rear_mid)))
+            width = float(max(1.0e-6, np.linalg.norm(poly[0, :2] - poly[1, :2])))
+            return yaw, length, width
+        delta = poly[1, :2] - poly[0, :2]
+        yaw = float(math.atan2(float(delta[1]), float(delta[0]))) if float(np.linalg.norm(delta)) > 1.0e-9 else 0.0
+        return yaw, float(max(1.0e-6, np.linalg.norm(delta))), 1.0
+
+    @classmethod
+    def _normalize_replay_object_context(
+        cls,
+        objects: Any,
+        *,
+        patch_radius: float,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for idx, raw in enumerate([] if objects is None else objects):
+            if not isinstance(raw, dict):
+                continue
+            corners_raw = raw.get("corners_xy", raw.get("poly", None))
+            try:
+                corners = np.asarray(corners_raw, dtype=np.float32)
+            except Exception:
+                corners = np.zeros((0, 2), dtype=np.float32)
+            center_raw = raw.get("center_xy", None)
+            if corners.ndim == 2 and corners.shape[0] >= 3 and corners.shape[1] >= 2:
+                corners = corners[:, :2].astype(np.float32, copy=False)
+                center = np.mean(corners, axis=0).astype(np.float32)
+                yaw, length, width = cls._poly_heading_length_width(corners)
+            else:
+                try:
+                    center = np.asarray(center_raw, dtype=np.float32).reshape(-1)[:2]
+                except Exception:
+                    center = np.zeros((0,), dtype=np.float32)
+                if center.size < 2:
+                    continue
+                length = float(abs(raw.get("length_m", 1.0)))
+                width = float(abs(raw.get("width_m", 1.0)))
+                yaw = float(raw.get("yaw_rad", 0.0))
+                corners = cls._box_corners_xy(float(center[0]), float(center[1]), length, width, yaw).astype(np.float32)
+            if float(np.linalg.norm(center[:2])) > float(patch_radius) * 1.8:
+                continue
+            velocity_xy = np.asarray(raw.get("velocity_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+            if velocity_xy.size < 2:
+                velocity_xy = np.zeros((2,), dtype=np.float32)
+            obj = {
+                "category": str(raw.get("category", "vehicle.car")),
+                "center_xy": center[:2].astype(np.float32),
+                "velocity_xy": velocity_xy[:2].astype(np.float32),
+                "length_m": float(abs(raw.get("length_m", length))),
+                "width_m": float(abs(raw.get("width_m", width))),
+                "yaw_rad": float(raw.get("yaw_rad", yaw)),
+                "speed_mps": float(raw.get("speed_mps", np.linalg.norm(velocity_xy[:2]))),
+                "corners_xy": corners[:, :2].astype(np.float32),
+                "token": str(raw.get("token", raw.get("id", f"override_obj_{idx}"))),
+                "source": str(raw.get("source", "replay_override")),
+            }
+            out.append(obj)
+        return out
+
     def _build_static_sample_context(
         self,
         replay: dict[str, Any],
@@ -1023,6 +1103,49 @@ class NuScenesScorerUtils:
         if sample_token is None:
             raise RuntimeError("NuScenesScorerUtils requires replay['sample_token']")
         sample_token_str = str(sample_token)
+        has_object_override = self._has_replay_object_context_override(replay)
+        if has_object_override:
+            row = self._lookup_row(sample_token_str)
+            gt_xy = self._lookup_gt(sample_token_str).copy()
+            gt_yaw = _path_yaw_from_xy(gt_xy)
+            gt_s = _polyline_arclength(gt_xy)
+            gt_total_len = float(max(1.0e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
+            cached_map_context = self._lookup_cached_map_layers(replay, patch_radius=float(patch_radius))
+            map_context = (
+                cached_map_context
+                if cached_map_context is not None
+                else self._lookup_map_layers(row, patch_radius=float(patch_radius))
+            )
+            patch_radius_resolved = float(map_context.get("patch_radius", patch_radius))
+            scene_objects = self._normalize_replay_object_context(
+                replay.get("scene_objects_override", []),
+                patch_radius=patch_radius_resolved,
+            )
+            if "ea_agent_states_override" in replay:
+                ea_agent_states = self._normalize_replay_object_context(
+                    replay.get("ea_agent_states_override", []),
+                    patch_radius=patch_radius_resolved,
+                )
+            else:
+                ea_agent_states = [dict(item) for item in scene_objects]
+            payload = {
+                "row": row,
+                "gt_xy": gt_xy,
+                "gt_yaw": gt_yaw,
+                "gt_s": gt_s,
+                "gt_total_len": gt_total_len,
+                "map_context": map_context,
+                "scene_objects": scene_objects,
+                "ea_agent_states": ea_agent_states,
+                "replay_scoped_object_context": True,
+            }
+            if "ttc_agent_states_override" in replay:
+                payload["ttc_agent_states"] = self._normalize_replay_object_context(
+                    replay.get("ttc_agent_states_override", []),
+                    patch_radius=patch_radius_resolved,
+                )
+            return payload
+
         cached = self._sample_static_context_cache.get(sample_token_str, None)
         if cached is not None:
             return cached

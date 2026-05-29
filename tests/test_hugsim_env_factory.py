@@ -103,6 +103,7 @@ def test_build_actor_env_passes_hugsim_backend_without_recon_ckpt(monkeypatch, t
                 "launch_mode": "fifo",
                 "pixi_cmd": "pixi",
                 "fifo_timeout_s": 120.0,
+                "min_gt_route_points": 3,
             },
         },
         "train": {"actor_learner": {"scene_shard_by_actor": True}},
@@ -119,3 +120,4 @@ def test_build_actor_env_passes_hugsim_backend_without_recon_ckpt(monkeypatch, t
     assert captured["hugsim_kwargs"]["launch_mode"] == "fifo"
     assert captured["hugsim_kwargs"]["pixi_cmd"] == "pixi"
     assert captured["hugsim_kwargs"]["fifo_timeout_s"] == 120.0
+    assert captured["hugsim_kwargs"]["min_gt_route_points"] == 3

@@ -200,7 +200,7 @@ def test_craft_carl_route_projection_uses_segments_not_nearest_gt_vertex(tmp_pat
     assert route_heading_ratio[0, 0] == pytest.approx(0.0)
 
 
-def test_craft_carl_scorer_raises_when_gt_route_is_missing(tmp_path: Path) -> None:
+def test_craft_carl_scorer_returns_neutral_scores_when_gt_route_is_too_short(tmp_path: Path) -> None:
     from framework.algorithms.nuscenes_craft_scorer import NuScenesCraftScorer
 
     token2vad_path = tmp_path / "token2vad.pkl"
@@ -210,14 +210,16 @@ def test_craft_carl_scorer_raises_when_gt_route_is_missing(tmp_path: Path) -> No
     geometry = scorer._pdm._build_candidate_geometry_batch(traj_xyyaw)
     sample_context = scorer._pdm._build_sample_context({"sample_token": "tok-a"}, patch_radius=20.0)
 
-    with pytest.raises(RuntimeError, match="requires gt_xy_full"):
-        scorer._score_candidate_batch_for_sample(
-            sample_context=sample_context,
-            candidate_geometry={key: value[0] for key, value in geometry.items()},
-            gt_xy_full=np.zeros((1, 2), dtype=np.float32),
-            gt_s_full=np.zeros((1,), dtype=np.float32),
-            dt_s=0.25,
-        )
+    scores = scorer._score_candidate_batch_for_sample(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        gt_xy_full=np.zeros((1, 2), dtype=np.float32),
+        gt_s_full=np.zeros((1,), dtype=np.float32),
+        dt_s=0.25,
+    )
+
+    assert np.allclose(scores, np.zeros((1,), dtype=np.float32))
+    assert scorer._last_terms["skipped_short_gt_route_count"] == pytest.approx(1.0)
 
 
 def test_craft_carl_scorer_passes_dt_to_collision_metrics(

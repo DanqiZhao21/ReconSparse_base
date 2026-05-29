@@ -146,7 +146,7 @@ class NuScenesPDMScorer:
         self._derived_context_cache_root = self._delegate.scene_cache_root / "_sample_pdm_context"
 
     def _derived_context_cache_variant(self) -> str:
-        return f"pdm-v4-ea{int(bool(self._delegate.ea_gate_enabled))}"
+        return f"pdm-v5-box-lw-ea{int(bool(self._delegate.ea_gate_enabled))}"
 
     def _derived_context_cache_path(self, sample_token: str) -> Path:
         return self._derived_context_cache_root / self._delegate._sample_context_cache_filename(
@@ -1235,15 +1235,17 @@ class NuScenesPDMScorer:
         if sample_token is None:
             raise RuntimeError("NuScenesPDMScorer requires replay['sample_token']")
         sample_token_str = str(sample_token)
+        has_object_override = self._delegate._has_replay_object_context_override(replay)
 
-        cached = self._sample_context_cache.get(sample_token_str, None)
-        if cached is not None:
-            return cached
+        if not has_object_override:
+            cached = self._sample_context_cache.get(sample_token_str, None)
+            if cached is not None:
+                return cached
 
-        persisted = self._load_persisted_sample_context(sample_token_str)
-        if persisted is not None:
-            self._sample_context_cache[sample_token_str] = persisted
-            return persisted
+            persisted = self._load_persisted_sample_context(sample_token_str)
+            if persisted is not None:
+                self._sample_context_cache[sample_token_str] = persisted
+                return persisted
 
         static_ctx = self._delegate._build_static_sample_context(
             replay,
@@ -1252,12 +1254,15 @@ class NuScenesPDMScorer:
         map_layers = dict(static_ctx.get("map_context", {}).get("layers", {}))
         scene_objects = list(static_ctx.get("scene_objects", []))
         ea_agent_states = list(static_ctx.get("ea_agent_states", []))
-        ttc_agent_states = self._build_ttc_agent_states(
-            static_context=static_ctx,
-            scene_objects=scene_objects,
-            ea_agent_states=ea_agent_states,
-            patch_radius=float(static_ctx.get("map_context", {}).get("patch_radius", patch_radius)),
-        )
+        if "ttc_agent_states" in static_ctx:
+            ttc_agent_states = [dict(item) for item in static_ctx.get("ttc_agent_states", [])]
+        else:
+            ttc_agent_states = self._build_ttc_agent_states(
+                static_context=static_ctx,
+                scene_objects=scene_objects,
+                ea_agent_states=ea_agent_states,
+                patch_radius=float(static_ctx.get("map_context", {}).get("patch_radius", patch_radius)),
+            )
         object_tokens, object_polygons, object_velocity_xy, occupancy_map = self._build_object_geometry_arrays(scene_objects)
         lane_centerlines = list(map_layers.get("lane_centerline", []))
         drivable_polygons = list(map_layers.get("drivable_area", []))
@@ -1279,6 +1284,8 @@ class NuScenesPDMScorer:
             centerline_segments_xy=centerline_segments_xy,
             centerline_tangents_xy=centerline_tangents_xy,
         )
+        if has_object_override:
+            return sample_context
         self._sample_context_cache[sample_token_str] = sample_context
         self._save_persisted_sample_context(
             self._serialize_sample_context_payload(

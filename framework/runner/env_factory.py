@@ -123,6 +123,7 @@ def build_actor_env(
             "pixi_cmd": hugsim_cfg.get("pixi_cmd", "pixi"),
             "fifo_timeout_s": float(hugsim_cfg.get("fifo_timeout_s", 300.0)),
             "fifo_poll_interval_s": float(hugsim_cfg.get("fifo_poll_interval_s", 0.2)),
+            "min_gt_route_points": int(hugsim_cfg.get("min_gt_route_points", 2)),
         }
         alignment_cfg = hugsim_cfg.get("alignment", {}) or {}
         if isinstance(alignment_cfg, dict):

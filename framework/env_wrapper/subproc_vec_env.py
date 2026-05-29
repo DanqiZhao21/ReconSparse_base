@@ -85,6 +85,12 @@ class SceneSamplingEnv:
     def env(self) -> RLReconEnv:
         return self._env
 
+    def close(self) -> None:
+        env = getattr(self, "_env", None)
+        close_fn = getattr(env, "close", None)
+        if callable(close_fn):
+            close_fn()
+
     def _create_env_for_scene(self, scene_id: int):
         if self._env_backend == "hugsim_ori":
             from .hugsim_adapter import HUGSIMReconEnv
@@ -200,6 +206,7 @@ class SceneSamplingEnv:
                 sf = self._sample_start_frame(scene_id=sid)
                 self._reset_counter += 1
                 if self._env_backend == "hugsim_ori" and int(sid) != int(self._current_scene):
+                    self.close()
                     self._env = self._create_env_for_scene(int(sid))
                 obs, info = self._env.reset(scene=int(sid), start_frame=int(sf), step_frames=self._step_frames)
                 self._current_scene = int(sid)
@@ -326,6 +333,9 @@ def _worker(remote: Any, parent_remote: Any, env_fn: Callable[[], Any]) -> None:
             elif cmd == "get_attr":
                 remote.send(getattr(env, data))
             elif cmd == "close":
+                close_fn = getattr(env, "close", None)
+                if callable(close_fn):
+                    close_fn()
                 remote.close()
                 break
             else:

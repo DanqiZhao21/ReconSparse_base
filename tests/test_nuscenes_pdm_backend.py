@@ -1382,7 +1382,7 @@ def test_nuscenes_pdm_backend_no_collision_detects_future_agent_box_overlap(
             "row": {
                 "gt_boxes": np.asarray(
                     [
-                        [20.0, 0.0, 0.0, 1.0, 4.0, 1.8, 0.0],
+                        [20.0, 0.0, 0.0, 4.0, 1.0, 1.8, 0.0],
                     ],
                     dtype=np.float32,
                 ),

@@ -69,7 +69,7 @@ class NuScenesCraftScorer:
                 np.ones((num_candidates, horizon), dtype=np.float32),
                 np.tile(np.asarray([1.0, 0.0], dtype=np.float32), (num_candidates, horizon, 1)),
             )
-
+        #把路径拆成很多线段
         seg_start = path[:-1]
         seg_end = path[1:]
         seg_vec = (seg_end - seg_start).astype(np.float32, copy=False)
@@ -114,9 +114,9 @@ class NuScenesCraftScorer:
         route_heading_ratio = (
             np.abs(_wrap_angle(yaw - route_yaw)) / max(1.0e-6, np.deg2rad(self.heading_dev_max_deg))
         ).astype(np.float32, copy=False)
-        return progress_s, route_lateral, route_heading_ratio, best_tangent
+        return progress_s, route_lateral, route_heading_ratio, best_tangent#专家轨迹在该处朝哪个方向
 
-    def _score_candidate_batch_for_sample(
+    def _score_candidate_batch_for_sample(#不处理batch维度，只处理一个场景 sample 里的 N 条候选轨迹
         self,
         *,
         sample_context: Any,
@@ -125,30 +125,37 @@ class NuScenesCraftScorer:
         gt_s_full: np.ndarray,
         dt_s: float,
     ) -> np.ndarray:
+        #取出候选轨迹的集合信息
         centers_xy = np.asarray(candidate_geometry["centers_xy"], dtype=np.float32)
         yaw_rad = np.asarray(candidate_geometry["yaw_rad"], dtype=np.float32)
-        corners_xy = np.asarray(candidate_geometry["corners_xy"], dtype=np.float32)
+        corners_xy = np.asarray(candidate_geometry["corners_xy"], dtype=np.float32)#自车 bounding box 四个角点
         num_candidates, horizon = centers_xy.shape[:2]
+        
         if num_candidates <= 0 or horizon <= 0:
             return np.zeros((num_candidates,), dtype=np.float32)
 
         gt_xy_full = np.asarray(gt_xy_full, dtype=np.float32)
-        gt_s_full = np.asarray(gt_s_full, dtype=np.float32)
+        gt_s_full = np.asarray(gt_s_full, dtype=np.float32)#gt_s_full 是专家轨迹每个点对应的累计路径长度。
         if gt_xy_full.size <= 0 or int(gt_xy_full.shape[0]) <= 1:
-            raise RuntimeError("NuScenesCraftScorer requires gt_xy_full with at least two route points")
+            self._last_terms = {
+                "skipped_short_gt_route_count": float(num_candidates),
+            }
+            return np.zeros((num_candidates,), dtype=np.float32)
         if int(gt_s_full.shape[0]) != int(gt_xy_full.shape[0]):
             gt_s_full = _polyline_arclength(gt_xy_full).astype(np.float32, copy=False)
 
-        progress_s, route_lateral, route_heading_ratio, _ = self._project_route_stats_all(
-            centers_xy,
+        progress_s, route_lateral, route_heading_ratio, _ = self._project_route_stats_all(#把候选轨迹投影到专家轨迹上
+            centers_xy,#
             yaw_rad,
             gt_xy_full,
             gt_s_full,
         )
+        #计算每个时间点相对于上一个时间点，在专家轨迹方向上前进了多少
         prev_progress = np.concatenate([np.zeros((num_candidates, 1), dtype=np.float32), progress_s[:, :-1]], axis=1)
         delta_progress = (progress_s - prev_progress).astype(np.float32, copy=False)
         global_dev_ratio = np.clip(route_lateral / max(1.0e-6, self.center_dev_max_m), 0.0, 1.0).astype(np.float32, copy=False)
 
+        #TODO:s是否真实取到了地图中心线呢
         prev_xy = np.concatenate([centers_xy[:, :1, :], centers_xy[:, :-1, :]], axis=1)
         step_delta = centers_xy - prev_xy
         center_lateral, tangents_xy = self._pdm._batch_centerline_stats(
@@ -159,6 +166,8 @@ class NuScenesCraftScorer:
         )
         has_centerline = np.asarray(sample_context.centerline_segments_xy).size > 0
         center_dev_ratio = np.clip(center_lateral / max(1.0e-6, self.center_dev_max_m), 0.0, 1.0).astype(np.float32, copy=False)
+        
+        #计算相对于地图中心线的航向偏差
         tangent_yaw = np.arctan2(tangents_xy[..., 1], tangents_xy[..., 0]).astype(np.float32, copy=False)
         map_heading_ratio = np.abs(_wrap_angle(yaw_rad - tangent_yaw)) / max(1.0e-6, np.deg2rad(self.heading_dev_max_deg))
         heading_source_ratio = np.maximum(route_heading_ratio, map_heading_ratio) if has_centerline else route_heading_ratio

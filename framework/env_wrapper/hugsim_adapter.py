@@ -575,6 +575,7 @@ class HUGSIMFifoClient:
         self.fifo_poll_interval_s = float(fifo_poll_interval_s)
         self.cuda = None if cuda is None else int(cuda)
         self.process: subprocess.Popen[Any] | None = None
+        self._episode_done = False
         self.obs_pipe = self.output_dir / "obs_pipe"
         self.plan_pipe = self.output_dir / "plan_pipe"
 
@@ -619,8 +620,11 @@ class HUGSIMFifoClient:
             path.unlink()
 
     def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        if self._episode_done:
+            self.close()
         self.start()
         obs, info = self._read_obs_info()
+        self._episode_done = False
         return dict(obs), dict(info)
 
     def step(self, plan_traj: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
@@ -638,6 +642,7 @@ class HUGSIMFifoClient:
         obs, info = self._read_obs_info()
         terminated = bool(info.get("terminated", False) or info.get("done", False))
         truncated = bool(info.get("truncated", False))
+        self._episode_done = bool(terminated or truncated)
         reward = float(info.get("reward", 0.0))
         return dict(obs), reward, terminated, truncated, dict(info)
 
@@ -665,6 +670,7 @@ class HUGSIMFifoClient:
                 process.kill()
                 process.wait(timeout=5.0)
         self.process = None
+        self._episode_done = False
 
     def _read_obs_info(self) -> tuple[dict[str, Any], dict[str, Any]]:
         if self.process is None:
@@ -709,6 +715,7 @@ class HUGSIMReconEnv:
         fifo_poll_interval_s: float = 0.2,
         fifo_runner_path: str | Path = FIFO_RUNNER_DEFAULT,
         cuda: int | None = None,
+        min_gt_route_points: int = 2,
     ) -> None:
         self.official_scene_name = str(scenario_name)
         self.scenario_path = str(scenario_path)
@@ -733,6 +740,7 @@ class HUGSIMReconEnv:
         self._last_hugsim_obs = None
         self._last_hugsim_info = None
         self._external_plan_local_xyyaw = None
+        self.min_gt_route_points = max(0, int(min_gt_route_points))
         scenario_output_name = Path(self.scenario_path).stem or self.official_scene_name
         output_dir = (Path(output_root) / scenario_output_name).resolve()
         if self.launch_mode == "fifo":
@@ -763,6 +771,28 @@ class HUGSIMReconEnv:
 
     def set_external_plan_local_xyyaw(self, plan: Any) -> None:
         self._external_plan_local_xyyaw = None if plan is None else np.asarray(plan, dtype=np.float32)
+
+    def _maybe_mark_short_gt_route_done(
+        self,
+        info: dict[str, Any],
+        mapping: HUGSIMFrameMapping,
+        *,
+        terminal_metadata_allowed: bool,
+    ) -> bool:
+        counter = getattr(self.scene_index, "remaining_future_sample_count", None)
+        if not callable(counter) or self.min_gt_route_points <= 0:
+            return False
+        try:
+            count = int(counter(str(mapping.official_scene_name), int(mapping.sample_index)))
+        except Exception:
+            return False
+        if count >= int(self.min_gt_route_points):
+            return False
+        info["remaining_future_sample_count"] = int(count)
+        if bool(terminal_metadata_allowed):
+            info["terminal_kind"] = "env_done"
+            info["done_reason"] = "short_gt_route"
+        return True
 
     def _get_alignment(self, mapping: HUGSIMFrameMapping) -> HUGSIMReconAlignment:
         key = (str(mapping.official_scene_name), int(mapping.recon_scene_id))
@@ -1040,7 +1070,14 @@ class HUGSIMReconEnv:
             alignment=alignment,
         )
         collision_done = bool(info.get("collision", False) or info.get("static_collision", False) or info.get("dynamic_collision", False))
+        short_gt_route_done = self._maybe_mark_short_gt_route_done(
+            info,
+            mapping,
+            terminal_metadata_allowed=not bool(collision_done or truncated),
+        )
         if collision_done and not bool(truncated):
+            terminated = True
+        if bool(short_gt_route_done) and not bool(truncated):
             terminated = True
         if bool(terminated or truncated) and "terminal_kind" not in info:
             if collision_done:

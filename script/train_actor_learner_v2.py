@@ -18,7 +18,11 @@ cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
   --role orchestrator \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605261115_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCloseloop_openGRPOCraft-MetricsPara-cuda2.yaml
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605291105_HUGSM_reinforcepp_closed_loop_closeCloseloop_openGRPOCraft-onlyScene0166.yaml
+
+#如果一直启动不起来卡在gsplat编译:
+rm -rf /root/clone/ReconDreamer-RL/.cache/torch_extensions/gsplat_cuda_legacy
+
 '''
 def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
@@ -125,24 +129,3 @@ if __name__ == "__main__":
     main()
     
     
-# python script/train_actor_learner_v2.py --role orchestrator --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml
-
-
-# python script/train_actor_learner_v2.py --role orchestrator --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml
-
-'''
-cd /root/clone/ReconDreamer-RL
-python script/train_actor_learner_v2.py \
-  --role orchestrator \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2.yaml
-
-
-20260407
-cd /root/clone/ReconDreamer-RL
-
-PYTHONPATH=/root/clone/ReconDreamer-RL \
-/root/miniconda3/envs/recondreamerNew-rl/bin/python -u script/train_actor_learner_v2.py \
-  --role orchestrator \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/ppo_closed_loop_sparsedrive_v2.yaml
-
-'''
