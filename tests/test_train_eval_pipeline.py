@@ -298,7 +298,9 @@ def test_parse_train_eval_args_defaults_to_hugsim_ori_88_scenes_two_repeats_and_
 
     assert args.repeat_evals == 2
     assert args.max_scenes == 88
-    assert args.scenario_dir == Path("/root/clone/HUGSIM-ORI/configs/scenarios/nuscenes")
+    assert args.scenario_dir == (
+        Path(__file__).resolve().parents[1] / "third_party" / "HUGSIM-ORI" / "configs" / "scenarios" / "nuscenes"
+    )
     assert args.slots == ["0:0", "1:1", "2:2", "3:3", "4:4", "5:5", "6:6", "7:7"]
     assert args.no_default_eval_seed is False
 

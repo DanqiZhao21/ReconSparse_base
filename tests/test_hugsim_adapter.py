@@ -48,6 +48,38 @@ def _fake_hugsim_info(timestamp):
     }
 
 
+def _install_fake_fifo_client(
+    monkeypatch,
+    hugsim_adapter,
+    *,
+    image,
+    step_info,
+    base_reward=0.0,
+    terminated=False,
+    truncated=False,
+    calls=None,
+):
+    call_log = [] if calls is None else calls
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            call_log.append(("client_init", kwargs))
+
+        def reset(self):
+            call_log.append(("client_reset",))
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+        def step(self, plan_traj):
+            call_log.append(("client_step", np.asarray(plan_traj, dtype=np.float32).copy()))
+            return _fake_hugsim_obs(image), float(base_reward), bool(terminated), bool(truncated), dict(step_info)
+
+        def close(self):
+            call_log.append(("client_close",))
+
+    monkeypatch.setattr(hugsim_adapter, "HUGSIMFifoClient", FakeClient)
+    return call_log
+
+
 def test_build_recondreamer_obs_uses_all_six_cameras():
     image = np.full((450, 800, 3), 7, dtype=np.uint8)
     hugsim_obs = _fake_hugsim_obs(image)
@@ -82,54 +114,12 @@ def test_build_recondreamer_obs_uses_all_six_cameras():
     assert obs["cam_intrinsics"].shape == (6, 3, 3)
 
 
-class FakeHUGSIMEnv:
-    def __init__(self):
-        self.actions = []
-        self.info = {
-            "ego_velo": 1.0,
-            "ego_steer": 0.0,
-            "accelerate": 0.0,
-            "command": 2,
-            "timestamp": 0.0,
-            "ego_pos": [0.0, 0.0, 0.0],
-            "ego_rot": [0.0, 0.0, 0.0],
-            "cam_params": {},
-        }
-
-    def step(self, action):
-        self.actions.append(action)
-        self.info = dict(self.info)
-        self.info["timestamp"] = 0.25 * len(self.actions)
-        return {"rgb": {}}, 0.0, False, False, self.info
-
-
-def test_execute_hugsim_substeps_reuses_same_control(monkeypatch):
+def test_hugsim_adapter_no_longer_exposes_direct_control_helpers():
     from framework.env_wrapper import hugsim_adapter
 
-    calls = []
-
-    def fake_traj2control(plan, info):
-        calls.append((plan.copy(), dict(info)))
-        return 0.2, -0.1
-
-    monkeypatch.setattr(hugsim_adapter, "traj2control", fake_traj2control)
-
-    env = FakeHUGSIMEnv()
-    obs, reward, terminated, truncated, info = hugsim_adapter.execute_hugsim_control_horizon(
-        env=env,
-        plan_traj=np.zeros((8, 2), dtype=np.float32),
-        initial_info=env.info,
-        substeps_per_rl_step=2,
-    )
-
-    assert obs == {"rgb": {}}
-    assert reward == 0.0
-    assert not terminated
-    assert not truncated
-    assert len(calls) == 1
-    assert len(env.actions) == 2
-    assert env.actions[0] == env.actions[1]
-    assert info["timestamp"] == 0.5
+    assert not hasattr(hugsim_adapter, "create_hugsim_env")
+    assert not hasattr(hugsim_adapter, "execute_hugsim_control_horizon")
+    assert not hasattr(hugsim_adapter, "traj2control")
 
 
 def test_hugsim_recon_env_reset_and_step(monkeypatch, tmp_path):
@@ -150,28 +140,11 @@ def test_hugsim_recon_env_reset_and_step(monkeypatch, tmp_path):
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def __init__(self):
-            self.timestamp = 0.0
-
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(self.timestamp)
-
-        def step(self, action):
-            self.timestamp += 0.25
-            return _fake_hugsim_obs(image), 0.0, False, False, _fake_hugsim_info(self.timestamp)
-
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            env.step({"acc": 0.0, "steer_rate": 0.0})[0],
-            0.0,
-            False,
-            False,
-            _fake_hugsim_info(0.5),
-        ),
+        image=image,
+        step_info=_fake_hugsim_info(0.5),
     )
 
     env = hugsim_adapter.HUGSIMReconEnv(
@@ -270,10 +243,6 @@ def test_hugsim_recon_env_uses_recondreamer_reward_not_hugsim_reward(monkeypatch
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     calls = []
 
     class FakeRewardComputer:
@@ -290,17 +259,12 @@ def test_hugsim_recon_env_uses_recondreamer_reward_not_hugsim_reward(monkeypatch
             out["reward"] = 7.5
             return TrackingRewardResult(reward=7.5, info=out)
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            123.0,
-            False,
-            False,
-            _fake_hugsim_info(0.5),
-        ),
+        image=image,
+        step_info=_fake_hugsim_info(0.5),
+        base_reward=123.0,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
 
@@ -345,10 +309,6 @@ def test_hugsim_recon_env_terminates_before_short_gt_route_token(monkeypatch, tm
         def remaining_future_sample_count(self, official_scene_name, sample_index):
             return 1
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     class FakeRewardComputer:
         def __init__(self, reward_cfg):
             pass
@@ -362,17 +322,11 @@ def test_hugsim_recon_env_terminates_before_short_gt_route_token(monkeypatch, tm
             out["seen_done"] = bool(done)
             return TrackingRewardResult(reward=0.0, info=out)
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            _fake_hugsim_info(0.5),
-        ),
+        image=image,
+        step_info=_fake_hugsim_info(0.5),
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
 
@@ -419,10 +373,6 @@ def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_p
         def remaining_future_sample_count(self, official_scene_name, sample_index):
             return 1
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     class FakeRewardComputer:
         def __init__(self, reward_cfg):
             pass
@@ -441,17 +391,13 @@ def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_p
     terminal_info["ego_box"] = [0.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
     terminal_info["obj_boxes"] = [[0.25, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]]
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            -100.0,
-            True,
-            False,
-            terminal_info,
-        ),
+        image=image,
+        step_info=terminal_info,
+        base_reward=-100.0,
+        terminated=True,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
 
@@ -499,10 +445,6 @@ def test_hugsim_recon_env_forces_done_when_hugsim_reports_collision_without_term
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     class FakeRewardComputer:
         def __init__(self, reward_cfg):
             pass
@@ -518,17 +460,11 @@ def test_hugsim_recon_env_forces_done_when_hugsim_reports_collision_without_term
     collision_info["collision"] = True
     collision_info["rc"] = 0.2
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            collision_info,
-        ),
+        image=image,
+        step_info=collision_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
 
@@ -571,10 +507,6 @@ def test_hugsim_recon_env_forces_done_when_aligned_bev_objects_collide(monkeypat
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     class FakeRewardComputer:
         def __init__(self, reward_cfg):
             pass
@@ -597,17 +529,11 @@ def test_hugsim_recon_env_forces_done_when_aligned_bev_objects_collide(monkeypat
         valid=True,
     )
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            step_info,
-        ),
+        image=image,
+        step_info=step_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
     monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
@@ -690,10 +616,6 @@ def test_hugsim_recon_env_collides_with_recon_cache_objects_using_local_alignmen
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     step_info = _fake_hugsim_info(0.5)
     step_info["collision"] = False
     step_info["ego_box"] = [10.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
@@ -721,17 +643,11 @@ def test_hugsim_recon_env_collides_with_recon_cache_objects_using_local_alignmen
             assert done is True
             return TrackingRewardResult(reward=-12.0, info=dict(info))
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            step_info,
-        ),
+        image=image,
+        step_info=step_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
     monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: global_alignment)
@@ -811,9 +727,9 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+        def sample_token_for_frame(self, recon_scene_id, frame_idx):
+            assert recon_scene_id == 12
+            return {125: "tok125", 169: "tok169"}.get(int(frame_idx))
 
     step_info = _fake_hugsim_info(12.5)
     step_info["collision"] = False
@@ -837,17 +753,11 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
             assert done is False
             return TrackingRewardResult(reward=1.0, info=dict(info))
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            step_info,
-        ),
+        image=image,
+        step_info=step_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
     monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
@@ -870,6 +780,10 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
     assert info["recon_cache_frame_idx"] == 169
     assert info["recon_cache_frame_source"] == "nearest_pose"
     assert info["recon_cache_time_frame_idx"] == 125
+    assert info["recon_cache_sample_token"] == "tok169"
+    assert info["recon_cache_time_sample_token"] == "tok125"
+    assert info["grpo_gt_sample_token"] == "tok169"
+    assert info["grpo_gt_frame_idx"] == 169
     assert info["recon_cache_frame_pose_dist_m"] == pytest.approx(0.0)
     assert info["recon_cache_dynamic_objects"][0]["token"] == "nearest_pose_vehicle"
 
@@ -891,10 +805,6 @@ def test_hugsim_recon_env_uses_aligned_recon_global_pose_for_reward(monkeypatch,
                 sample_relative_time_s=0.5,
                 hugsim_relative_time_s=relative_time_s,
             )
-
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
 
     step_info = _fake_hugsim_info(0.5)
     step_info["ego_box"] = [10.0, 2.0, 0.0, 2.0, 4.0, 1.5, 0.0]
@@ -918,17 +828,11 @@ def test_hugsim_recon_env_uses_aligned_recon_global_pose_for_reward(monkeypatch,
         valid=True,
     )
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            step_info,
-        ),
+        image=image,
+        step_info=step_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
     monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
@@ -989,10 +893,6 @@ def test_hugsim_recon_env_adds_recon_cache_dynamic_objects_and_front_obstacle_me
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     step_info = _fake_hugsim_info(0.5)
     step_info["ego_box"] = [10.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
     alignment = HUGSIMReconAlignment(
@@ -1012,17 +912,11 @@ def test_hugsim_recon_env_adds_recon_cache_dynamic_objects_and_front_obstacle_me
         def compute(self, *, env, info, step_idx, done):
             return TrackingRewardResult(reward=1.0, info=dict(info))
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            step_info,
-        ),
+        image=image,
+        step_info=step_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
     monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
@@ -1063,10 +957,6 @@ def test_hugsim_recon_env_transforms_inserted_hugsim_objects_to_recon_global(mon
                 hugsim_relative_time_s=relative_time_s,
             )
 
-    class FakeEnv:
-        def reset(self):
-            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
-
     step_info = _fake_hugsim_info(0.5)
     step_info["ego_box"] = [10.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
     step_info["obj_boxes"] = [[12.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]]
@@ -1087,17 +977,11 @@ def test_hugsim_recon_env_transforms_inserted_hugsim_objects_to_recon_global(mon
         def compute(self, *, env, info, step_idx, done):
             return TrackingRewardResult(reward=1.0, info=dict(info))
 
-    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
-    monkeypatch.setattr(
+    _install_fake_fifo_client(
+        monkeypatch,
         hugsim_adapter,
-        "execute_hugsim_control_horizon",
-        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
-            _fake_hugsim_obs(image),
-            0.0,
-            False,
-            False,
-            step_info,
-        ),
+        image=image,
+        step_info=step_info,
     )
     monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
     monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
@@ -1118,3 +1002,72 @@ def test_hugsim_recon_env_transforms_inserted_hugsim_objects_to_recon_global(mon
     assert info["hugsim_obj_boxes_recon_global"][0]["source"] == "hugsim_inserted"
     assert info["hugsim_obj_boxes_recon_global"][0]["token"] == "hugsim_obj_0"
     assert len(info["hugsim_obj_boxes_recon_global"][0]["poly"]) >= 4
+
+
+def test_hugsim_recon_env_uses_inserted_hugsim_objects_for_front_obstacle_metrics(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_recon_alignment import HUGSIMReconAlignment, Sim2Transform
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok1",
+                frame_idx=5,
+                sample_index=1,
+                sample_relative_time_s=0.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    step_info = _fake_hugsim_info(0.5)
+    step_info["ego_velo"] = 4.0
+    step_info["ego_box"] = [10.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
+    step_info["obj_boxes"] = [[15.0, 0.5, 0.0, 2.0, 4.0, 1.5, 0.0]]
+    alignment = HUGSIMReconAlignment(
+        official_scene_name="scene-0013",
+        recon_scene_id=12,
+        transform=Sim2Transform(scale=1.0, rotation=np.eye(2), translation_xy=np.asarray([100.0, 50.0])),
+        valid=True,
+    )
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            pass
+
+        def compute(self, *, env, info, step_idx, done):
+            return TrackingRewardResult(reward=1.0, info=dict(info))
+
+    _install_fake_fifo_client(
+        monkeypatch,
+        hugsim_adapter,
+        image=image,
+        step_info=step_info,
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+    monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        output_root=tmp_path,
+        recon_data_root=tmp_path,
+        hugsim_model_base=tmp_path / "hugsim",
+    )
+
+    env.reset()
+    _obs, _reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert not terminated
+    assert not truncated
+    assert info["recon_cache_dynamic_objects"] == []
+    assert info["front_obstacle_available"] is True
+    assert info["front_obstacle_gap_m"] == pytest.approx(5.0)
+    assert info["front_obstacle_lateral_m"] == pytest.approx(0.5)
+    assert info["front_obstacle_category"] == "vehicle.car"

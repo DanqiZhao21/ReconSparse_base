@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from framework.utils.repo_paths import resolve_hugsim_path, resolve_hugsim_root
+
 
 @dataclass(frozen=True)
 class HUGSIMScenarioSpec:
@@ -86,7 +88,14 @@ def build_actor_env(
         from framework.env_wrapper.hugsim_scene_index import HUGSIMSceneIndex
 
         hugsim_cfg = env_cfg.get("hugsim", {}) or {}
-        scenario_dir = str(hugsim_cfg.get("scenario_dir", "/root/clone/HUGSIM-ORI/configs/scenarios/nuscenes"))
+        scenario_dir = str(
+            resolve_hugsim_path(
+                hugsim_cfg.get("scenario_dir", None),
+                "configs",
+                "scenarios",
+                "nuscenes",
+            )
+        )
         discovered_scenarios = discover_hugsim_scenarios(scenario_dir)
         scene_filter = hugsim_cfg.get("scenes", None)
         if scene_filter:
@@ -111,15 +120,19 @@ def build_actor_env(
         )
         hugsim_kwargs = {
             "scene_index": scene_index,
-            "hugsim_repo": hugsim_cfg.get("repo", "/root/clone/HUGSIM-ORI"),
-            "base_path": hugsim_cfg.get("base_path", None),
-            "camera_path": hugsim_cfg.get("camera_path", None),
-            "kinematic_path": hugsim_cfg.get("kinematic_path", None),
-            "substeps_per_rl_step": int(hugsim_cfg.get("substeps_per_rl_step", 2)),
+            "hugsim_repo": resolve_hugsim_path(hugsim_cfg.get("repo", None)) or resolve_hugsim_root(),
+            "base_path": resolve_hugsim_path(
+                hugsim_cfg.get("base_path", None),
+                "configs",
+                "sim",
+                "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml",
+            ),
+            "camera_path": resolve_hugsim_path(hugsim_cfg.get("camera_path", None), "configs", "sim", "nuscenes_camera.yaml"),
+            "kinematic_path": resolve_hugsim_path(hugsim_cfg.get("kinematic_path", None), "configs", "sim", "kinematic.yaml"),
             "output_root": hugsim_cfg.get("output_root", "outputs/hugsim_rl"),
             "recon_data_root": hugsim_cfg.get("recon_data_root", "assets/nus/data"),
             "hugsim_model_base": hugsim_cfg.get("model_base", None),
-            "launch_mode": hugsim_cfg.get("launch_mode", "direct"),
+            "launch_mode": hugsim_cfg.get("launch_mode", "fifo"),
             "pixi_cmd": hugsim_cfg.get("pixi_cmd", "pixi"),
             "fifo_timeout_s": float(hugsim_cfg.get("fifo_timeout_s", 300.0)),
             "fifo_poll_interval_s": float(hugsim_cfg.get("fifo_poll_interval_s", 0.2)),

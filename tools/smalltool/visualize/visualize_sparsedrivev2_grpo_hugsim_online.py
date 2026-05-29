@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_
 CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_grpo_hugsim_online.py \
   --config script/configs/sparsedrive_v2/202605280811_HUGSM_reinforcepp_closed_loop_Noclose_GRPOCrafty.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
-  --scenario-path /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0166-medium-00.yaml \
+  --scenario-path third_party/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0166-medium-00.yaml \
   --max-steps 42 \
   --num-candidates 64 \
   --top-k 3 \
@@ -43,6 +43,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from framework.runner.env_factory import discover_hugsim_scenarios
+from framework.utils.repo_paths import resolve_hugsim_path, resolve_hugsim_root
 from framework.utils.repo_paths import resolve_repo_path
 from tools.smalltool.visualize.visualize_sparsedrivev2_grpo_craft_online import (
     _extract_plan_and_scores,
@@ -170,7 +171,14 @@ def select_hugsim_scenario(
 ) -> HUGSIMSelection:
     env_cfg = dict(config.get("env", {}) or {})
     hugsim_cfg = dict(env_cfg.get("hugsim", {}) or {})
-    scenario_dir = str(hugsim_cfg.get("scenario_dir", "/root/clone/HUGSIM-ORI/configs/scenarios/nuscenes"))
+    scenario_dir = str(
+        resolve_hugsim_path(
+            hugsim_cfg.get("scenario_dir", None),
+            "configs",
+            "scenarios",
+            "nuscenes",
+        )
+    )
     scenarios = discover_hugsim_scenarios(scenario_dir)
     if not scenarios:
         raise RuntimeError(f"No HUGSIM scenarios discovered under {scenario_dir}")
@@ -562,10 +570,15 @@ def _make_hugsim_env(*, config: Mapping[str, Any], selection: HUGSIMSelection, c
         "scene_index": scene_index,
         "reward_cfg": env_cfg.get("reward", {}) or {},
         "output_root": hugsim_cfg.get("output_root", "outputs/hugsim_rl_visualize"),
-        "hugsim_repo": hugsim_cfg.get("repo", "/root/clone/HUGSIM-ORI"),
-        "base_path": hugsim_cfg.get("base_path", None),
-        "camera_path": hugsim_cfg.get("camera_path", None),
-        "kinematic_path": hugsim_cfg.get("kinematic_path", None),
+        "hugsim_repo": resolve_hugsim_path(hugsim_cfg.get("repo", None)) or resolve_hugsim_root(),
+        "base_path": resolve_hugsim_path(
+            hugsim_cfg.get("base_path", None),
+            "configs",
+            "sim",
+            "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml",
+        ),
+        "camera_path": resolve_hugsim_path(hugsim_cfg.get("camera_path", None), "configs", "sim", "nuscenes_camera.yaml"),
+        "kinematic_path": resolve_hugsim_path(hugsim_cfg.get("kinematic_path", None), "configs", "sim", "kinematic.yaml"),
         "substeps_per_rl_step": int(hugsim_cfg.get("substeps_per_rl_step", 2)),
         "recon_data_root": hugsim_cfg.get("recon_data_root", "assets/nus/data"),
         "hugsim_model_base": hugsim_cfg.get("model_base", None),
@@ -714,6 +727,15 @@ def run_online_hugsim_scene(
                     "recon_cache_object_count": int(grpo_object_context.get("recon_cache_object_count", 0)),
                     "scene_object_count": len(grpo_object_context.get("scene_objects", []) or []),
                 }
+            gt_sample_token = current_info.get("grpo_gt_sample_token", current_info.get("recon_cache_sample_token", None))
+            if gt_sample_token is not None and str(gt_sample_token):
+                replay["gt_sample_token_override"] = str(gt_sample_token)
+            gt_frame_idx = current_info.get("grpo_gt_frame_idx", current_info.get("recon_cache_frame_idx", None))
+            if gt_frame_idx is not None:
+                try:
+                    replay["gt_frame_idx_override"] = int(gt_frame_idx)
+                except Exception:
+                    pass
             replay_out = _extract_plan_and_scores(
                 policy,
                 replay,

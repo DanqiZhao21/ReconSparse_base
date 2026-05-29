@@ -12,8 +12,8 @@ from typing import Any
 import yaml
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-HUGSIM_ROOT = Path("/root/clone/HUGSIM-ORI")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+HUGSIM_ROOT = Path(os.environ.get("HUGSIM_ROOT", REPO_ROOT / "third_party" / "HUGSIM-ORI")).resolve()
 DEFAULT_HUGSIM_TEMPLATE = HUGSIM_ROOT / "configs" / "sim" / "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml"
 DEFAULT_SCENARIO_DIR = HUGSIM_ROOT / "configs" / "scenarios" / "nuscenes"
 DEFAULT_EVAL_OUTPUT_ROOT = HUGSIM_ROOT / "outputs" / "evaluate-auto"

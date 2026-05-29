@@ -35,7 +35,7 @@ python -u script/train_eval_pipeline.py \
 '''
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HUGSIM_ROOT = Path("/root/clone/HUGSIM-ORI")
+HUGSIM_ROOT = Path(os.environ.get("HUGSIM_ROOT", REPO_ROOT / "third_party" / "HUGSIM-ORI")).resolve()
 SPARSEDRIVE_CKPT_DIR = REPO_ROOT / "egoADs" / "SparseDriveV2" / "ckpt"
 DEFAULT_TRAIN_PYTHON = Path("/root/miniconda3/envs/recondreamerNew-rl/bin/python")
 DEFAULT_HUGSIM_TEMPLATE = HUGSIM_ROOT / "configs" / "sim" / "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml"

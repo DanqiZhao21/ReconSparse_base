@@ -111,6 +111,32 @@ def test_score_matches_detail_path_for_mixed_horizon_batch(tmp_path: Path) -> No
     assert torch.allclose(scores.cpu(), detail_scores.cpu(), atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_gt_sample_token_override_controls_detail_and_torch_gt(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path)
+
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.3, 0.2, 0.0], [0.7, 0.4, 0.0], [0.8, 0.5, 0.0]],
+                [[1.0, 1.0, 0.0], [1.2, 1.1, 0.0], [1.4, 1.2, 0.0], [1.6, 1.3, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    replays = [{"sample_token": "tok-a", "gt_sample_token_override": "tok-b"}]
+
+    detail_scores_np, details = scorer._score_batch(replays, traj_xyyaw, include_debug_context=False)
+    torch_scores = scorer.score(replays, traj_xyyaw)
+
+    assert len(details) == 1
+    assert np.allclose(details[0]["gt_xy"], scorer._lookup_gt("tok-b"))
+    assert details[0]["sample_token"] == "tok-a"
+    assert details[0]["gt_sample_token"] == "tok-b"
+    assert torch.allclose(torch_scores.cpu(), torch.from_numpy(detail_scores_np), atol=1.0e-5, rtol=1.0e-5)
+
+
 def test_detail_path_reuses_static_context_per_sample_token(monkeypatch, tmp_path: Path) -> None:
     token2vad_path = tmp_path / "token2vad.pkl"
     _write_token2vad(token2vad_path)

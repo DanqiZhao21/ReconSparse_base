@@ -9,7 +9,7 @@ import torch
 
 from framework.batch import build_training_batch
 from framework.lightning.config import actor_learner_lightning_config_from_algorithm
-from framework.rollout.collector import collect_single_env_shard
+from framework.rollout.collector import collect_single_env_shard, collect_vector_env_shards
 from framework.runner.actor_runtime import resolve_store_obs
 from framework.runner.learner_factory import ValueHead, ValueNet
 
@@ -104,6 +104,103 @@ def test_collect_single_env_shard_can_skip_obs_storage() -> None:
     assert "next_obs" not in shard
     assert shard["reward"].shape == (2,)
     assert len(shard["replay"]) == 2
+
+
+def test_collect_single_env_shard_injects_current_gt_reference_info() -> None:
+    class EnvWithGtInfo(_TinyEnv):
+        def reset(self):
+            return _obs(0), {
+                "grpo_gt_sample_token": "tok-reset",
+                "grpo_gt_frame_idx": 10,
+            }
+
+        def step(self, action: Any):
+            del action
+            self.step_count += 1
+            return _obs(self.step_count), 1.0, False, False, {
+                "grpo_gt_sample_token": f"tok-step-{self.step_count}",
+                "grpo_gt_frame_idx": 10 + self.step_count,
+            }
+
+    env = EnvWithGtInfo()
+    obs, info = env.reset()
+    shard, _next_obs = collect_single_env_shard(
+        env=env,
+        agent=_TinyAgent(),
+        obs=obs,
+        info=info,
+        horizon=2,
+        eta=1.0,
+        mode_idx=-1,
+        mode_select="sample",
+        actor_id=0,
+        local_ver=1,
+        shard_idx=0,
+        store_obs=False,
+    )
+
+    assert shard["replay"][0]["gt_sample_token_override"] == "tok-reset"
+    assert shard["replay"][0]["gt_frame_idx_override"] == 10
+    assert shard["replay"][1]["gt_sample_token_override"] == "tok-step-1"
+    assert shard["replay"][1]["gt_frame_idx_override"] == 11
+
+
+def test_collect_vector_env_shards_injects_current_gt_reference_info() -> None:
+    class VecEnvWithGtInfo:
+        def __init__(self) -> None:
+            self.step_count = 0
+
+        def step(self, actions):
+            del actions
+            self.step_count += 1
+            return (
+                [_obs(self.step_count), _obs(self.step_count + 10)],
+                [1.0, 2.0],
+                [False, False],
+                [False, False],
+                [
+                    {"grpo_gt_sample_token": f"tok-a-step-{self.step_count}", "grpo_gt_frame_idx": 20 + self.step_count},
+                    {"grpo_gt_sample_token": f"tok-b-step-{self.step_count}", "grpo_gt_frame_idx": 30 + self.step_count},
+                ],
+            )
+
+        def reset_one(self, env_idx: int):
+            return _obs(100 + int(env_idx)), {"grpo_gt_sample_token": f"tok-reset-{env_idx}"}
+
+        def call_one(self, env_idx: int, method_name: str, *args):
+            del env_idx, method_name, args
+
+    class BatchAgent:
+        def act_batch(self, obs_list, *, eta: float, mode_idx: int, mode_select: str):
+            del eta, mode_idx, mode_select
+            actions = [(0.0, 0.0, 0.0, 2) for _ in obs_list]
+            logps = [torch.tensor(0.0) for _ in obs_list]
+            replays = [{"env": idx} for idx, _obs_item in enumerate(obs_list)]
+            return actions, logps, replays
+
+    shards, _obs_list = collect_vector_env_shards(
+        vec_env=VecEnvWithGtInfo(),
+        agent=BatchAgent(),
+        obs_list=[_obs(0), _obs(1)],
+        info_list=[
+            {"grpo_gt_sample_token": "tok-a-reset", "grpo_gt_frame_idx": 20},
+            {"grpo_gt_sample_token": "tok-b-reset", "grpo_gt_frame_idx": 30},
+        ],
+        num_envs_per_actor=2,
+        horizon=2,
+        eta=1.0,
+        mode_idx=-1,
+        mode_select="sample",
+        actor_id=0,
+        local_ver=1,
+        shard_idx_per_env=[0, 0],
+        store_obs=False,
+    )
+
+    assert shards[0]["replay"][0]["gt_sample_token_override"] == "tok-a-reset"
+    assert shards[0]["replay"][1]["gt_sample_token_override"] == "tok-a-step-1"
+    assert shards[1]["replay"][0]["gt_sample_token_override"] == "tok-b-reset"
+    assert shards[1]["replay"][1]["gt_sample_token_override"] == "tok-b-step-1"
 
 
 def test_replay_feature_ppo_batch_accepts_shard_without_obs(tmp_path: Path) -> None:

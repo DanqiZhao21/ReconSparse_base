@@ -88,6 +88,14 @@ class HUGSIMSceneIndex:
             raise KeyError(f"sample_token={sample_token!r} not found for recon scene {recon_scene_id:03d}")
         return int(token_to_frame[str(sample_token)])
 
+    def sample_token_for_frame(self, recon_scene_id: int, frame_idx: int) -> str | None:
+        token_to_frame = self._recon_scene_tokens.get(int(recon_scene_id), {})
+        target_frame = int(frame_idx)
+        for token, frame in token_to_frame.items():
+            if int(frame) == target_frame:
+                return str(token)
+        return None
+
     def remaining_future_sample_count(self, official_scene_name: str, sample_index: int) -> int:
         samples = self.samples_for_official_scene(str(official_scene_name))
         return max(0, int(len(samples)) - int(sample_index) - 1)

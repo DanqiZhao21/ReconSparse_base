@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -90,10 +91,12 @@ def test_hugsim_fifo_client_launches_pixi_runner(monkeypatch, tmp_path: Path):
     launched = {}
 
     class FakeProcess:
-        def __init__(self, cmd, cwd, env):
+        def __init__(self, cmd, cwd, env, stdout=None, stderr=None):
             launched["cmd"] = cmd
             launched["cwd"] = cwd
             launched["env"] = env
+            launched["stdout"] = stdout
+            launched["stderr"] = stderr
 
         def poll(self):
             return None
@@ -104,7 +107,10 @@ def test_hugsim_fifo_client_launches_pixi_runner(monkeypatch, tmp_path: Path):
         def wait(self, timeout=None):
             return 0
 
-    monkeypatch.setattr("subprocess.Popen", lambda cmd, cwd=None, env=None, **kwargs: FakeProcess(cmd, cwd, env))
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda cmd, cwd=None, env=None, stdout=None, stderr=None, **kwargs: FakeProcess(cmd, cwd, env, stdout, stderr),
+    )
 
     client = HUGSIMFifoClient(
         hugsim_repo="/root/clone/HUGSIM-ORI",
@@ -124,6 +130,9 @@ def test_hugsim_fifo_client_launches_pixi_runner(monkeypatch, tmp_path: Path):
     assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     output_idx = launched["cmd"].index("--output_dir") + 1
     assert Path(launched["cmd"][output_idx]).is_absolute()
+    assert Path(launched["stdout"].name).name == "hugsim_fifo_runner.log"
+    assert launched["stdout"].closed
+    assert launched["stderr"] == subprocess.STDOUT
 
 
 def test_hugsim_fifo_client_removes_stale_pipes_before_launch(monkeypatch, tmp_path: Path):

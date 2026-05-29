@@ -59,6 +59,38 @@ def resolve_actor_env_runtime(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def resolve_close_env_between_shards(cfg: Dict[str, Any]) -> bool:
+    train_cfg = cfg.get("train", {}) or {}
+    al_cfg = train_cfg.get("actor_learner", {}) or {}
+    raw = al_cfg.get("close_env_between_shards", "auto")
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off"}:
+            return False
+        if text != "auto":
+            raise ValueError(
+                f"Unsupported actor_learner.close_env_between_shards={raw!r}; expected true, false, or auto"
+            )
+    elif raw is not None:
+        return bool(raw)
+
+    env_cfg = cfg.get("env", {}) or {}
+    backend = str(env_cfg.get("backend", "recon")).strip().lower()
+    return backend == "hugsim_ori"
+
+
+def _close_env_for_actor(env: Any, *, actor_id: int) -> None:
+    close_fn = getattr(env, "close", None)
+    if not callable(close_fn):
+        return
+    try:
+        close_fn()
+    except Exception as exc:
+        stage(f"[actor{actor_id}] env close between shards failed: {exc}")
+
+
 def _normalize_algo_key(value: Any) -> str:
     text = str(value or "ppo").strip().lower()
     if text in {"reinforce++", "reinforce_pp", "reinforce_clip"}:
@@ -177,13 +209,19 @@ def _actor_main_impl(
         stage(f"[actor{actor_id}] batched actor mode enabled num_envs_per_actor={num_envs_per_actor} vec_env_mode={vec_env_mode}")
 
     if num_envs_per_actor == 1:
+        close_env_between_shards = resolve_close_env_between_shards(cfg)
+        if close_env_between_shards:
+            stage(f"[actor{actor_id}] close_env_between_shards=True")
         env = build_actor_env(
             cfg,
             cuda=int(cuda if cuda >= 0 else 0),
             actor_id=int(actor_id),
             total_actors=(int(total_actors) if total_actors is not None else max(1, int(al_cfg.get("num_actors", 1)))),
         )
-        obs, _info = env.reset()
+        obs = None
+        _info = None
+        if not close_env_between_shards:
+            obs, _info = env.reset()
         while True:
             if stop_requested(paths):
                 stage(f"[actor{actor_id}] stop requested; exiting")
@@ -212,19 +250,34 @@ def _actor_main_impl(
                 except Exception as exc:
                     stage(f"[actor{actor_id}] weight reload failed: {exc}")
 
-            shard, obs = collect_single_env_shard(
-                env=env,
-                agent=agent,
-                obs=obs,
-                horizon=horizon,
-                eta=eta,
-                mode_idx=mode_idx,
-                mode_select=mode_select,
-                actor_id=actor_id,
-                local_ver=local_ver,
-                shard_idx=shard_idx,
-                store_obs=bool(store_obs),
-            )
+            if obs is None:
+                obs, _info = env.reset()
+            try:
+                shard, obs, _info = collect_single_env_shard(
+                    env=env,
+                    agent=agent,
+                    obs=obs,
+                    horizon=horizon,
+                    eta=eta,
+                    mode_idx=mode_idx,
+                    mode_select=mode_select,
+                    actor_id=actor_id,
+                    local_ver=local_ver,
+                    shard_idx=shard_idx,
+                    store_obs=bool(store_obs),
+                    info=_info,
+                    return_info=True,
+                )
+            except Exception:
+                if close_env_between_shards:
+                    _close_env_for_actor(env, actor_id=int(actor_id))
+                    obs = None
+                    _info = None
+                raise
+            if close_env_between_shards:
+                _close_env_for_actor(env, actor_id=int(actor_id))
+                obs = None
+                _info = None
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=1):
                 break
             name = f"actor{actor_id}_e0_v{local_ver}_t{int(time.time())}_{uuid.uuid4().hex[:8]}.pt"
@@ -292,7 +345,7 @@ def _actor_main_impl(
                 except Exception as exc:
                     stage(f"[actor{actor_id}] weight reload failed: {exc}")
 
-            shards, obs_list = collect_vector_env_shards(
+            shards, obs_list, _info = collect_vector_env_shards(
                 vec_env=vec_env,
                 agent=agent,
                 obs_list=obs_list,
@@ -305,6 +358,8 @@ def _actor_main_impl(
                 local_ver=local_ver,
                 shard_idx_per_env=shard_idx_per_env,
                 store_obs=bool(store_obs),
+                info_list=_info,
+                return_info=True,
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=len(shards)):
                 break

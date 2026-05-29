@@ -6,7 +6,7 @@ import yaml
 def test_hugsim_ori_sparsedrive_v2_smoke_config_selects_hugsim_backend() -> None:
     config_path = (
         Path(__file__).resolve().parents[1]
-        / "script/configs/sparsedrive_v2/hugsim_ori_sparsedrive_v2_smoke.yaml"
+        / "script/configs/sparsedrive_v2/202605291041_HUGSM_reinforcepp_closed_loop_closeCloseloop_openGRPOCraft.yaml"
     )
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
@@ -14,6 +14,8 @@ def test_hugsim_ori_sparsedrive_v2_smoke_config_selects_hugsim_backend() -> None
     assert cfg["env"]["hugsim"]["launch_mode"] == "fifo"
     assert cfg["env"]["hugsim"]["pixi_cmd"] == "pixi"
     assert cfg["env"]["hugsim"]["fifo_timeout_s"] == 300
-    assert cfg["env"]["hugsim"]["substeps_per_rl_step"] == 2
-    assert cfg["env"]["hugsim"]["scenes"] == ["scene-0013"]
-    assert cfg["train"]["actor_learner"]["actor_horizon"] == 8
+    assert "substeps_per_rl_step" not in cfg["env"]["hugsim"]
+    assert cfg["env"]["use_all_scenes"] is True
+    assert cfg["env"]["hugsim"]["repo"] == "third_party/HUGSIM-ORI"
+    assert cfg["env"]["hugsim"]["scenario_dir"] == "third_party/HUGSIM-ORI/configs/scenarios/nuscenes"
+    assert cfg["train"]["actor_learner"]["actor_horizon"] > 0

@@ -147,6 +147,20 @@ def _inject_external_plan_vec_env(vec_env: Any, env_idx: int, replay: Any) -> No
         call_one(int(env_idx), "set_external_plan_local_xyyaw", plan_arr)
 
 
+def _inject_gt_reference_from_info(replay: Any, info: Any) -> None:
+    if not isinstance(replay, dict) or not isinstance(info, dict):
+        return
+    gt_sample_token = info.get("grpo_gt_sample_token", info.get("recon_cache_sample_token", None))
+    if gt_sample_token is not None and str(gt_sample_token):
+        replay["gt_sample_token_override"] = str(gt_sample_token)
+    gt_frame_idx = info.get("grpo_gt_frame_idx", info.get("recon_cache_frame_idx", None))
+    if gt_frame_idx is not None:
+        try:
+            replay["gt_frame_idx_override"] = int(gt_frame_idx)
+        except Exception:
+            pass
+
+
 def collect_single_env_shard(
     *,
     env: Any,
@@ -160,6 +174,8 @@ def collect_single_env_shard(
     local_ver: int,
     shard_idx: int,
     store_obs: bool = True,
+    info: Any = None,
+    return_info: bool = False,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -173,6 +189,7 @@ def collect_single_env_shard(
     last_done = 1.0
     last_terminated = 1.0
     next_obs_after = obs
+    current_info: Any = info
     step_records: List[Dict[str, float]] = []
     counters: Dict[str, int] = {"done_count": 0, "reset_count": 0}
     reward_summary = _reward_summary_defaults()
@@ -190,6 +207,7 @@ def collect_single_env_shard(
         t0 = time.perf_counter()
         action0, logp, replay = agent.act(obs_decision, eta=eta, mode_idx=mode_idx, mode_select=mode_select)
         step_timing["act_s"] = float(time.perf_counter() - t0)
+        _inject_gt_reference_from_info(replay, current_info)
         _inject_external_plan_single_env(env, replay)
         t0 = time.perf_counter()
         obs, reward, terminated, truncated, _info = env.step(action0)
@@ -220,6 +238,7 @@ def collect_single_env_shard(
             obs, _info = env.reset()
             step_timing["env_reset_s"] = float(time.perf_counter() - t0)
             counters["reset_count"] += 1
+        current_info = _info
         step_records.append(step_timing)
 
     next_obs_t = None
@@ -260,6 +279,8 @@ def collect_single_env_shard(
         shard["next_obs"] = next_obs_t
     if next_value_feature is not None:
         shard["next_value_feature"] = next_value_feature
+    if bool(return_info):
+        return shard, obs, current_info
     return shard, obs
 
 
@@ -277,6 +298,8 @@ def collect_vector_env_shards(
     local_ver: int,
     shard_idx_per_env: List[int],
     store_obs: bool = True,
+    info_list: List[Any] | None = None,
+    return_info: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[Any]]:
     obs_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
     old_logp_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
@@ -292,6 +315,16 @@ def collect_vector_env_shards(
     step_records_by_env: List[List[Dict[str, float]]] = [[] for _ in range(int(num_envs_per_actor))]
     counters_by_env: List[Dict[str, int]] = [{"done_count": 0, "reset_count": 0} for _ in range(int(num_envs_per_actor))]
     reward_summaries_by_env: List[Dict[str, float]] = [_reward_summary_defaults() for _ in range(int(num_envs_per_actor))]
+    if isinstance(info_list, (list, tuple)):
+        current_info_list: List[Any] = list(info_list)
+    elif info_list is not None:
+        current_info_list = [info_list for _ in range(int(num_envs_per_actor))]
+    else:
+        current_info_list = [None for _ in range(int(num_envs_per_actor))]
+    if len(current_info_list) < int(num_envs_per_actor):
+        current_info_list.extend([None for _ in range(int(num_envs_per_actor) - len(current_info_list))])
+    if len(current_info_list) > int(num_envs_per_actor):
+        current_info_list = current_info_list[: int(num_envs_per_actor)]
 
     step_count = 0
     collect_t0 = time.perf_counter()
@@ -306,6 +339,7 @@ def collect_vector_env_shards(
         )
         act_s = float(time.perf_counter() - act_t0) / float(max(1, int(num_envs_per_actor)))
         for i, replay in enumerate(replays):
+            _inject_gt_reference_from_info(replay, current_info_list[i] if i < len(current_info_list) else None)
             _inject_external_plan_vec_env(vec_env, i, replay)
 
         env_step_t0 = time.perf_counter()
@@ -313,6 +347,7 @@ def collect_vector_env_shards(
         env_step_s = float(time.perf_counter() - env_step_t0) / float(max(1, int(num_envs_per_actor)))
         step_done = [False for _ in range(int(num_envs_per_actor))]
         step_next_obs: List[Any] = list(next_obs_list)
+        next_current_info_list: List[Any] = list(_info_list)
         reset_s_list = [0.0 for _ in range(int(num_envs_per_actor))]
         for i in range(int(num_envs_per_actor)):
             done = bool(term_list[i] or trunc_list[i])
@@ -322,9 +357,11 @@ def collect_vector_env_shards(
                 o2, _info2 = vec_env.reset_one(i)
                 reset_s_list[i] = float(time.perf_counter() - reset_t0)
                 next_obs_list[i] = o2
+                next_current_info_list[i] = _info2
                 counters_by_env[i]["done_count"] += 1
                 counters_by_env[i]["reset_count"] += 1
         obs_list = next_obs_list
+        current_info_list = next_current_info_list
 
         for i in range(int(num_envs_per_actor)):
             if bool(store_obs):
@@ -396,4 +433,6 @@ def collect_vector_env_shards(
         shards.append(shard_i)
         if next_value_feature is not None:
             shards[-1]["next_value_feature"] = next_value_feature
+    if bool(return_info):
+        return shards, obs_list, current_info_list
     return shards, obs_list

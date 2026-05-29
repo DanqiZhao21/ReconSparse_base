@@ -4,7 +4,6 @@ import json
 import math
 import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +22,10 @@ from framework.env_wrapper.hugsim_recon_alignment import (
 )
 from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
 from framework.rewards import TrackingRewardComputer
+from framework.utils.repo_paths import resolve_hugsim_path, resolve_hugsim_root
 
 
-HUGSIM_REPO_DEFAULT = "/root/clone/HUGSIM-ORI"
+HUGSIM_REPO_DEFAULT = resolve_hugsim_root()
 HUGSIM_CAMERA_MAP = {
     "CAM_FRONT_LEFT": ("front_left", 1),
     "CAM_FRONT": ("front", 0),
@@ -248,52 +248,8 @@ def build_recondreamer_obs_from_hugsim(
     return out
 
 
-def _ensure_hugsim_repo_on_path(hugsim_repo: str | Path = HUGSIM_REPO_DEFAULT) -> None:
-    repo = str(hugsim_repo)
-    sim_dir = str(Path(repo) / "sim")
-    for path in [repo, sim_dir]:
-        if path not in sys.path:
-            sys.path.insert(0, path)
 
-
-def _load_traj2control(hugsim_repo: str | Path = HUGSIM_REPO_DEFAULT):
-    _ensure_hugsim_repo_on_path(hugsim_repo)
-    from sim.utils.sim_utils import traj2control as fn  # type: ignore
-
-    return fn
-
-
-traj2control = _load_traj2control
-
-
-def execute_hugsim_control_horizon(
-    *,
-    env: Any,
-    plan_traj: np.ndarray,
-    initial_info: dict[str, Any],
-    substeps_per_rl_step: int = 2,
-    hugsim_repo: str | Path = HUGSIM_REPO_DEFAULT,
-) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
-    if callable(traj2control) and getattr(traj2control, "__name__", "") == "_load_traj2control":
-        control_fn = traj2control(hugsim_repo)
-    else:
-        control_fn = traj2control
-    acc, steer_rate = control_fn(np.asarray(plan_traj, dtype=np.float32), dict(initial_info))
-    action = {"acc": float(acc), "steer_rate": float(steer_rate)}
-
-    obs: dict[str, Any] = {}
-    info: dict[str, Any] = dict(initial_info)
-    total_reward = 0.0
-    terminated = False
-    truncated = False
-    for _ in range(max(1, int(substeps_per_rl_step))):
-        obs, reward, terminated, truncated, info = env.step(dict(action))
-        total_reward += float(reward)
-        if bool(terminated or truncated):
-            break
-    return obs, float(total_reward), bool(terminated), bool(truncated), info
-
-
+# Standardize the termination and collision information in HUGSIM info.
 def _augment_hugsim_reward_info(
     *,
     info: dict[str, Any],
@@ -344,7 +300,7 @@ def _augment_hugsim_reward_info(
             out["done_reason"] = "hugsim_terminated"
     return out
 
-
+# Recon cache and obstacle info.
 def _load_recon_env_cache(recon_data_root: str | Path, scene_id: int) -> dict[int, dict[str, Any]]:
     path = Path(recon_data_root) / f"{int(scene_id):03d}" / "env_cache.json"
     try:
@@ -516,33 +472,6 @@ def _detect_polygon_collision_tokens(ego_poly: Any, objects: list[dict[str, Any]
     return tokens
 
 
-def create_hugsim_env(
-    *,
-    scenario_path: str | Path,
-    output_dir: str | Path,
-    hugsim_repo: str | Path = HUGSIM_REPO_DEFAULT,
-    base_path: str | Path | None = None,
-    camera_path: str | Path | None = None,
-    kinematic_path: str | Path | None = None,
-    ad: str = "sparsedrive_v2",
-) -> Any:
-    _ensure_hugsim_repo_on_path(hugsim_repo)
-    import gymnasium  # type: ignore
-    import hugsim_env  # noqa: F401
-    from sim.utils.config_loader import load_closed_loop_cfg  # type: ignore
-
-    repo = Path(hugsim_repo)
-    cfg, _output = load_closed_loop_cfg(
-        scenario_path=str(scenario_path),
-        base_path=str(base_path or repo / "configs" / "sim" / "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml"),
-        camera_path=str(camera_path or repo / "configs" / "sim" / "nuscenes_camera.yaml"),
-        kinematic_path=str(kinematic_path or repo / "configs" / "sim" / "kinematic.yaml"),
-        ad=str(ad),
-    )
-    output = str(output_dir)
-    Path(output).mkdir(parents=True, exist_ok=True)
-    return gymnasium.make("hugsim_env/HUGSim-v0", cfg=cfg, output=output)
-
 
 class HUGSIMFifoClient:
     def __init__(
@@ -561,12 +490,24 @@ class HUGSIMFifoClient:
         fifo_poll_interval_s: float = 0.2,
         cuda: int | None = None,
     ) -> None:
-        self.hugsim_repo = str(hugsim_repo)
-        self.scenario_path = str(scenario_path)
+        self.hugsim_repo = str(resolve_hugsim_path(str(hugsim_repo)))
+        self.scenario_path = str(resolve_hugsim_path(str(scenario_path)))
         repo = Path(self.hugsim_repo)
-        self.base_path = str(base_path or repo / "configs" / "sim" / "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml")
-        self.camera_path = str(camera_path or repo / "configs" / "sim" / "nuscenes_camera.yaml")
-        self.kinematic_path = str(kinematic_path or repo / "configs" / "sim" / "kinematic.yaml")
+        self.base_path = str(
+            resolve_hugsim_path(str(base_path))
+            if base_path is not None
+            else repo / "configs" / "sim" / "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml"
+        )
+        self.camera_path = str(
+            resolve_hugsim_path(str(camera_path))
+            if camera_path is not None
+            else repo / "configs" / "sim" / "nuscenes_camera.yaml"
+        )
+        self.kinematic_path = str(
+            resolve_hugsim_path(str(kinematic_path))
+            if kinematic_path is not None
+            else repo / "configs" / "sim" / "kinematic.yaml"
+        )
         self.output_dir = Path(output_dir)
         self.pixi_cmd = str(pixi_cmd)
         self.runner_path = str(runner_path)
@@ -609,7 +550,17 @@ class HUGSIMFifoClient:
         env = os.environ.copy()
         if self.cuda is not None and self.cuda >= 0:
             env["CUDA_VISIBLE_DEVICES"] = str(int(self.cuda))
-        self.process = subprocess.Popen(cmd, cwd=self.hugsim_repo, env=env)
+        log_handle = (self.output_dir / "hugsim_fifo_runner.log").open("ab")
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                cwd=self.hugsim_repo,
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+        finally:
+            log_handle.close()
 
     def _clear_stale_session_files(self) -> None:
         for path in (self.obs_pipe, self.plan_pipe, self.output_dir / "status.json"):
@@ -702,14 +653,13 @@ class HUGSIMReconEnv:
         base_path: str | Path | None = None,
         camera_path: str | Path | None = None,
         kinematic_path: str | Path | None = None,
-        substeps_per_rl_step: int = 2,
         recon_data_root: str | Path = RECON_DATA_ROOT_DEFAULT,
         hugsim_model_base: str | Path | None = None,
         alignment_enabled: bool = True,
         alignment_max_rmse_m: float = 2.0,
         use_recon_cache_objects: bool = True,
         use_hugsim_inserted_objects: bool = True,
-        launch_mode: str = "direct",
+        launch_mode: str = "fifo",
         pixi_cmd: str = "pixi",
         fifo_timeout_s: float = 300.0,
         fifo_poll_interval_s: float = 0.2,
@@ -722,8 +672,9 @@ class HUGSIMReconEnv:
         self.scene_index = scene_index
         self.reward_cfg = reward_cfg or {}
         self.hugsim_repo = str(hugsim_repo)
-        self.substeps_per_rl_step = int(substeps_per_rl_step)
         self.launch_mode = str(launch_mode).strip().lower()
+        if self.launch_mode != "fifo":
+            raise ValueError(f"Unsupported HUGSIM launch_mode: {launch_mode!r}; only 'fifo' is supported")
         self.recon_data_root = Path(recon_data_root)
         self.hugsim_model_base = None if hugsim_model_base is None else Path(hugsim_model_base)
         self.alignment_enabled = bool(alignment_enabled)
@@ -743,31 +694,19 @@ class HUGSIMReconEnv:
         self.min_gt_route_points = max(0, int(min_gt_route_points))
         scenario_output_name = Path(self.scenario_path).stem or self.official_scene_name
         output_dir = (Path(output_root) / scenario_output_name).resolve()
-        if self.launch_mode == "fifo":
-            self.env = HUGSIMFifoClient(
-                hugsim_repo=self.hugsim_repo,
-                scenario_path=self.scenario_path,
-                base_path=base_path,
-                camera_path=camera_path,
-                kinematic_path=kinematic_path,
-                output_dir=output_dir,
-                pixi_cmd=pixi_cmd,
-                runner_path=fifo_runner_path,
-                fifo_timeout_s=fifo_timeout_s,
-                fifo_poll_interval_s=fifo_poll_interval_s,
-                cuda=cuda,
-            )
-        elif self.launch_mode == "direct":
-            self.env = create_hugsim_env(
-                scenario_path=self.scenario_path,
-                output_dir=output_dir,
-                hugsim_repo=self.hugsim_repo,
-                base_path=base_path,
-                camera_path=camera_path,
-                kinematic_path=kinematic_path,
-            )
-        else:
-            raise ValueError(f"Unsupported HUGSIM launch_mode: {launch_mode!r}")
+        self.env = HUGSIMFifoClient(
+            hugsim_repo=self.hugsim_repo,
+            scenario_path=self.scenario_path,
+            base_path=base_path,
+            camera_path=camera_path,
+            kinematic_path=kinematic_path,
+            output_dir=output_dir,
+            pixi_cmd=pixi_cmd,
+            runner_path=fifo_runner_path,
+            fifo_timeout_s=fifo_timeout_s,
+            fifo_poll_interval_s=fifo_poll_interval_s,
+            cuda=cuda,
+        )
 
     def set_external_plan_local_xyyaw(self, plan: Any) -> None:
         self._external_plan_local_xyyaw = None if plan is None else np.asarray(plan, dtype=np.float32)
@@ -936,6 +875,18 @@ class HUGSIMReconEnv:
             out["recon_cache_frame_idx"] = -1 if frame_used is None else int(frame_used)
             out["recon_cache_time_frame_idx"] = -1 if time_frame_used is None else int(time_frame_used)
             out["recon_cache_frame_source"] = frame_source
+            token_for_frame = getattr(self.scene_index, "sample_token_for_frame", None)
+            if callable(token_for_frame):
+                if time_frame_used is not None:
+                    time_token = token_for_frame(scene_id, int(time_frame_used))
+                    if time_token is not None:
+                        out["recon_cache_time_sample_token"] = str(time_token)
+                if frame_used is not None:
+                    frame_token = token_for_frame(scene_id, int(frame_used))
+                    if frame_token is not None:
+                        out["recon_cache_sample_token"] = str(frame_token)
+                        out["grpo_gt_sample_token"] = str(frame_token)
+                        out["grpo_gt_frame_idx"] = int(frame_used)
             if pose_dist_m is not None:
                 out["recon_cache_frame_pose_dist_m"] = pose_dist_m
             raw_objects = snap.get("dynamic_objects", []) if isinstance(snap, dict) else []
@@ -944,9 +895,10 @@ class HUGSIMReconEnv:
                 obj.setdefault("source", "recon_cache")
             out["recon_cache_dynamic_objects"] = objects
 
+        aligned_objects = [*hugsim_objects, *objects]
         collision_tokens: list[str] = []
         if ego_poly_recon is not None:
-            collision_tokens = _detect_polygon_collision_tokens(ego_poly_recon, [*hugsim_objects, *objects])
+            collision_tokens = _detect_polygon_collision_tokens(ego_poly_recon, aligned_objects)
             if collision_tokens:
                 out["collision"] = True
                 out["dynamic_collision"] = True
@@ -965,7 +917,7 @@ class HUGSIMReconEnv:
                     ego_xy=ego_xy,
                     ego_yaw=ego_yaw,
                     ego_speed_mps=ego_speed,
-                    objects=objects,
+                    objects=aligned_objects,
                 )
             )
         return out
@@ -1024,18 +976,8 @@ class HUGSIMReconEnv:
         if self._last_hugsim_info is None:
             raise RuntimeError("HUGSIMReconEnv.step called before reset")
         plan_traj = self._plan_from_action(action)
-        if self.launch_mode == "fifo":
-            hugsim_obs, base_reward, terminated, truncated, hugsim_info = self.env.step(plan_traj)
-            self._hugsim_step_idx += 1
-        else:
-            hugsim_obs, base_reward, terminated, truncated, hugsim_info = execute_hugsim_control_horizon(
-                env=self.env,
-                plan_traj=plan_traj,
-                initial_info=dict(self._last_hugsim_info),
-                substeps_per_rl_step=self.substeps_per_rl_step,
-                hugsim_repo=self.hugsim_repo,
-            )
-            self._hugsim_step_idx += self.substeps_per_rl_step
+        hugsim_obs, base_reward, terminated, truncated, hugsim_info = self.env.step(plan_traj)
+        self._hugsim_step_idx += 1
         self._last_hugsim_obs = hugsim_obs
         self._last_hugsim_info = hugsim_info
         mapping = self.scene_index.map_time(self.official_scene_name, float(hugsim_info.get("timestamp", 0.0)))

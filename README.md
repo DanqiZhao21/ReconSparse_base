@@ -73,6 +73,35 @@ outputs/TrainEvaluationAuto/<run_id>/
 
 其中训练阶段会在该 run 目录下生成 `actor_learner/`，评估结果则写到 HUGSIM-ORI 的 `outputs/evaluate-auto/` 下。
 
+## HUGSIM-ORI 子模块
+
+HUGSIM-ORI 作为 Git submodule 放在：
+
+```text
+third_party/HUGSIM-ORI
+```
+
+首次 clone 时需要拉取子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
+ReconDreamer-RL 默认从 `third_party/HUGSIM-ORI` 读取 HUGSIM 代码，也可以用环境变量覆盖：
+
+```bash
+export HUGSIM_ROOT=/path/to/HUGSIM-ORI
+```
+
+HUGSIM 的运行环境仍由 HUGSIM 自己的 `pixi.toml` 管理。训练环境只负责调度，HUGSIM FIFO 后端会在 HUGSIM 仓库目录下执行 `pixi run python ...`。
+
+HUGSIM 的本地数据目录不要提交到 Git。需要在本机创建 ignored 软连接，例如：
+
+```bash
+ln -s /OpenDataset/HUGSIM_data/scenarios third_party/HUGSIM-ORI/configs/scenarios
+ln -s /OpenDataset/zhaodanqi/HUGSIM_data/outputs third_party/HUGSIM-ORI/outputs
+```
+
 ## 主训练链路
 
 仅训练这条链路的核心流程可以概括为：

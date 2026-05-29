@@ -5,6 +5,7 @@ import os
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 EGOADS_ROOT = os.path.join(REPO_ROOT, "egoADs")
+DEFAULT_HUGSIM_ROOT = os.path.join(REPO_ROOT, "third_party", "HUGSIM-ORI")
 
 
 def resolve_ego_ads_subdir(name: str) -> str:
@@ -30,9 +31,27 @@ def resolve_repo_path(path: str) -> str:
     return direct
 
 
+def resolve_hugsim_root() -> str:
+    return os.path.abspath(os.environ.get("HUGSIM_ROOT", DEFAULT_HUGSIM_ROOT))
+
+
+def resolve_hugsim_path(path: str | None, *default_parts: str) -> str | None:
+    if path is None:
+        if not default_parts:
+            return None
+        return os.path.join(resolve_hugsim_root(), *default_parts)
+    text = os.path.expanduser(str(path))
+    if os.path.isabs(text):
+        return text
+    return resolve_repo_path(text)
+
+
 __all__ = [
     "EGOADS_ROOT",
+    "DEFAULT_HUGSIM_ROOT",
     "REPO_ROOT",
+    "resolve_hugsim_path",
+    "resolve_hugsim_root",
     "resolve_ego_ads_subdir",
     "resolve_repo_path",
 ]

@@ -9,7 +9,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -295,6 +295,14 @@ class NuScenesScorerUtils:
             valid_mask_any=row.get("gt_ego_fut_masks", row.get("gt_ego_fut_mask", row.get("gt_ego_fut_valid", None))),
         )
         return self._gt_to_env_xy(gt_local, cumulative=True)
+
+    @staticmethod
+    def _gt_sample_token_for_replay(replay: Mapping[str, Any], sample_token: str) -> str:
+        for key in ("gt_sample_token_override", "grpo_gt_sample_token"):
+            value = replay.get(key, None)
+            if value is not None and str(value):
+                return str(value)
+        return str(sample_token)
 
     @staticmethod
     def _rebase_xy(points_xy: np.ndarray, origin_xy: np.ndarray | None) -> np.ndarray:
@@ -1103,10 +1111,16 @@ class NuScenesScorerUtils:
         if sample_token is None:
             raise RuntimeError("NuScenesScorerUtils requires replay['sample_token']")
         sample_token_str = str(sample_token)
+        gt_sample_token_str = self._gt_sample_token_for_replay(replay, sample_token_str)
+        cache_key = (
+            sample_token_str
+            if gt_sample_token_str == sample_token_str
+            else f"{sample_token_str}|gt={gt_sample_token_str}"
+        )
         has_object_override = self._has_replay_object_context_override(replay)
         if has_object_override:
             row = self._lookup_row(sample_token_str)
-            gt_xy = self._lookup_gt(sample_token_str).copy()
+            gt_xy = self._lookup_gt(gt_sample_token_str).copy()
             gt_yaw = _path_yaw_from_xy(gt_xy)
             gt_s = _polyline_arclength(gt_xy)
             gt_total_len = float(max(1.0e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
@@ -1134,6 +1148,7 @@ class NuScenesScorerUtils:
                 "gt_yaw": gt_yaw,
                 "gt_s": gt_s,
                 "gt_total_len": gt_total_len,
+                "gt_sample_token": gt_sample_token_str,
                 "map_context": map_context,
                 "scene_objects": scene_objects,
                 "ea_agent_states": ea_agent_states,
@@ -1146,17 +1161,19 @@ class NuScenesScorerUtils:
                 )
             return payload
 
-        cached = self._sample_static_context_cache.get(sample_token_str, None)
+        cached = self._sample_static_context_cache.get(cache_key, None)
         if cached is not None:
             return cached
 
-        persisted = self._load_persisted_static_sample_context(sample_token_str)
+        persisted = None
+        if gt_sample_token_str == sample_token_str:
+            persisted = self._load_persisted_static_sample_context(sample_token_str)
         if persisted is not None:
-            self._sample_static_context_cache[sample_token_str] = persisted
+            self._sample_static_context_cache[cache_key] = persisted
             return persisted
 
         row = self._lookup_row(sample_token_str)
-        gt_xy = self._lookup_gt(sample_token_str).copy()
+        gt_xy = self._lookup_gt(gt_sample_token_str).copy()
         gt_yaw = _path_yaw_from_xy(gt_xy)
         gt_s = _polyline_arclength(gt_xy)
         gt_total_len = float(max(1.0e-6, gt_s[-1] if int(gt_s.shape[0]) > 0 else 1.0))
@@ -1181,12 +1198,14 @@ class NuScenesScorerUtils:
             "gt_yaw": gt_yaw,
             "gt_s": gt_s,
             "gt_total_len": gt_total_len,
+            "gt_sample_token": gt_sample_token_str,
             "map_context": map_context,
             "scene_objects": scene_objects,
             "ea_agent_states": ea_agent_states,
         }
-        self._sample_static_context_cache[sample_token_str] = payload
-        self._save_persisted_static_sample_context(sample_token_str, payload)
+        self._sample_static_context_cache[cache_key] = payload
+        if gt_sample_token_str == sample_token_str:
+            self._save_persisted_static_sample_context(sample_token_str, payload)
         return payload
 
     def _ensure_ea_compute_fn(self) -> Callable[..., float] | None:
@@ -1858,6 +1877,7 @@ class NuScenesScorerUtils:
             gt_yaw = np.asarray(static_ctx["gt_yaw"], dtype=np.float32).copy()
             gt_s = np.asarray(static_ctx["gt_s"], dtype=np.float32).copy()
             gt_total_len = float(static_ctx["gt_total_len"])
+            gt_sample_token_str = str(static_ctx.get("gt_sample_token", sample_token_str))
             map_context = dict(static_ctx["map_context"])
             gt_history_xy = self._lookup_gt_history(row, origin_xy=None) if include_debug_context else np.zeros((0, 2), dtype=np.float32)
             scene_objects = list(static_ctx["scene_objects"])
@@ -1872,6 +1892,7 @@ class NuScenesScorerUtils:
             sample_detail: dict[str, Any] = {
                 "batch_index": int(batch_idx),
                 "sample_token": sample_token_str,
+                "gt_sample_token": gt_sample_token_str,
                 "gt_origin_shift_xy": [0.0, 0.0],
                 "gt_xy": gt_xy_cmp.copy(),
                 "gt_yaw": gt_yaw_cmp.copy(),
@@ -2025,7 +2046,8 @@ class NuScenesScorerUtils:
             sample_token = replay.get("sample_token", None)
             if sample_token is None:
                 raise RuntimeError("NuScenesScorerUtils requires replay['sample_token']")
-            gt_xy_raw = self._lookup_gt(str(sample_token))
+            sample_token_str = str(sample_token)
+            gt_xy_raw = self._lookup_gt(self._gt_sample_token_for_replay(replay, sample_token_str))
             gt_arrays.append(gt_xy_raw)
 
         batch_size = len(gt_arrays)
