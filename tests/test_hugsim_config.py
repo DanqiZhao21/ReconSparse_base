@@ -16,6 +16,6 @@ def test_hugsim_ori_sparsedrive_v2_smoke_config_selects_hugsim_backend() -> None
     assert cfg["env"]["hugsim"]["fifo_timeout_s"] == 300
     assert "substeps_per_rl_step" not in cfg["env"]["hugsim"]
     assert cfg["env"]["use_all_scenes"] is True
-    assert cfg["env"]["hugsim"]["repo"] == "third_party/HUGSIM-ORI"
-    assert cfg["env"]["hugsim"]["scenario_dir"] == "third_party/HUGSIM-ORI/configs/scenarios/nuscenes"
+    assert cfg["env"]["hugsim"]["repo"] == "/root/clone/HUGSIM-ORI"
+    assert cfg["env"]["hugsim"]["scenario_dir"] == "/root/clone/HUGSIM-ORI/configs/scenarios/nuscenes"
     assert cfg["train"]["actor_learner"]["actor_horizon"] > 0

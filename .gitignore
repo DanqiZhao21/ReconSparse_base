@@ -66,5 +66,12 @@ AGENTS.md
 /README_old.md
 /craftdrive-keyu.pdf
 RL-cky/
-/tools/trytry.py
 
+# tools 目录只保留可复用的可视化工具，其它本地小工具不纳入版本控制
+/tools/*
+!/tools/smalltool/
+/tools/smalltool/*
+!/tools/smalltool/visualize/
+!/tools/smalltool/visualize/**
+/tools/smalltool/visualize/**/__pycache__/
+/tools/smalltool/visualize/**/*.py[cod]

@@ -1,3 +1,0 @@
-[submodule "third_party/HUGSIM-ORI"]
-	url = ssh://git@github.com/DanqiZhao21/HUGSIM-ORI.git
-	path = third_party/HUGSIM-ORI

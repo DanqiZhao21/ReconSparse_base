@@ -37,9 +37,9 @@ Optional explicit HUGSIM template/output paths:
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 /root/miniconda3/envs/recondreamerNew-rl/bin/python -u script/evaluate_existing_sparsedrive_v2_ckpts.py \
   --ckpts /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
-  --hugsim-template third_party/HUGSIM-ORI/configs/sim/nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml \
-  --scenario-dir third_party/HUGSIM-ORI/configs/scenarios/nuscenes \
-  --eval-output-root third_party/HUGSIM-ORI/outputs/evaluate-auto \
+  --hugsim-template /root/clone/HUGSIM-ORI/configs/sim/nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml \
+  --scenario-dir /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes \
+  --eval-output-root /root/clone/HUGSIM-ORI/outputs/evaluate-auto \
   --repeat-evals 2 \
   --max-scenes 88 \
   --slots 0:0 1:1 2:2 3:3 4:4 5:5 6:6 7:7 \

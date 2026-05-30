@@ -12,13 +12,13 @@ env:
     allow_short_tail: false
     min: 0
   hugsim:
-    repo: third_party/HUGSIM-ORI
-    scenario_dir: third_party/HUGSIM-ORI/configs/scenarios/nuscenes
+    repo: /root/clone/HUGSIM-ORI
+    scenario_dir: /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes
     scenes:
       - scene-0166-medium-00.yaml
-    base_path: third_party/HUGSIM-ORI/configs/sim/nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml
-    camera_path: third_party/HUGSIM-ORI/configs/sim/nuscenes_camera.yaml
-    kinematic_path: third_party/HUGSIM-ORI/configs/sim/kinematic.yaml
+    base_path: /root/clone/HUGSIM-ORI/configs/sim/nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml
+    camera_path: /root/clone/HUGSIM-ORI/configs/sim/nuscenes_camera.yaml
+    kinematic_path: /root/clone/HUGSIM-ORI/configs/sim/kinematic.yaml
     model_base: /OpenDataset/HUGSIM_data/scenes/nuscenes
     launch_mode: fifo
     pixi_cmd: pixi

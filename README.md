@@ -73,21 +73,16 @@ outputs/TrainEvaluationAuto/<run_id>/
 
 其中训练阶段会在该 run 目录下生成 `actor_learner/`，评估结果则写到 HUGSIM-ORI 的 `outputs/evaluate-auto/` 下。
 
-## HUGSIM-ORI 子模块
+## HUGSIM-ORI 外部仓库
 
-HUGSIM-ORI 作为 Git submodule 放在：
+HUGSIM-ORI 不作为本仓库的 Git submodule 管理。保持两个仓库并列放置：
 
 ```text
-third_party/HUGSIM-ORI
+/root/clone/ReconDreamer-RL
+/root/clone/HUGSIM-ORI
 ```
 
-首次 clone 时需要拉取子模块：
-
-```bash
-git submodule update --init --recursive
-```
-
-ReconDreamer-RL 默认从 `third_party/HUGSIM-ORI` 读取 HUGSIM 代码，也可以用环境变量覆盖：
+ReconDreamer-RL 默认从 `/root/clone/HUGSIM-ORI` 读取 HUGSIM 代码，也可以用环境变量覆盖：
 
 ```bash
 export HUGSIM_ROOT=/path/to/HUGSIM-ORI
@@ -95,11 +90,11 @@ export HUGSIM_ROOT=/path/to/HUGSIM-ORI
 
 HUGSIM 的运行环境仍由 HUGSIM 自己的 `pixi.toml` 管理。训练环境只负责调度，HUGSIM FIFO 后端会在 HUGSIM 仓库目录下执行 `pixi run python ...`。
 
-HUGSIM 的本地数据目录不要提交到 Git。需要在本机创建 ignored 软连接，例如：
+HUGSIM 的本地数据目录不要提交到 Git。需要在 HUGSIM 仓库内创建本机软连接，例如：
 
 ```bash
-ln -s /OpenDataset/HUGSIM_data/scenarios third_party/HUGSIM-ORI/configs/scenarios
-ln -s /OpenDataset/zhaodanqi/HUGSIM_data/outputs third_party/HUGSIM-ORI/outputs
+ln -s /OpenDataset/HUGSIM_data/scenarios /root/clone/HUGSIM-ORI/configs/scenarios
+ln -s /OpenDataset/zhaodanqi/HUGSIM_data/outputs /root/clone/HUGSIM-ORI/outputs
 ```
 
 ## 主训练链路
