@@ -788,6 +788,121 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
     assert info["recon_cache_dynamic_objects"][0]["token"] == "nearest_pose_vehicle"
 
 
+def test_hugsim_recon_env_adds_map_metrics_from_nearest_pose_cache_frame(
+    monkeypatch, tmp_path
+):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_recon_alignment import HUGSIMReconAlignment, Sim2Transform
+    import json
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+    recon_scene_root = tmp_path / "recon" / "012" / "ego_pose"
+    recon_cache_root = tmp_path / "recon" / "012"
+    recon_scene_root.mkdir(parents=True)
+    for frame, xy in [(125, (125.0, 0.0)), (169, (169.0, 0.0))]:
+        pose = np.eye(4, dtype=np.float64)
+        pose[0, 3] = xy[0]
+        pose[1, 3] = xy[1]
+        np.savetxt(recon_scene_root / f"{frame:03d}.txt", pose)
+    with (recon_cache_root / "env_cache.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "125": {
+                    "lanes_centerlines": [
+                        [[169.0, 2.0], [159.0, 2.0]],
+                    ],
+                    "drivable_polygons": [
+                        [[160.0, -5.0], [178.0, -5.0], [178.0, 5.0], [160.0, 5.0]],
+                    ],
+                },
+                "169": {
+                    "lanes_centerlines": [
+                        [[169.0, 1.0], [179.0, 1.0]],
+                    ],
+                    "drivable_polygons": [
+                        [[160.0, -5.0], [178.0, -5.0], [178.0, 5.0], [160.0, 5.0]],
+                    ],
+                },
+            },
+            handle,
+        )
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok125",
+                frame_idx=125,
+                sample_index=25,
+                sample_relative_time_s=12.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    step_info = _fake_hugsim_info(12.5)
+    step_info["collision"] = False
+    step_info["ego_box"] = [169.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
+    alignment = HUGSIMReconAlignment(
+        official_scene_name="scene-0013",
+        recon_scene_id=12,
+        transform=Sim2Transform(scale=1.0, rotation=np.eye(2), translation_xy=np.zeros((2,))),
+        valid=True,
+        mode="global",
+    )
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            pass
+
+        def compute(self, *, env, info, step_idx, done):
+            return TrackingRewardResult(reward=1.0, info=dict(info))
+
+    _install_fake_fifo_client(
+        monkeypatch,
+        hugsim_adapter,
+        image=image,
+        step_info=step_info,
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+    monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={
+            "CRAFT": {
+                "enable": True,
+                "map": {
+                    "center_dev_max_m": 2.0,
+                    "heading_dev_max_deg": 90.0,
+                    "reverse_dot_threshold": -0.5,
+                },
+            }
+        },
+        output_root=tmp_path,
+        recon_data_root=tmp_path / "recon",
+        hugsim_model_base=tmp_path / "hugsim",
+    )
+
+    env.reset()
+    _obs, _reward, _terminated, _truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert info["recon_cache_frame_idx"] == 169
+    assert info["recon_cache_time_frame_idx"] == 125
+    assert info["map_metrics_frame_idx"] == 169
+    assert info["map_metrics_frame_source"] == "nearest_pose"
+    assert info["map_has_lane_centerline"] is True
+    assert info["centerline_lateral_error_m"] == pytest.approx(1.0)
+    assert info["center_dev_ratio"] == pytest.approx(0.5)
+    assert info["map_heading_dev_ratio"] == pytest.approx(0.0)
+    assert info["opposite_lane"] is False
+    assert info["off_road"] is False
+
+
 def test_hugsim_recon_env_uses_aligned_recon_global_pose_for_reward(monkeypatch, tmp_path):
     from framework.env_wrapper import hugsim_adapter
     from framework.env_wrapper.hugsim_recon_alignment import HUGSIMReconAlignment, Sim2Transform

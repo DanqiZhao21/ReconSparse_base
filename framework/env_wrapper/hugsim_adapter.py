@@ -11,6 +11,11 @@ import numpy as np
 from shapely.geometry import Polygon
 from scipy.spatial.transform import Rotation, Slerp
 
+from framework.env_wrapper.map_metrics import (
+    DEFAULT_EGO_LENGTH_M,
+    DEFAULT_EGO_WIDTH_M,
+    compute_craft_map_metrics,
+)
 from framework.env_wrapper.hugsim_recon_alignment import (
     HUGSIMReconAlignment,
     Sim2Transform,
@@ -21,7 +26,7 @@ from framework.env_wrapper.hugsim_recon_alignment import (
     transform_hugsim_ego_box_to_reward_pose,
 )
 from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
-from framework.rewards import TrackingRewardComputer
+from framework.rewards import TrackingRewardComputer, select_reward_mode_cfg
 from framework.utils.repo_paths import resolve_hugsim_path, resolve_hugsim_root
 
 
@@ -649,6 +654,7 @@ class HUGSIMReconEnv:
         scene_index: Any,
         reward_cfg: dict[str, Any] | None = None,
         output_root: str | Path = "outputs/hugsim_rl",
+        output_namespace: str | None = None,
         hugsim_repo: str | Path = HUGSIM_REPO_DEFAULT,
         base_path: str | Path | None = None,
         camera_path: str | Path | None = None,
@@ -670,7 +676,8 @@ class HUGSIMReconEnv:
         self.official_scene_name = str(scenario_name)
         self.scenario_path = str(scenario_path)
         self.scene_index = scene_index
-        self.reward_cfg = reward_cfg or {}
+        self.raw_reward_cfg = reward_cfg or {}
+        self.reward_cfg = select_reward_mode_cfg(self.raw_reward_cfg)
         self.hugsim_repo = str(hugsim_repo)
         self.launch_mode = str(launch_mode).strip().lower()
         if self.launch_mode != "fifo":
@@ -694,6 +701,8 @@ class HUGSIMReconEnv:
         self.min_gt_route_points = max(0, int(min_gt_route_points))
         scenario_output_name = Path(self.scenario_path).stem or self.official_scene_name
         output_dir = (Path(output_root) / scenario_output_name).resolve()
+        if output_namespace is not None and str(output_namespace).strip():
+            output_dir = output_dir / Path(str(output_namespace).strip()).name
         self.env = HUGSIMFifoClient(
             hugsim_repo=self.hugsim_repo,
             scenario_path=self.scenario_path,
@@ -889,6 +898,41 @@ class HUGSIMReconEnv:
                         out["grpo_gt_frame_idx"] = int(frame_used)
             if pose_dist_m is not None:
                 out["recon_cache_frame_pose_dist_m"] = pose_dist_m
+            if reward_pose is not None and isinstance(snap, dict):
+                craft_cfg = self.reward_cfg.get("CRAFT", {}) if isinstance(self.reward_cfg, dict) else {}
+                if isinstance(craft_cfg, dict) and bool(craft_cfg.get("enable", False)):
+                    map_cfg = craft_cfg.get("map", {}) or {}
+                    if not isinstance(map_cfg, dict):
+                        map_cfg = {}
+                    try:
+                        # reward_pose stores Recon global XY as matrix X/Z; map metrics use XY.
+                        ego_x = float(reward_pose[0, 3])
+                        ego_y = float(reward_pose[2, 3])
+                        ego_yaw = float(math.atan2(float(reward_pose[2, 0]), float(reward_pose[0, 0])))
+                        map_metrics = compute_craft_map_metrics(
+                            snap,
+                            ego_x=ego_x,
+                            ego_y=ego_y,
+                            ego_yaw=ego_yaw,
+                            ego_length_m=float(map_cfg.get("ego_length_m", DEFAULT_EGO_LENGTH_M)),
+                            ego_width_m=float(map_cfg.get("ego_width_m", DEFAULT_EGO_WIDTH_M)),
+                            center_dev_max_m=float(
+                                map_cfg.get("center_dev_max_m", craft_cfg.get("center_dev_max_m", 2.0))
+                            ),
+                            heading_dev_max_deg=float(
+                                map_cfg.get("heading_dev_max_deg", craft_cfg.get("heading_max_deg", 90.0))
+                            ),
+                            reverse_dot_threshold=float(map_cfg.get("reverse_dot_threshold", -0.5)),
+                            same_dir_dot_threshold=float(map_cfg.get("same_dir_dot_threshold", 0.2)),
+                            same_dir_distance_margin_m=float(map_cfg.get("same_dir_distance_margin_m", 0.75)),
+                            opposite_min_lateral_m=float(map_cfg.get("opposite_min_lateral_m", 0.0)),
+                        )
+                        map_metrics["map_metrics_frame_idx"] = -1 if frame_used is None else int(frame_used)
+                        map_metrics["map_metrics_frame_source"] = str(frame_source)
+                        map_metrics["map_metrics_pose_source"] = str(out.get("reward_pose_source", ""))
+                        out.update(map_metrics)
+                    except Exception as exc:
+                        out["map_metrics_error"] = str(exc)
             raw_objects = snap.get("dynamic_objects", []) if isinstance(snap, dict) else []
             objects = [dict(obj) for obj in raw_objects if isinstance(obj, dict)]
             for obj in objects:

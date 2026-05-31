@@ -282,3 +282,34 @@ def test_hugsim_recon_env_fifo_output_dir_is_unique_per_scenario(monkeypatch, tm
     assert output_dirs[0] != output_dirs[1]
     assert output_dirs[0].name == "scene-0013-easy-00"
     assert output_dirs[1].name == "scene-0013-medium-00"
+
+
+def test_hugsim_recon_env_fifo_output_dir_is_unique_per_namespace(monkeypatch, tmp_path: Path):
+    from framework.env_wrapper import hugsim_adapter
+
+    output_dirs = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            output_dirs.append(Path(kwargs["output_dir"]))
+
+    monkeypatch.setattr(hugsim_adapter, "HUGSIMFifoClient", FakeClient)
+
+    for namespace in ["actor0", "actor1"]:
+        hugsim_adapter.HUGSIMReconEnv(
+            scenario_name="scene-0013",
+            scenario_path="/tmp/scene-0013-easy-00.yaml",
+            scene_index=object(),
+            reward_cfg={},
+            output_root=tmp_path,
+            output_namespace=namespace,
+            launch_mode="fifo",
+            recon_data_root=tmp_path,
+        )
+
+    assert len(output_dirs) == 2
+    assert output_dirs[0] != output_dirs[1]
+    assert output_dirs[0].parent.name == "scene-0013-easy-00"
+    assert output_dirs[1].parent.name == "scene-0013-easy-00"
+    assert output_dirs[0].name == "actor0"
+    assert output_dirs[1].name == "actor1"

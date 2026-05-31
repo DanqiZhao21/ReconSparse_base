@@ -7,7 +7,14 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from framework.batch import build_training_batch
-from framework.io.buffer import BufferPaths, list_failed_actor_ids, list_shards, read_int, stop_requested
+from framework.io.buffer import (
+    BufferPaths,
+    list_failed_actor_ids,
+    list_shards,
+    mark_stale_actor_heartbeats,
+    read_int,
+    stop_requested,
+)
 from framework.io.shard_policy import (
     discard_incompatible_shards,
     discard_stale_shards,
@@ -69,6 +76,10 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
         self.max_inflight_per_actor = int(getattr(learner_config, "max_inflight_per_actor", 1))
         self.poll_s = float(learner_config.poll_s)
         self.shard_collect_timeout_s = float(getattr(learner_config, "shard_collect_timeout_s", 0.0))
+        self.allow_partial_updates_after_timeout = bool(
+            getattr(learner_config, "allow_partial_updates_after_timeout", False)
+        )
+        self.actor_heartbeat_timeout_s = float(getattr(learner_config, "actor_heartbeat_timeout_s", 0.0))
         self.max_shard_version_lag = int(learner_config.max_shard_version_lag)
         self.norm_eps = float(learner_config.norm_eps)
         self.inner_epochs = max(1, int(learner_config.inner_epochs))
@@ -122,6 +133,14 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
             while True:
                 if stop_requested(self.paths):
                     break
+                if self.mode.startswith("async") and float(self.actor_heartbeat_timeout_s) > 0.0:
+                    mark_stale_actor_heartbeats(
+                        self.paths,
+                        list(range(int(self.num_actors))),
+                        timeout_s=float(self.actor_heartbeat_timeout_s),
+                        now=float(time.time()),
+                        stage_fn=self.stage_fn,
+                    )
                 failed_actor_ids = list_failed_actor_ids(self.paths) if self.mode.startswith("async") else []
                 cur_ver_now = read_int(self.paths.version_file, default=self.start_version)
                 self.current_weights_version = int(cur_ver_now)
@@ -150,7 +169,8 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                         selected = []
                         break
                     if (
-                        float(self.shard_collect_timeout_s) > 0.0
+                        bool(self.allow_partial_updates_after_timeout)
+                        and float(self.shard_collect_timeout_s) > 0.0
                         and len(files) > 0
                         and len(files) < int(effective_shards_per_update)
                         and (time.time() - float(wait_t0)) >= float(self.shard_collect_timeout_s)

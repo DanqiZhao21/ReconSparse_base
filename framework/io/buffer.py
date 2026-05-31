@@ -97,6 +97,11 @@ def actor_failure_log_path(paths: BufferPaths, actor_id: int) -> str:
     return os.path.join(paths.actors_dir, f"actor{int(actor_id)}.log")
 
 
+def actor_heartbeat_path(paths: BufferPaths, actor_id: int) -> str:
+    ensure_buffer_layout(paths)
+    return os.path.join(paths.actors_dir, f"actor{int(actor_id)}.heartbeat")
+
+
 def clear_actor_failure(paths: BufferPaths, actor_id: int) -> None:
     for path in [actor_failure_flag_path(paths, actor_id), actor_failure_log_path(paths, actor_id)]:
         try:
@@ -127,6 +132,59 @@ def write_actor_failure(
     with open(log_path, "w", encoding="utf-8") as handle:
         handle.write(text)
     return flag_path
+
+
+def write_actor_heartbeat(paths: BufferPaths, actor_id: int, *, message: str = "") -> str:
+    ensure_buffer_layout(paths)
+    path = actor_heartbeat_path(paths, actor_id)
+    now = time.time()
+    text = f"time={now:.6f}\nactor_id={int(actor_id)}\nmessage={str(message).strip()}\n"
+    tmp = f"{path}.tmp.{uuid.uuid4().hex}"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+def mark_stale_actor_heartbeats(
+    paths: BufferPaths,
+    actor_ids: List[int],
+    *,
+    timeout_s: float,
+    now: float | None = None,
+    stage_fn: Any | None = None,
+) -> List[int]:
+    timeout = float(timeout_s)
+    if timeout <= 0.0:
+        return []
+    ensure_buffer_layout(paths)
+    failed = set(list_failed_actor_ids(paths))
+    marked: List[int] = []
+    cur_t = float(time.time() if now is None else now)
+    for actor_id in actor_ids:
+        aid = int(actor_id)
+        if aid in failed:
+            continue
+        heartbeat = actor_heartbeat_path(paths, aid)
+        try:
+            last_t = float(os.path.getmtime(heartbeat))
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+        age_s = cur_t - float(last_t)
+        if age_s < timeout:
+            continue
+        write_actor_failure(
+            paths,
+            aid,
+            message=f"actor heartbeat stale age_s={age_s:.2f} timeout_s={timeout:.2f}",
+        )
+        marked.append(aid)
+
+    if marked and callable(stage_fn):
+        stage_fn(f"[learner] marked stale heartbeat actor(s) failed: {marked}")
+    return marked
 
 
 def list_failed_actor_ids(paths: BufferPaths) -> List[int]:
@@ -275,9 +333,11 @@ __all__ = [
     "ensure_buffer_layout",
     "actor_failure_flag_path",
     "actor_failure_log_path",
+    "actor_heartbeat_path",
     "clear_actor_failure",
     "list_shards",
     "list_failed_actor_ids",
+    "mark_stale_actor_heartbeats",
     "move_to_consumed",
     "prune_consumed",
     "read_int",
@@ -285,4 +345,5 @@ __all__ = [
     "wait_for_version",
     "write_int",
     "write_actor_failure",
+    "write_actor_heartbeat",
 ]

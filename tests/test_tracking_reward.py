@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import yaml
 
-from framework.rewards.tracking import TrackingRewardComputer
+from framework.rewards.tracking import TrackingRewardComputer, TrackingRewardResult, select_reward_mode_cfg
 
 
 def _pose(x: float, z: float, yaw_rad: float = 0.0) -> np.ndarray:
@@ -24,9 +24,219 @@ def _pose(x: float, z: float, yaw_rad: float = 0.0) -> np.ndarray:
 
 
 class _DummyEnv:
-    def __init__(self, *, start_ego: np.ndarray, all_expert_ego: list[np.ndarray]) -> None:
+    def __init__(
+        self,
+        *,
+        start_ego: np.ndarray,
+        all_expert_ego: list[np.ndarray],
+        expert_pair: list[np.ndarray] | None = None,
+    ) -> None:
         self.start_ego = np.asarray(start_ego, dtype=np.float64)
         self.all_expert_ego = [np.asarray(item, dtype=np.float64) for item in all_expert_ego]
+        if expert_pair is not None:
+            self.expert_pair = [np.asarray(item, dtype=np.float64) for item in expert_pair]
+
+
+def _zero_reward_cfg() -> dict[str, object]:
+    return {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 0.0,
+            "w_lateral": 0.0,
+            "w_yaw": 0.0,
+        },
+        "collision": {
+            "w_static": 0.0,
+            "w_dynamic": 0.0,
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+
+
+def test_nested_reward_mode_config_selects_active_craft_close_loop() -> None:
+    reward_cfg = {
+        "mode": "craft_close_loop",
+        "craft_close_loop": {
+            "dt": 0.5,
+            "CRAFT": {
+                "enable": True,
+                "real_reward_model": "close loop",
+                "progress_weight": 0.0,
+                "progress_max_m": 1.2,
+                "progress_min_m": 0.0,
+                "cost_off_road": 0.0,
+                "cost_opposite_lane": 0.0,
+                "cost_off_global_route": 0.0,
+                "cost_emergency_lane": 0.0,
+                "cost_red_light": 0.0,
+                "cost_stop_sign": 0.0,
+                "term_collision": 0.0,
+                "term_route_dev": 0.0,
+            },
+        },
+        "step_path": {
+            "dt": 0.5,
+            "path": {
+                "w_progress": 0.0,
+                "w_lateral": 0.0,
+                "w_yaw": 0.0,
+            },
+        },
+    }
+
+    selected = select_reward_mode_cfg(reward_cfg)
+
+    assert selected["CRAFT"]["real_reward_model"] == "close loop"
+
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(
+        start_ego=_pose(0.0, 1.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+    assert result.info["reward_mode"] == "craft_closed_loop"
+
+
+def test_compute_dispatches_nested_reward_modes_as_parallel_branches() -> None:
+    class DispatchProbeRewardComputer(TrackingRewardComputer):
+        def _compute_step_path_reward(self, **_: object) -> TrackingRewardResult:  # type: ignore[override]
+            return TrackingRewardResult(reward=1.0, info={"reward_mode": "step_path_probe"})
+
+        def _compute_craft_corrective_reward(self, **_: object) -> TrackingRewardResult:  # type: ignore[override]
+            return TrackingRewardResult(reward=2.0, info={"reward_mode": "craft_corrective_probe"})
+
+        def _compute_craft_closed_loop_reward(self, **_: object) -> TrackingRewardResult:  # type: ignore[override]
+            return TrackingRewardResult(reward=3.0, info={"reward_mode": "craft_closed_loop_probe"})
+
+    base_cfg = {
+        "craft_close_loop": {
+            "dt": 0.5,
+            "CRAFT": {
+                "enable": True,
+                "real_reward_model": "close loop",
+            },
+        },
+        "craft_sparse_loop": {
+            "dt": 0.5,
+            "CRAFT": {
+                "enable": True,
+                "real_reward_model": "corrective",
+            },
+        },
+        "step_path": {
+            "dt": 0.5,
+            "CRAFT": {
+                "enable": False,
+            },
+        },
+    }
+    env = _DummyEnv(
+        start_ego=_pose(0.0, 1.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)],
+    )
+
+    expected_by_mode = {
+        "craft_close_loop": "craft_closed_loop_probe",
+        "craft_sparse_loop": "craft_corrective_probe",
+        "step_path": "step_path_probe",
+    }
+    for mode, expected_reward_mode in expected_by_mode.items():
+        computer = DispatchProbeRewardComputer({"mode": mode, **base_cfg})
+
+        result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+        assert result.info["reward_mode"] == expected_reward_mode
+
+
+def test_craft_corrective_reward_info_omits_unused_dev_ratio_fields() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "CRAFT": {
+            "enable": True,
+            "real_reward_model": "corrective",
+            "heading_max_deg": 60.0,
+            "corrective_progress": {
+                "enable": True,
+                "weight": 1.0,
+                "max_m": 1.0,
+                "min_m": 0.0,
+                "lateral_safe_m": 0.0,
+                "lateral_max_m": 2.0,
+                "w_lateral_efficiency": 0.0,
+                "w_heading_efficiency": 0.0,
+            },
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    reference_path = [_pose(0.0, 0.0), _pose(0.0, 5.0)]
+
+    computer.compute(
+        env=_DummyEnv(start_ego=_pose(0.0, 0.0), all_expert_ego=reference_path),
+        info={},
+        step_idx=0,
+        done=False,
+    )
+    result = computer.compute(
+        env=_DummyEnv(start_ego=_pose(0.0, 1.0), all_expert_ego=reference_path),
+        info={},
+        step_idx=1,
+        done=False,
+    )
+
+    assert result.info["reward_mode"] == "craft_corrective"
+    assert result.reward == pytest.approx(1.0)
+    assert result.info["craft_corrective_progress_lateral_ratio"] == pytest.approx(0.0)
+    assert "craft_global_dev_ratio" not in result.info
+    assert "craft_center_dev_ratio" not in result.info
+    assert "craft_lateral_dev_ratio" not in result.info
+    for legacy_key in [
+        "positive_reward",
+        "gated_positive_reward",
+        "craft_progress_reward",
+        "craft_effective_progress",
+        "craft_efficiency",
+        "craft_correction_reward",
+        "craft_safety_cost",
+        "pos_dev",
+        "pos_dev_source",
+        "yaw_err_deg",
+    ]:
+        assert legacy_key not in result.info
+
+
+def test_reference_path_prefers_all_expert_ego_over_legacy_expert_pair() -> None:
+    computer = TrackingRewardComputer(_zero_reward_cfg())
+    env = _DummyEnv(
+        start_ego=_pose(0.0, 2.0),
+        all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 10.0)],
+        expert_pair=[np.asarray([10.0, 0.0]), np.asarray([10.0, 10.0])],
+    )
+
+    result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+    assert result.info["reference_path_source"] == "all_expert_ego"
+    assert result.info["reference_path_source_legacy"] is False
+    assert result.info["lateral_error_m"] == pytest.approx(0.0)
+
+
+def test_reference_path_uses_expert_pair_only_as_legacy_fallback() -> None:
+    computer = TrackingRewardComputer(_zero_reward_cfg())
+    env = _DummyEnv(
+        start_ego=_pose(10.0, 2.0),
+        all_expert_ego=[],
+        expert_pair=[np.asarray([10.0, 0.0]), np.asarray([10.0, 10.0])],
+    )
+
+    result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+    assert result.info["reference_path_source"] == "expert_pair"
+    assert result.info["reference_path_source_legacy"] is True
+    assert result.info["lateral_error_m"] == pytest.approx(0.0)
 
 
 def test_completion_ratio_is_diagnostic_not_reward_term() -> None:
@@ -414,6 +624,59 @@ def test_step_path_reward_penalizes_front_obstacle_risk_and_gates_progress() -> 
     assert result.reward == pytest.approx((1.0 / 3.0) - result.info["front_obstacle_cost"])
 
 
+def test_step_path_reward_ignores_legacy_front_obstacle_aliases() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "path": {
+            "w_progress": 1.0,
+            "w_lateral": 0.0,
+            "w_yaw": 0.0,
+        },
+        "safety": {
+            "enable": True,
+            "lookahead_m": 20.0,
+            "corridor_half_width_m": 2.5,
+            "safe_gap_m": 8.0,
+            "safe_ttc_s": 3.0,
+            "w_clearance": 2.0,
+            "w_ttc": 3.0,
+        },
+        "comfort": {
+            "w_longitudinal_jerk": 0.0,
+            "w_yaw_jerk": 0.0,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    reference_path = [_pose(0.0, 0.0), _pose(0.0, 10.0)]
+    computer.compute(
+        env=_DummyEnv(start_ego=_pose(0.0, 0.0), all_expert_ego=reference_path),
+        info={},
+        step_idx=0,
+        done=False,
+    )
+
+    result = computer.compute(
+        env=_DummyEnv(start_ego=_pose(0.0, 1.0), all_expert_ego=reference_path),
+        info={
+            "front_gap_m": 4.0,
+            "front_lateral_m": 0.0,
+            "front_closing_speed_mps": 4.0,
+            "front_ttc_s": 1.0,
+        },
+        step_idx=1,
+        done=False,
+    )
+
+    assert result.info["front_obstacle_active"] is False
+    assert math.isinf(result.info["front_obstacle_gap_m"])
+    assert math.isinf(result.info["front_obstacle_lateral_m"])
+    assert result.info["front_obstacle_closing_speed_mps"] == pytest.approx(0.0)
+    assert math.isinf(result.info["front_obstacle_ttc_s"])
+    assert result.info["front_obstacle_cost"] == pytest.approx(0.0)
+    assert result.info["safe_progress_gate"] == pytest.approx(1.0)
+    assert result.reward == pytest.approx(1.0)
+
+
 def test_step_path_reward_ignores_front_obstacle_outside_corridor() -> None:
     reward_cfg = {
         "dt": 0.5,
@@ -497,6 +760,37 @@ def test_craft_reward_discounts_progress_when_laterally_deviated() -> None:
     assert aligned_result.info["reward_mode"] == "craft_closed_loop"
     assert aligned_result.info["craft_efficiency"] > deviated_result.info["craft_efficiency"]
     assert aligned_result.reward > deviated_result.reward
+
+
+def test_craft_closed_loop_uses_effective_progress_without_raw_progress_bonus() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "CRAFT": {
+            "enable": True,
+            "real_reward_model": "dense_carl",
+            "progress_weight": 5.0,
+            "progress_max_m": 1.0,
+            "progress_min_m": 0.0,
+            "w_g": 0.0,
+            "w_c": 0.0,
+            "w_h": 0.0,
+            "efficiency_floor": 1.0,
+            "k_g": 0.0,
+            "k_c": 0.0,
+            "k_h": 0.0,
+            "collision_cost_static": 0.0,
+            "collision_cost_dynamic": 0.0,
+        },
+    }
+    reference_path = [_pose(0.0, 0.0), _pose(0.0, 5.0)]
+    computer = TrackingRewardComputer(reward_cfg)
+
+    computer.compute(env=_DummyEnv(start_ego=_pose(0.0, 0.0), all_expert_ego=reference_path), info={}, step_idx=0, done=False)
+    result = computer.compute(env=_DummyEnv(start_ego=_pose(0.0, 1.0), all_expert_ego=reference_path), info={}, step_idx=1, done=False)
+
+    assert result.info["craft_progress_reward"] == pytest.approx(5.0)
+    assert result.info["craft_effective_progress"] == pytest.approx(5.0)
+    assert result.reward == pytest.approx(5.0)
 
 
 def test_craft_reward_adds_correction_when_deviation_improves() -> None:
@@ -590,6 +884,41 @@ def test_craft_reward_applies_term_collision_once_without_per_type_overrides() -
 
     assert result.info["craft_collision_terminal_cost"] == pytest.approx(30.0)
     assert result.info["craft_safety_cost"] == pytest.approx(30.0)
+    assert result.reward == pytest.approx(-30.0)
+
+
+def test_craft_closed_loop_treats_null_collision_overrides_as_absent() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "CRAFT": {
+            "enable": True,
+            "real_reward_model": "dense_carl",
+            "progress_weight": 0.0,
+            "w_g": 0.0,
+            "w_c": 0.0,
+            "w_h": 0.0,
+            "efficiency_floor": 1.0,
+            "k_g": 0.0,
+            "k_c": 0.0,
+            "k_h": 0.0,
+            "term_collision": 30.0,
+            "collision_cost_static": None,
+            "collision_cost_dynamic": None,
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(start_ego=_pose(0.0, 1.0), all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)])
+
+    result = computer.compute(
+        env=env,
+        info={"static_collision": True, "dynamic_collision": True},
+        step_idx=0,
+        done=False,
+    )
+
+    assert result.info["craft_collision_terminal_cost"] == pytest.approx(30.0)
+    assert result.info["craft_static_collision_cost"] == pytest.approx(0.0)
+    assert result.info["craft_dynamic_collision_cost"] == pytest.approx(0.0)
     assert result.reward == pytest.approx(-30.0)
 
 
@@ -762,6 +1091,40 @@ def test_craft_reward_uses_map_and_rule_flags_as_safety_cost() -> None:
     assert result.reward == pytest.approx(-22.0)
 
 
+def test_craft_closed_loop_computes_off_global_route_from_lateral_threshold() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "CRAFT": {
+            "enable": True,
+            "real_reward_model": "dense_carl",
+            "progress_weight": 0.0,
+            "w_g": 0.0,
+            "w_c": 0.0,
+            "w_h": 0.0,
+            "efficiency_floor": 1.0,
+            "k_g": 0.0,
+            "k_c": 0.0,
+            "k_h": 0.0,
+            "cost_off_global_route": 4.0,
+            "collision_cost_static": 0.0,
+            "collision_cost_dynamic": 0.0,
+            "map": {
+                "off_global_route_threshold_m": 1.5,
+            },
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(start_ego=_pose(2.0, 1.0), all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)])
+
+    result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+    assert result.info["off_global_route"] is True
+    assert result.info["off_global_route_source"] == "route_lateral_threshold"
+    assert result.info["off_global_route_threshold_m"] == pytest.approx(1.5)
+    assert result.info["craft_off_global_route_cost"] == pytest.approx(4.0)
+    assert result.reward == pytest.approx(-4.0)
+
+
 def test_craft_reward_applies_route_completion_and_deviation_terms() -> None:
     reward_cfg = {
         "dt": 0.5,
@@ -831,14 +1194,89 @@ def test_craft_default_sparse_corrective_reward_ignores_dense_progress_and_uses_
     )
 
     assert result.info["reward_mode"] == "craft_corrective"
-    assert result.info["craft_effective_progress"] == pytest.approx(0.0)
-    assert result.info["craft_correction_reward"] == pytest.approx(0.0)
     assert result.info["craft_corrective_cost_off_road"] == pytest.approx(0.5)
     assert result.info["craft_corrective_cost_red_light"] == pytest.approx(2.0)
     assert result.info["craft_corrective_cost_stop_sign"] == pytest.approx(2.0)
     assert result.info["craft_corrective_cost_collision"] == pytest.approx(5.0)
-    assert result.info["craft_safety_cost"] == pytest.approx(9.5)
+    assert result.info["cost_reward"] == pytest.approx(9.5)
     assert result.reward == pytest.approx(-9.5)
+
+
+def test_craft_corrective_uses_map_heading_ratio_like_closed_loop() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "CRAFT": {
+            "enable": True,
+            "real_reward_model": "corrective",
+            "heading_max_deg": 60.0,
+            "corrective_progress": {
+                "enable": True,
+                "weight": 1.2,
+                "max_m": 1.2,
+                "min_m": 0.0,
+                "w_lateral_efficiency": 0.0,
+                "w_heading_efficiency": 1.0,
+            },
+            "corrective": {
+                "cost_off_road": 0.0,
+                "cost_emergency_lane": 0.0,
+                "cost_off_global_route": 0.0,
+                "cost_red_light": 0.0,
+                "cost_stop_sign": 0.0,
+                "cost_collision": 0.0,
+            },
+        },
+    }
+    reference_path = [_pose(0.0, 0.0, math.pi / 2.0), _pose(0.0, 5.0, math.pi / 2.0)]
+    computer = TrackingRewardComputer(reward_cfg)
+    computer.compute(
+        env=_DummyEnv(start_ego=_pose(0.0, 0.0, math.pi / 2.0), all_expert_ego=reference_path),
+        info={},
+        step_idx=0,
+        done=False,
+    )
+
+    result = computer.compute(
+        env=_DummyEnv(start_ego=_pose(0.0, 1.0, math.pi / 2.0), all_expert_ego=reference_path),
+        info={"map_heading_dev_ratio": 0.5},
+        step_idx=1,
+        done=False,
+    )
+
+    assert result.info["heading_dev_ratio"] == pytest.approx(0.5)
+    assert result.info["craft_corrective_progress_heading_ratio"] == pytest.approx(0.5)
+    assert "craft_heading_dev_ratio" not in result.info
+
+
+def test_craft_corrective_computes_off_global_route_from_lateral_threshold() -> None:
+    reward_cfg = {
+        "dt": 0.5,
+        "CRAFT": {
+            "enable": True,
+            "real_reward_model": "corrective",
+            "map": {
+                "off_global_route_threshold_m": 1.5,
+            },
+            "corrective": {
+                "cost_off_road": 0.0,
+                "cost_emergency_lane": 0.0,
+                "cost_off_global_route": 0.5,
+                "cost_red_light": 0.0,
+                "cost_stop_sign": 0.0,
+                "cost_collision": 0.0,
+            },
+        },
+    }
+    computer = TrackingRewardComputer(reward_cfg)
+    env = _DummyEnv(start_ego=_pose(2.0, 1.0), all_expert_ego=[_pose(0.0, 0.0), _pose(0.0, 5.0)])
+
+    result = computer.compute(env=env, info={}, step_idx=0, done=False)
+
+    assert result.info["reward_mode"] == "craft_corrective"
+    assert result.info["off_global_route"] is True
+    assert result.info["off_global_route_source"] == "route_lateral_threshold"
+    assert result.info["craft_corrective_cost_off_global_route"] == pytest.approx(0.5)
+    assert result.reward == pytest.approx(-0.5)
 
 
 def test_craft_corrective_uses_defaults_and_ignores_opposite_lane() -> None:
@@ -952,7 +1390,7 @@ def test_craft_corrective_reward_subtracts_closed_loop_ea_cost() -> None:
 
     assert result.info["reward_mode"] == "craft_corrective"
     assert result.info["ea_cost"] == pytest.approx(1.0)
-    assert result.info["craft_safety_cost"] == pytest.approx(1.0)
+    assert result.info["cost_reward"] == pytest.approx(1.0)
     assert result.reward == pytest.approx(-1.0)
 
 
@@ -998,7 +1436,6 @@ def test_craft_corrective_progress_bonus_rewards_forward_motion() -> None:
     assert result.info["craft_corrective_progress_enabled"] is True
     assert result.info["progress_reward"] == pytest.approx(0.8)
     assert result.info["craft_corrective_progress_reward"] == pytest.approx(1.6)
-    assert result.info["positive_reward"] == pytest.approx(1.6)
     assert result.info["cost_reward"] == pytest.approx(0.0)
     assert result.reward == pytest.approx(1.6)
 
@@ -1041,9 +1478,9 @@ def test_craft_corrective_progress_bonus_is_discounted_by_deviation() -> None:
         done=False,
     )
 
-    expected_efficiency = math.exp(-2.0 * 0.5) * math.exp(-1.0 * 0.5)
+    expected_efficiency = math.exp(-2.0 * 0.5) * math.exp(-1.0 * 0.75)
     assert result.info["craft_corrective_progress_lateral_ratio"] == pytest.approx(0.5)
-    assert result.info["craft_corrective_progress_heading_ratio"] == pytest.approx(0.5)
+    assert result.info["craft_corrective_progress_heading_ratio"] == pytest.approx(0.75)
     assert result.info["craft_corrective_progress_efficiency"] == pytest.approx(expected_efficiency)
     assert result.info["craft_corrective_progress_reward"] == pytest.approx(expected_efficiency)
     assert result.reward == pytest.approx(expected_efficiency)

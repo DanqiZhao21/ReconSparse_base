@@ -12,7 +12,7 @@ from reconsimulator.envs.metrics_cache import load_scene_env_cache
 from shapely.geometry import Polygon
 
 from framework.env_wrapper.map_metrics import compute_craft_map_metrics
-from framework.rewards import TrackingRewardComputer
+from framework.rewards import TrackingRewardComputer, select_reward_mode_cfg
 from framework.rewards.closed_loop_ea import ClosedLoopEAScorer
 
 _DEFAULT_PDM_CONTEXT_CACHE_ROOT = Path(__file__).resolve().parents[2] / "assets" / "nus" / "cache" / "_sample_pdm_context"
@@ -43,7 +43,8 @@ class RLReconEnv:
             self.env = ReconSimulator(cuda=cuda, scene=scene, debug=bool(debug))
         else:
             self.env = ReconSimulator(cuda=cuda, scene=scene, debug=bool(debug), render_w=int(render_w), render_h=int(render_h))
-        self.reward_cfg = reward_cfg or {}
+        self.raw_reward_cfg = reward_cfg or {}
+        self.reward_cfg = select_reward_mode_cfg(self.raw_reward_cfg)
         self._reward_computer = TrackingRewardComputer(self.reward_cfg)
         ea_cfg = self.reward_cfg.get("ea", {}) if isinstance(self.reward_cfg, dict) else {}
         self._closed_loop_ea_scorer = ClosedLoopEAScorer(ea_cfg if isinstance(ea_cfg, dict) else {})

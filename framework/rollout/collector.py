@@ -176,6 +176,7 @@ def collect_single_env_shard(
     store_obs: bool = True,
     info: Any = None,
     return_info: bool = False,
+    heartbeat_fn: Any | None = None,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -197,6 +198,8 @@ def collect_single_env_shard(
     step_count = 0
     collect_t0 = time.perf_counter()
     while step_count < int(horizon):
+        if callable(heartbeat_fn):
+            heartbeat_fn("collect_single_step", step_count)
         obs_decision = obs
         step_timing: Dict[str, float] = {}
         obs_t: torch.Tensor | None = None
@@ -300,6 +303,7 @@ def collect_vector_env_shards(
     store_obs: bool = True,
     info_list: List[Any] | None = None,
     return_info: bool = False,
+    heartbeat_fn: Any | None = None,
 ) -> tuple[List[Dict[str, Any]], List[Any]]:
     obs_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
     old_logp_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
@@ -329,6 +333,8 @@ def collect_vector_env_shards(
     step_count = 0
     collect_t0 = time.perf_counter()
     while step_count < int(horizon):
+        if callable(heartbeat_fn):
+            heartbeat_fn("collect_vector_step", step_count)
         act_t0 = time.perf_counter()
         obs_t_list = [_default_obs_tensor(obs) for obs in obs_list] if bool(store_obs) else []
         actions0, logps, replays = agent.act_batch(

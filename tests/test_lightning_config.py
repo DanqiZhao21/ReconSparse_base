@@ -43,7 +43,7 @@ def test_trainer_kwargs_keep_scalar_device_count_for_cpu() -> None:
     assert kwargs["devices"] == 1
 
 
-def test_actor_learner_config_reads_shard_collect_timeout() -> None:
+def test_actor_learner_config_reads_async_collection_timing_options() -> None:
     class _Algo:
         eta = 1.0
         clip_eps = 0.2
@@ -58,8 +58,11 @@ def test_actor_learner_config_reads_shard_collect_timeout() -> None:
             "shards_per_update": 24,
             "poll_interval_s": 0.1,
             "shard_collect_timeout_s": 30.0,
+            "allow_partial_updates_after_timeout": True,
         },
         algo_meta={"algo_key": "ppo", "eta": 1.0, "clip_eps": 0.2},
     )
 
     assert cfg.shard_collect_timeout_s == 30.0
+    assert cfg.allow_partial_updates_after_timeout is True
+    assert cfg.actor_heartbeat_timeout_s == 150.0

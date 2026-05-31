@@ -176,6 +176,8 @@ def build_actor_env(
     ddp_seed = int(((cfg.get("train", {}) or {}).get("ddp", {}) or {}).get("seed", 0))
     rank = int(os.environ.get("RANK", "0"))
     wid = int(worker_id) if worker_id is not None else int(actor_id)
+    if hugsim_kwargs is not None:
+        hugsim_kwargs["output_namespace"] = f"actor{int(actor_id)}_worker{int(wid)}"
 
     return make_scene_sampling_env(
         cuda=int(cuda),

@@ -15,6 +15,12 @@ python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   --scene 0051 \
   --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605251610_HUGSM_reinforcepp_closed_loop_closeCloselopop_openGRPOCraft.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
+  
+python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
+  --hugsim-scene scene-0051-hard-00 \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605301356_HUGSM_reinforcepp_closed_loop_reward-close_loop_openGRPOCraft.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
+  
 """
 
 from __future__ import annotations

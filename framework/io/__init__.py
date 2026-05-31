@@ -5,12 +5,14 @@ from .buffer import (
     atomic_torch_save,
     count_inflight,
     ensure_buffer_layout,
+    mark_stale_actor_heartbeats,
     list_shards,
     move_to_consumed,
     prune_consumed,
     read_int,
     stop_requested,
     wait_for_version,
+    write_actor_heartbeat,
     write_int,
 )
 
@@ -19,11 +21,13 @@ __all__ = [
     "atomic_torch_save",
     "count_inflight",
     "ensure_buffer_layout",
+    "mark_stale_actor_heartbeats",
     "list_shards",
     "move_to_consumed",
     "prune_consumed",
     "read_int",
     "stop_requested",
     "wait_for_version",
+    "write_actor_heartbeat",
     "write_int",
 ]

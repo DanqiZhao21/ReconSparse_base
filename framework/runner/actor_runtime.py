@@ -18,6 +18,7 @@ from framework.io.buffer import (
     stop_requested,
     wait_for_version,
     write_actor_failure,
+    write_actor_heartbeat,
 )
 from framework.rollout import collect_single_env_shard, collect_vector_env_shards
 from framework.rollout.timing import format_rollout_timing_summary
@@ -171,6 +172,7 @@ def _actor_main_impl(
     horizon = int(al_cfg.get("actor_horizon", 32))
     max_inflight = int(al_cfg.get("max_inflight_per_actor", 2))
     poll_s = float(al_cfg.get("poll_interval_s", 0.2))
+    heartbeat_interval_s = float(al_cfg.get("actor_heartbeat_interval_s", max(1.0, float(poll_s) * 10.0)))
     runtime_cfg = resolve_actor_env_runtime(cfg)
     num_envs_per_actor = int(runtime_cfg["num_envs_per_actor"])
     vec_env_mode = str(runtime_cfg["vec_env_mode"])
@@ -187,6 +189,24 @@ def _actor_main_impl(
 
     pause_actor_on_learner_gpu = bool(al_cfg.get("pause_actor_on_learner_gpu", True))
     training_lock_file = os.path.join(paths.root, "TRAINING_LOCK")
+
+    last_heartbeat_t = 0.0
+
+    def heartbeat(phase: str, step: int | None = None, *, force: bool = False) -> None:
+        nonlocal last_heartbeat_t
+        if float(heartbeat_interval_s) <= 0.0:
+            return
+        now = time.time()
+        if not bool(force) and (now - float(last_heartbeat_t)) < float(heartbeat_interval_s):
+            return
+        last_heartbeat_t = float(now)
+        step_suffix = "" if step is None else f" step={int(step)}"
+        try:
+            write_actor_heartbeat(paths, int(actor_id), message=f"{str(phase)}{step_suffix}")
+        except Exception as exc:
+            stage(f"[actor{actor_id}] heartbeat write failed: {exc}")
+
+    heartbeat("init", force=True)
     agent = build_agent(cfg, device=device)
     local_ver = 0
     v0 = read_int(paths.version_file, default=0)
@@ -228,6 +248,7 @@ def _actor_main_impl(
                 break
             if pause_actor_on_learner_gpu and _actor_should_pause_for_learner(al_cfg, cuda=int(cuda)):
                 while os.path.exists(training_lock_file):
+                    heartbeat("waiting_training_lock")
                     if stop_requested(paths):
                         stage(f"[actor{actor_id}] stop requested during learner-train pause; exiting")
                         return
@@ -235,6 +256,7 @@ def _actor_main_impl(
             reserve = 1
             backpressure_wait_t0 = time.perf_counter()
             while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
+                heartbeat("waiting_backpressure")
                 if stop_requested(paths):
                     stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
                     return
@@ -253,6 +275,7 @@ def _actor_main_impl(
             if obs is None:
                 obs, _info = env.reset()
             try:
+                heartbeat("collect_single_start", force=True)
                 shard, obs, _info = collect_single_env_shard(
                     env=env,
                     agent=agent,
@@ -267,6 +290,7 @@ def _actor_main_impl(
                     store_obs=bool(store_obs),
                     info=_info,
                     return_info=True,
+                    heartbeat_fn=heartbeat,
                 )
             except Exception:
                 if close_env_between_shards:
@@ -287,6 +311,7 @@ def _actor_main_impl(
                 shard["meta"]["timing"] = dict(timing)
             save_t0 = time.perf_counter()
             atomic_torch_save(shard, os.path.join(paths.shards_dir, name))
+            heartbeat("wrote_single_shard", force=True)
             timing["save_shard_s"] = float(time.perf_counter() - save_t0)
             timing_summary = format_rollout_timing_summary(timing)
             suffix = f" {timing_summary}" if timing_summary else ""
@@ -324,6 +349,7 @@ def _actor_main_impl(
                 break
             if pause_actor_on_learner_gpu and _actor_should_pause_for_learner(al_cfg, cuda=int(cuda)):
                 while os.path.exists(training_lock_file):
+                    heartbeat("waiting_training_lock")
                     if stop_requested(paths):
                         stage(f"[actor{actor_id}] stop requested during learner-train pause; exiting")
                         return
@@ -331,6 +357,7 @@ def _actor_main_impl(
             reserve = max(1, int(num_envs_per_actor))
             backpressure_wait_t0 = time.perf_counter()
             while count_inflight(paths, actor_id=str(actor_id)) >= max(1, int(max_inflight) - int(reserve) + 1):
+                heartbeat("waiting_backpressure")
                 if stop_requested(paths):
                     stage(f"[actor{actor_id}] stop requested during backpressure; exiting")
                     return
@@ -345,6 +372,7 @@ def _actor_main_impl(
                 except Exception as exc:
                     stage(f"[actor{actor_id}] weight reload failed: {exc}")
 
+            heartbeat("collect_vector_start", force=True)
             shards, obs_list, _info = collect_vector_env_shards(
                 vec_env=vec_env,
                 agent=agent,
@@ -360,6 +388,7 @@ def _actor_main_impl(
                 store_obs=bool(store_obs),
                 info_list=_info,
                 return_info=True,
+                heartbeat_fn=heartbeat,
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=len(shards)):
                 break
@@ -371,6 +400,7 @@ def _actor_main_impl(
                     shard["meta"]["timing"] = dict(timing)
                 save_t0 = time.perf_counter()
                 atomic_torch_save(shard, os.path.join(paths.shards_dir, name))
+                heartbeat("wrote_vector_shard", force=True)
                 timing["save_shard_s"] = float(time.perf_counter() - save_t0)
                 timing_summary = format_rollout_timing_summary(timing)
                 suffix = f" {timing_summary}" if timing_summary else ""
