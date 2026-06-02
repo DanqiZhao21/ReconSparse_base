@@ -147,6 +147,55 @@ def test_vector_actor_env_builds_receive_total_actors(
     assert {int(call["worker_id"]) for call in calls} == {2000, 2001}
 
 
+def test_actor_heartbeat_reports_initial_weight_loading_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BufferPaths(root=str(tmp_path / "buffer_root"))
+    ensure_buffer_layout(paths)
+    Path(paths.version_file).write_text("3", encoding="utf-8")
+    Path(paths.latest_ckpt).write_bytes(b"checkpoint")
+    cfg = _single_env_cfg(paths, backend="recon")
+    beats: list[tuple[str, int | None, bool]] = []
+
+    class _FakeHeartbeat:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def beat(self, phase=None, step=None, *, force=False) -> None:
+            beats.append(("" if phase is None else str(phase), None if step is None else int(step), bool(force)))
+
+    class _Agent:
+        def load_checkpoint(self, path: str) -> None:
+            assert path == paths.latest_ckpt
+
+    def _stop_after_weight_load(*_args, **_kwargs):
+        raise _StopAfterShard("stop after initial weight load")
+
+    monkeypatch.setattr("framework.runner.actor_runtime.PeriodicActorHeartbeat", _FakeHeartbeat)
+    monkeypatch.setattr("framework.runner.actor_runtime.build_agent", lambda *_args, **_kwargs: _Agent())
+    monkeypatch.setattr("framework.runner.actor_runtime.build_actor_env", _stop_after_weight_load)
+    monkeypatch.setattr("framework.runner.actor_runtime.torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(_StopAfterShard):
+        _actor_main_impl(
+            cfg,
+            actor_id=0,
+            gpu_id=None,
+            total_actors=1,
+            paths=paths,
+        )
+
+    assert ("loading_weights", 3, True) in beats
+    assert ("loaded_weights", 3, True) in beats
+
+
 def test_hugsim_single_env_actor_closes_session_between_shards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -161,6 +161,15 @@ def _inject_gt_reference_from_info(replay: Any, info: Any) -> None:
             pass
 
 
+def _emit_heartbeat(heartbeat_fn: Any | None, phase: str, step: int | None = None, *, force: bool = False) -> None:
+    if not callable(heartbeat_fn):
+        return
+    try:
+        heartbeat_fn(phase, step, force=bool(force))
+    except TypeError:
+        heartbeat_fn(phase, step)
+
+
 def collect_single_env_shard(
     *,
     env: Any,
@@ -198,8 +207,7 @@ def collect_single_env_shard(
     step_count = 0
     collect_t0 = time.perf_counter()
     while step_count < int(horizon):
-        if callable(heartbeat_fn):
-            heartbeat_fn("collect_single_step", step_count)
+        _emit_heartbeat(heartbeat_fn, "collect_single_step", step_count)
         obs_decision = obs
         step_timing: Dict[str, float] = {}
         obs_t: torch.Tensor | None = None
@@ -208,12 +216,16 @@ def collect_single_env_shard(
             obs_t = _default_obs_tensor(obs_decision)
             step_timing["obs_tensor_s"] = float(time.perf_counter() - t0)
         t0 = time.perf_counter()
+        _emit_heartbeat(heartbeat_fn, "act_start", step_count, force=True)
         action0, logp, replay = agent.act(obs_decision, eta=eta, mode_idx=mode_idx, mode_select=mode_select)
+        _emit_heartbeat(heartbeat_fn, "act_done", step_count, force=True)
         step_timing["act_s"] = float(time.perf_counter() - t0)
         _inject_gt_reference_from_info(replay, current_info)
         _inject_external_plan_single_env(env, replay)
         t0 = time.perf_counter()
+        _emit_heartbeat(heartbeat_fn, "env_step_start", step_count, force=True)
         obs, reward, terminated, truncated, _info = env.step(action0)
+        _emit_heartbeat(heartbeat_fn, "env_step_done", step_count, force=True)
         step_timing["env_step_s"] = float(time.perf_counter() - t0)
         step_timing.update(extract_env_timing(_info))
         done = bool(terminated or truncated)
@@ -238,7 +250,9 @@ def collect_single_env_shard(
         if done:
             counters["done_count"] += 1
             t0 = time.perf_counter()
+            _emit_heartbeat(heartbeat_fn, "env_reset_start", step_count, force=True)
             obs, _info = env.reset()
+            _emit_heartbeat(heartbeat_fn, "env_reset_done", step_count, force=True)
             step_timing["env_reset_s"] = float(time.perf_counter() - t0)
             counters["reset_count"] += 1
         current_info = _info

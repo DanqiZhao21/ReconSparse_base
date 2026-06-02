@@ -1,0 +1,1 @@
+[sweep] close_loop start 2026-06-01T16:25:08+00:00 config=/root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606011200_HUGSM_reinforcepp_closed_loop_reward-close_loop_NoGRPOCraft_substeps2.yaml algo_tag=hugsim_ori_reinforcepp_close_loop_nogrpo_substeps2

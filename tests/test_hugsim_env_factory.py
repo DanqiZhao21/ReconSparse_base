@@ -102,6 +102,7 @@ def test_build_actor_env_passes_hugsim_backend_without_recon_ckpt(monkeypatch, t
                 "launch_mode": "fifo",
                 "pixi_cmd": "pixi",
                 "fifo_timeout_s": 120.0,
+                "substeps_per_rl_step": 2,
                 "min_gt_route_points": 3,
             },
         },
@@ -115,7 +116,7 @@ def test_build_actor_env_passes_hugsim_backend_without_recon_ckpt(monkeypatch, t
     assert captured["hugsim_scenarios"] == [
         {"official_scene_name": "scene-0013", "scenario_path": str(scenario_dir / "scene-0013-easy-00.yaml")}
     ]
-    assert "substeps_per_rl_step" not in captured["hugsim_kwargs"]
+    assert captured["hugsim_kwargs"]["substeps_per_rl_step"] == 2
     assert captured["hugsim_kwargs"]["launch_mode"] == "fifo"
     assert captured["hugsim_kwargs"]["pixi_cmd"] == "pixi"
     assert captured["hugsim_kwargs"]["fifo_timeout_s"] == 120.0
@@ -213,3 +214,4 @@ def test_build_actor_env_defaults_hugsim_launch_mode_to_fifo(monkeypatch, tmp_pa
     env_factory.build_actor_env(cfg, cuda=0, actor_id=0, total_actors=1)
 
     assert captured["hugsim_kwargs"]["launch_mode"] == "fifo"
+    assert captured["hugsim_kwargs"]["substeps_per_rl_step"] == 2

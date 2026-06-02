@@ -148,7 +148,7 @@ def normalize_actor_learner_cfg(cfg: Dict[str, Any]) -> None:
             ids = _list_int(al_cfg.get("actor_gpu_ids", None))
             num_actors = int(len(ids)) if len(ids) > 0 else 1
             al_cfg["num_actors"] = int(num_actors)
-        per_actor_target = max(1, int(math.ceil(float(shards_per_update) / float(max(1, int(num_actors))))))
+        per_actor_target = max(1, int(math.ceil(float(shards_per_update)*2 / float(max(1, int(num_actors))))))
         env_batch = max(1, int(num_envs_per_actor))
         required = int(env_batch * math.ceil(float(per_actor_target) / float(env_batch)))
         cur = al_cfg.get("max_inflight_per_actor", None)

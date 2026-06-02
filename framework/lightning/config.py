@@ -120,6 +120,13 @@ def actor_learner_lightning_config_from_algorithm(
         if raw_actor_heartbeat_timeout_s is not None
         else (float(shard_collect_timeout_s) * 5.0 if float(shard_collect_timeout_s) > 0.0 else 0.0)
     )
+    mode = str(actor_learner_cfg.get("mode", "async")).strip().lower()
+    allow_partial_updates_after_timeout = bool(
+        actor_learner_cfg.get(
+            "allow_partial_updates_after_timeout",
+            bool(mode.startswith("async") and float(shard_collect_timeout_s) > 0.0),
+        )
+    )
     inner_epochs = int(
         getattr(
             algo,
@@ -167,13 +174,13 @@ def actor_learner_lightning_config_from_algorithm(
         minibatch_size=int(getattr(algo, "minibatch_size", train_cfg.get("minibatch_size", 64))),
         include_obs=bool(algo_kind.startswith("ppo") and not bool(algo_meta.get("critic_use_agent_features", False))),
         use_distributed_sampler=bool(getattr(algo, "use_distributed_sampler", True)),
-        mode=str(actor_learner_cfg.get("mode", "async")).strip().lower(),
+        mode=str(mode),
         num_actors=int(actor_learner_cfg.get("num_actors", 1)),
         shards_per_update=int(actor_learner_cfg.get("shards_per_update", actor_learner_cfg.get("num_actors", 1))),
         max_inflight_per_actor=int(actor_learner_cfg.get("max_inflight_per_actor", 1)),
         poll_s=float(actor_learner_cfg.get("poll_interval_s", 0.2)),
         shard_collect_timeout_s=float(shard_collect_timeout_s),
-        allow_partial_updates_after_timeout=bool(actor_learner_cfg.get("allow_partial_updates_after_timeout", False)),
+        allow_partial_updates_after_timeout=bool(allow_partial_updates_after_timeout),
         actor_heartbeat_timeout_s=float(actor_heartbeat_timeout_s),
         max_shard_version_lag=int(raw_max_shard_version_lag),
         norm_eps=float(algo_meta.get("rpp_norm_eps", 1e-8)),

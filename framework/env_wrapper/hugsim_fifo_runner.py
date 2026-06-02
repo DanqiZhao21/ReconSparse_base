@@ -33,9 +33,67 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kinematic_path", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--ad", default="sparsedrive_v2")
+    parser.add_argument("--substeps_per_rl_step", type=int, default=2)
     parser.add_argument("--fifo_timeout_s", type=float, default=300.0)
     parser.add_argument("--fifo_poll_interval_s", type=float, default=0.2)
     return parser
+
+
+def execute_control_substeps(
+    *,
+    env: Any,
+    plan: np.ndarray,
+    initial_info: dict[str, Any],
+    traj2control: Any,
+    substeps_per_rl_step: int,
+    status_fn: Any | None = None,
+) -> tuple[Any, float, bool, bool, dict[str, Any]]:
+    substeps = max(1, int(substeps_per_rl_step))
+    start_ts = _safe_float(initial_info.get("timestamp", None))
+    acc, steer_rate = traj2control(np.asarray(plan, dtype=np.float32), dict(initial_info))
+    action = {"acc": float(acc), "steer_rate": float(steer_rate)}
+
+    obs = None
+    info: dict[str, Any] = dict(initial_info)
+    total_reward = 0.0
+    terminated = False
+    truncated = False
+    executed = 0
+    substep_rewards: list[float] = []
+    for _idx in range(substeps):
+        if callable(status_fn):
+            status_fn(state="executing_substep", substep_idx=int(_idx), substeps_per_rl_step=int(substeps))
+        obs, reward, terminated, truncated, info = env.step(dict(action))
+        info = dict(info)
+        reward_f = float(reward)
+        total_reward += reward_f
+        substep_rewards.append(reward_f)
+        executed += 1
+        if callable(status_fn):
+            status_fn(
+                state="executed_substep",
+                substep_idx=int(_idx),
+                substeps_per_rl_step=int(substeps),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+            )
+        if bool(terminated or truncated):
+            break
+
+    end_ts = _safe_float(info.get("timestamp", None))
+    info["reward"] = float(total_reward)
+    info["terminated"] = bool(terminated)
+    info["truncated"] = bool(truncated)
+    info["hugsim_substeps_per_rl_step"] = int(substeps)
+    info["hugsim_executed_substeps"] = int(executed)
+    info["hugsim_substep_rewards"] = substep_rewards
+    if start_ts is not None:
+        info["hugsim_rl_step_start_timestamp"] = float(start_ts)
+    if end_ts is not None:
+        info["hugsim_rl_step_end_timestamp"] = float(end_ts)
+    if start_ts is not None and end_ts is not None:
+        info["hugsim_rl_step_delta_s"] = float(end_ts - start_ts)
+    return obs, float(total_reward), bool(terminated), bool(truncated), info
 
 
 def run_fifo_env(args: argparse.Namespace) -> None:
@@ -65,17 +123,29 @@ def run_fifo_env(args: argparse.Namespace) -> None:
             kinematic_path=str(args.kinematic_path),
             ad=str(args.ad),
         )
+        _write_status(output_dir, state="making_env", pid=os.getpid(), started_at=time.time())
         env = gymnasium.make("hugsim_env/HUGSim-v0", cfg=cfg, output=str(output_dir))
+        _write_status(output_dir, state="resetting", pid=os.getpid(), started_at=time.time())
         obs, info = env.reset()
-        _write_status(output_dir, state="running", pid=os.getpid(), started_at=time.time())
+        substeps = max(1, int(args.substeps_per_rl_step))
+        print(f"[hugsim_fifo_runner] substeps_per_rl_step={substeps}", flush=True)
+        _write_status(
+            output_dir,
+            state="running",
+            pid=os.getpid(),
+            started_at=time.time(),
+            substeps_per_rl_step=int(substeps),
+        )
 
         while True:
+            _write_status(output_dir, state="writing_obs", pid=os.getpid(), updated_at=time.time())
             write_fifo_payload(
                 obs_pipe,
                 (obs, info),
                 timeout_s=float(args.fifo_timeout_s),
                 poll_interval_s=float(args.fifo_poll_interval_s),
             )
+            _write_status(output_dir, state="waiting_plan", pid=os.getpid(), updated_at=time.time())
             plan = read_fifo_payload(
                 plan_pipe,
                 timeout_s=float(args.fifo_timeout_s),
@@ -85,14 +155,20 @@ def run_fifo_env(args: argparse.Namespace) -> None:
                 _write_status(output_dir, state="stopped", pid=os.getpid(), completed_at=time.time())
                 return
 
-            acc, steer_rate = traj2control(np.asarray(plan, dtype=np.float32), dict(info))
-            obs, reward, terminated, truncated, info = env.step(
-                {"acc": float(acc), "steer_rate": float(steer_rate)}
+            obs, reward, terminated, truncated, info = execute_control_substeps(
+                env=env,
+                plan=np.asarray(plan, dtype=np.float32),
+                initial_info=dict(info),
+                traj2control=traj2control,
+                substeps_per_rl_step=int(substeps),
+                status_fn=lambda **payload: _write_status(
+                    output_dir,
+                    pid=os.getpid(),
+                    updated_at=time.time(),
+                    **payload,
+                ),
             )
             info = dict(info)
-            info["reward"] = float(reward)
-            info["terminated"] = bool(terminated)
-            info["truncated"] = bool(truncated)
             if bool(terminated or truncated):
                 write_fifo_payload(
                     obs_pipe,
@@ -132,6 +208,13 @@ def main(argv: list[str] | None = None) -> None:
 def _write_status(output_dir: Path, **payload: Any) -> None:
     status_path = output_dir / "status.json"
     status_path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

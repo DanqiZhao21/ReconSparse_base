@@ -134,6 +134,7 @@ def build_actor_env(
             "hugsim_model_base": hugsim_cfg.get("model_base", None),
             "launch_mode": hugsim_cfg.get("launch_mode", "fifo"),
             "pixi_cmd": hugsim_cfg.get("pixi_cmd", "pixi"),
+            "substeps_per_rl_step": int(hugsim_cfg.get("substeps_per_rl_step", 2)),
             "fifo_timeout_s": float(hugsim_cfg.get("fifo_timeout_s", 300.0)),
             "fifo_poll_interval_s": float(hugsim_cfg.get("fifo_poll_interval_s", 0.2)),
             "min_gt_route_points": int(hugsim_cfg.get("min_gt_route_points", 2)),

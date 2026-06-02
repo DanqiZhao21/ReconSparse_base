@@ -18,11 +18,11 @@ from framework.io.buffer import (
     stop_requested,
     wait_for_version,
     write_actor_failure,
-    write_actor_heartbeat,
 )
 from framework.rollout import collect_single_env_shard, collect_vector_env_shards
 from framework.rollout.timing import format_rollout_timing_summary
 from framework.runner.agent_factory import build_agent
+from framework.runner.actor_heartbeat import PeriodicActorHeartbeat
 from framework.runner.config_normalization import resolve_learner_gpu_ids
 from framework.runner.env_factory import build_actor_env
 from framework.runner.logging import stage
@@ -190,32 +190,30 @@ def _actor_main_impl(
     pause_actor_on_learner_gpu = bool(al_cfg.get("pause_actor_on_learner_gpu", True))
     training_lock_file = os.path.join(paths.root, "TRAINING_LOCK")
 
-    last_heartbeat_t = 0.0
+    heartbeat_writer = PeriodicActorHeartbeat(
+        paths=paths,
+        actor_id=int(actor_id),
+        interval_s=float(heartbeat_interval_s),
+        stage_fn=stage,
+    )
 
     def heartbeat(phase: str, step: int | None = None, *, force: bool = False) -> None:
-        nonlocal last_heartbeat_t
-        if float(heartbeat_interval_s) <= 0.0:
-            return
-        now = time.time()
-        if not bool(force) and (now - float(last_heartbeat_t)) < float(heartbeat_interval_s):
-            return
-        last_heartbeat_t = float(now)
-        step_suffix = "" if step is None else f" step={int(step)}"
-        try:
-            write_actor_heartbeat(paths, int(actor_id), message=f"{str(phase)}{step_suffix}")
-        except Exception as exc:
-            stage(f"[actor{actor_id}] heartbeat write failed: {exc}")
+        heartbeat_writer.beat(phase, step, force=force)
 
+    heartbeat_writer.start()
     heartbeat("init", force=True)
     agent = build_agent(cfg, device=device)
     local_ver = 0
     v0 = read_int(paths.version_file, default=0)
     if v0 > 0 and os.path.exists(paths.latest_ckpt):
         try:
+            heartbeat("loading_weights", int(v0), force=True)
             agent.load_checkpoint(paths.latest_ckpt)
             local_ver = int(v0)
+            heartbeat("loaded_weights", int(local_ver), force=True)
             stage(f"[actor{actor_id}] loaded learner weights ver={local_ver}")
         except Exception as exc:
+            heartbeat("load_weights_failed", int(v0), force=True)
             stage(f"[actor{actor_id}] failed to load learner weights: {exc}")
 
     eta = float(train_cfg.get("eta", train_cfg.get("ddv2_eta", 1.0)))
@@ -266,10 +264,13 @@ def _actor_main_impl(
             cur_ver = read_int(paths.version_file, default=0)
             if cur_ver > local_ver and os.path.exists(paths.latest_ckpt):
                 try:
+                    heartbeat("loading_weights", int(cur_ver), force=True)
                     agent.load_checkpoint(paths.latest_ckpt)
                     local_ver = int(cur_ver)
+                    heartbeat("loaded_weights", int(local_ver), force=True)
                     stage(f"[actor{actor_id}] updated weights ver={local_ver}")
                 except Exception as exc:
+                    heartbeat("load_weights_failed", int(cur_ver), force=True)
                     stage(f"[actor{actor_id}] weight reload failed: {exc}")
 
             if obs is None:
@@ -366,10 +367,13 @@ def _actor_main_impl(
             cur_ver = read_int(paths.version_file, default=0)
             if cur_ver > local_ver and os.path.exists(paths.latest_ckpt):
                 try:
+                    heartbeat("loading_weights", int(cur_ver), force=True)
                     agent.load_checkpoint(paths.latest_ckpt)
                     local_ver = int(cur_ver)
+                    heartbeat("loaded_weights", int(local_ver), force=True)
                     stage(f"[actor{actor_id}] updated weights ver={local_ver}")
                 except Exception as exc:
+                    heartbeat("load_weights_failed", int(cur_ver), force=True)
                     stage(f"[actor{actor_id}] weight reload failed: {exc}")
 
             heartbeat("collect_vector_start", force=True)

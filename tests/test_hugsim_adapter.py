@@ -144,7 +144,11 @@ def test_hugsim_recon_env_reset_and_step(monkeypatch, tmp_path):
         monkeypatch,
         hugsim_adapter,
         image=image,
-        step_info=_fake_hugsim_info(0.5),
+        step_info={
+            **_fake_hugsim_info(0.5),
+            "hugsim_executed_substeps": 2,
+            "hugsim_rl_step_delta_s": 0.5,
+        },
     )
 
     env = hugsim_adapter.HUGSIMReconEnv(
@@ -161,9 +165,48 @@ def test_hugsim_recon_env_reset_and_step(monkeypatch, tmp_path):
 
     next_obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
     assert next_obs["frame_idx"] == np.int32(5)
+    assert next_obs["hugsim_step_idx"] == np.int32(2)
     assert info["scene_id"] == 12
     assert info["frame_idx"] == 5
     assert info["sample_token"] == "tok1"
+    assert info["hugsim_executed_substeps"] == 2
+    assert info["hugsim_rl_step_delta_s"] == 0.5
+
+
+def test_hugsim_recon_env_passes_fifo_substeps_to_client(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+    calls = _install_fake_fifo_client(
+        monkeypatch,
+        hugsim_adapter,
+        image=image,
+        step_info=_fake_hugsim_info(0.5),
+    )
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok0",
+                frame_idx=0,
+                sample_index=0,
+                sample_relative_time_s=0.0,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={},
+        output_root=tmp_path,
+        substeps_per_rl_step=2,
+    )
+
+    init_kwargs = next(call[1] for call in calls if call[0] == "client_init")
+    assert init_kwargs["substeps_per_rl_step"] == 2
 
 
 def test_hugsim_reward_proxy_loads_recon_expert_trajectory(tmp_path):

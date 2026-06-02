@@ -69,6 +69,71 @@ def test_hugsim_fifo_runner_parser_has_required_args():
     )
 
     assert args.ad == "sparsedrive_v2"
+    assert args.substeps_per_rl_step == 2
+
+
+def test_hugsim_fifo_runner_executes_configured_substeps():
+    from framework.env_wrapper.hugsim_fifo_runner import execute_control_substeps
+
+    calls = []
+
+    class FakeEnv:
+        def step(self, action):
+            calls.append(dict(action))
+            info = {"timestamp": 0.25 * len(calls)}
+            return {"obs": len(calls)}, 1.5, False, False, info
+
+    def fake_traj2control(plan, info):
+        assert info["timestamp"] == 0.0
+        return 2.0, 0.25
+
+    obs, reward, terminated, truncated, info = execute_control_substeps(
+        env=FakeEnv(),
+        plan=np.zeros((8, 2), dtype=np.float32),
+        initial_info={"timestamp": 0.0},
+        traj2control=fake_traj2control,
+        substeps_per_rl_step=2,
+    )
+
+    assert obs == {"obs": 2}
+    assert reward == 3.0
+    assert not terminated
+    assert not truncated
+    assert calls == [{"acc": 2.0, "steer_rate": 0.25}, {"acc": 2.0, "steer_rate": 0.25}]
+    assert info["hugsim_substeps_per_rl_step"] == 2
+    assert info["hugsim_executed_substeps"] == 2
+    assert info["hugsim_rl_step_delta_s"] == 0.5
+
+
+def test_hugsim_fifo_runner_reports_substep_status():
+    from framework.env_wrapper.hugsim_fifo_runner import execute_control_substeps
+
+    statuses = []
+
+    class FakeEnv:
+        def step(self, action):
+            step_idx = len([s for s in statuses if s["state"] == "executing_substep"])
+            info = {"timestamp": 0.25 * step_idx}
+            return {"obs": step_idx}, 1.0, False, False, info
+
+    def fake_traj2control(plan, info):
+        return 0.0, 0.0
+
+    execute_control_substeps(
+        env=FakeEnv(),
+        plan=np.zeros((8, 2), dtype=np.float32),
+        initial_info={"timestamp": 0.0},
+        traj2control=fake_traj2control,
+        substeps_per_rl_step=2,
+        status_fn=lambda **payload: statuses.append(dict(payload)),
+    )
+
+    assert statuses == [
+        {"state": "executing_substep", "substep_idx": 0, "substeps_per_rl_step": 2},
+        {"state": "executed_substep", "substep_idx": 0, "substeps_per_rl_step": 2, "terminated": False, "truncated": False},
+        {"state": "executing_substep", "substep_idx": 1, "substeps_per_rl_step": 2},
+        {"state": "executed_substep", "substep_idx": 1, "substeps_per_rl_step": 2, "terminated": False, "truncated": False},
+    ]
 
 
 def test_hugsim_fifo_runner_adds_hugsim_cwd_to_sys_path(monkeypatch, tmp_path: Path):
@@ -120,6 +185,7 @@ def test_hugsim_fifo_client_launches_pixi_runner(monkeypatch, tmp_path: Path):
         kinematic_path="/tmp/kinematic.yaml",
         output_dir=tmp_path,
         pixi_cmd="pixi",
+        substeps_per_rl_step=2,
         cuda=1,
     )
     client.start()
@@ -130,6 +196,8 @@ def test_hugsim_fifo_client_launches_pixi_runner(monkeypatch, tmp_path: Path):
     assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     output_idx = launched["cmd"].index("--output_dir") + 1
     assert Path(launched["cmd"][output_idx]).is_absolute()
+    substeps_idx = launched["cmd"].index("--substeps_per_rl_step") + 1
+    assert launched["cmd"][substeps_idx] == "2"
     assert Path(launched["stdout"].name).name == "hugsim_fifo_runner.log"
     assert launched["stdout"].closed
     assert launched["stderr"] == subprocess.STDOUT

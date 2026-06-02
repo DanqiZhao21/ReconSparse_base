@@ -1,0 +1,3 @@
+[sweep] step_path start 2026-06-01T23:31:39+00:00 config=/root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606011200_HUGSM_reinforcepp_closed_loop_reward-step_path_NoGRPOCraft_substeps2.yaml algo_tag=hugsim_ori_reinforcepp_step_path_nogrpo_substeps2
+[sweep] step_path pipeline rc=0 2026-06-02T03:05:15+00:00
+[sweep] step_path done 2026-06-02T03:05:15+00:00

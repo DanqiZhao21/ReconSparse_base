@@ -491,6 +491,7 @@ class HUGSIMFifoClient:
         pixi_cmd: str = "pixi",
         runner_path: str | Path = FIFO_RUNNER_DEFAULT,
         ad: str = "sparsedrive_v2",
+        substeps_per_rl_step: int = 2,
         fifo_timeout_s: float = 300.0,
         fifo_poll_interval_s: float = 0.2,
         cuda: int | None = None,
@@ -517,6 +518,7 @@ class HUGSIMFifoClient:
         self.pixi_cmd = str(pixi_cmd)
         self.runner_path = str(runner_path)
         self.ad = str(ad)
+        self.substeps_per_rl_step = max(1, int(substeps_per_rl_step))
         self.fifo_timeout_s = float(fifo_timeout_s)
         self.fifo_poll_interval_s = float(fifo_poll_interval_s)
         self.cuda = None if cuda is None else int(cuda)
@@ -547,6 +549,8 @@ class HUGSIMFifoClient:
             str(self.output_dir),
             "--ad",
             self.ad,
+            "--substeps_per_rl_step",
+            str(self.substeps_per_rl_step),
             "--fifo_timeout_s",
             str(self.fifo_timeout_s),
             "--fifo_poll_interval_s",
@@ -670,6 +674,7 @@ class HUGSIMReconEnv:
         fifo_timeout_s: float = 300.0,
         fifo_poll_interval_s: float = 0.2,
         fifo_runner_path: str | Path = FIFO_RUNNER_DEFAULT,
+        substeps_per_rl_step: int = 2,
         cuda: int | None = None,
         min_gt_route_points: int = 2,
     ) -> None:
@@ -679,6 +684,7 @@ class HUGSIMReconEnv:
         self.raw_reward_cfg = reward_cfg or {}
         self.reward_cfg = select_reward_mode_cfg(self.raw_reward_cfg)
         self.hugsim_repo = str(hugsim_repo)
+        self.substeps_per_rl_step = max(1, int(substeps_per_rl_step))
         self.launch_mode = str(launch_mode).strip().lower()
         if self.launch_mode != "fifo":
             raise ValueError(f"Unsupported HUGSIM launch_mode: {launch_mode!r}; only 'fifo' is supported")
@@ -712,6 +718,7 @@ class HUGSIMReconEnv:
             output_dir=output_dir,
             pixi_cmd=pixi_cmd,
             runner_path=fifo_runner_path,
+            substeps_per_rl_step=self.substeps_per_rl_step,
             fifo_timeout_s=fifo_timeout_s,
             fifo_poll_interval_s=fifo_poll_interval_s,
             cuda=cuda,
@@ -1021,7 +1028,11 @@ class HUGSIMReconEnv:
             raise RuntimeError("HUGSIMReconEnv.step called before reset")
         plan_traj = self._plan_from_action(action)
         hugsim_obs, base_reward, terminated, truncated, hugsim_info = self.env.step(plan_traj)
-        self._hugsim_step_idx += 1
+        try:
+            executed_substeps = int(dict(hugsim_info).get("hugsim_executed_substeps", 1))
+        except Exception:
+            executed_substeps = 1
+        self._hugsim_step_idx += max(1, int(executed_substeps))
         self._last_hugsim_obs = hugsim_obs
         self._last_hugsim_info = hugsim_info
         mapping = self.scene_index.map_time(self.official_scene_name, float(hugsim_info.get("timestamp", 0.0)))
@@ -1041,6 +1052,16 @@ class HUGSIMReconEnv:
             "hugsim_base_reward": float(base_reward),
             "official_scene_name": str(mapping.official_scene_name),
         }
+        for key in (
+            "hugsim_substeps_per_rl_step",
+            "hugsim_executed_substeps",
+            "hugsim_substep_rewards",
+            "hugsim_rl_step_start_timestamp",
+            "hugsim_rl_step_end_timestamp",
+            "hugsim_rl_step_delta_s",
+        ):
+            if key in hugsim_info:
+                info[key] = hugsim_info[key]
         info = _augment_hugsim_reward_info(
             info=info,
             hugsim_info=dict(hugsim_info),
