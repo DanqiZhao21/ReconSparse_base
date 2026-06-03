@@ -21,6 +21,19 @@ def _write_dummy_shard(path: Path) -> None:
     torch.save({"replay": [{"ok": True}]}, path)
 
 
+def _write_sized_shard(path: Path, num_steps: int) -> None:
+    steps = max(1, int(num_steps))
+    torch.save(
+        {
+            "reward": torch.ones(steps),
+            "done": torch.zeros(steps),
+            "old_logp": torch.zeros(steps),
+            "replay": [{"step": idx} for idx in range(steps)],
+        },
+        path,
+    )
+
+
 def _build_learner_config() -> ActorLearnerLightningConfig:
     return ActorLearnerLightningConfig(
         algo_kind="ppo",
@@ -112,6 +125,54 @@ def test_async_collection_marks_stale_actor_heartbeat_failed(
     monkeypatch.setattr(
         "framework.lightning.actor_learner_datamodule.time.sleep",
         lambda _seconds: (_ for _ in ()).throw(AssertionError("learner should not wait after stale actor is failed")),
+    )
+
+    selected = learner._select_shards()
+
+    assert len(selected) == 20
+    assert (Path(paths.actors_dir) / "actor4.failed").exists()
+
+
+def test_async_collection_marks_actor_failed_after_shard_stall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BufferPaths(root=str(tmp_path / "buffer_root"))
+    ensure_buffer_layout(paths)
+    for actor_id in [0, 1, 2, 3, 5]:
+        for shard_idx in range(4):
+            name = f"actor{actor_id}_e0_v34_t{1700 + actor_id * 10 + shard_idx}_full{shard_idx}.pt"
+            _write_dummy_shard(Path(paths.shards_dir) / name)
+    stalled_shard = Path(paths.shards_dir) / "actor4_e0_v34_t1750_stalled.pt"
+    _write_dummy_shard(stalled_shard)
+    os.utime(stalled_shard, (100.0, 100.0))
+    buffer_io.write_actor_heartbeat(paths, actor_id=4, message="collecting")
+
+    Path(paths.version_file).write_text("34", encoding="utf-8")
+    learner_config = ActorLearnerLightningConfig(
+        **{
+            **_build_learner_config().__dict__,
+            "actor_shard_stall_timeout_s": 10.0,
+        }
+    )
+    learner = ActorLearnerUpdateDataModule(
+        paths=paths,
+        agent=_DummyAgent(),
+        learner_config=learner_config,
+        device=torch.device("cpu"),
+        value_net=None,
+        ddp_enabled=False,
+        dist_module=None,
+        world_size=1,
+        rank=0,
+        stage_fn=lambda *_args, **_kwargs: None,
+        start_version=34,
+    )
+
+    monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.time", lambda: 200.0)
+    monkeypatch.setattr(
+        "framework.lightning.actor_learner_datamodule.time.sleep",
+        lambda _seconds: (_ for _ in ()).throw(AssertionError("learner should not wait after shard stall")),
     )
 
     selected = learner._select_shards()
@@ -235,6 +296,53 @@ def test_async_collection_can_temporarily_shrink_after_timeout_when_partial_upda
 
     assert len(selected_second) == 24
     assert sum("actor2_" in item for item in selected_second) == 4
+
+
+def test_async_collection_can_wait_for_sample_target_with_variable_shards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BufferPaths(root=str(tmp_path / "buffer_root"))
+    ensure_buffer_layout(paths)
+    for idx, steps in enumerate([2, 3, 4]):
+        _write_sized_shard(Path(paths.shards_dir) / f"actor{idx}_e0_v34_t{5000 + idx}_short.pt", steps)
+
+    learner_config = ActorLearnerLightningConfig(
+        **{
+            **_build_learner_config().__dict__,
+            "num_actors": 4,
+            "shards_per_update": 4,
+            "samples_per_update": 10,
+        }
+    )
+    Path(paths.version_file).write_text("34", encoding="utf-8")
+
+    learner = ActorLearnerUpdateDataModule(
+        paths=paths,
+        agent=_DummyAgent(),
+        learner_config=learner_config,
+        device=torch.device("cpu"),
+        value_net=None,
+        ddp_enabled=False,
+        dist_module=None,
+        world_size=1,
+        rank=0,
+        stage_fn=lambda *_args, **_kwargs: None,
+        start_version=34,
+    )
+
+    sleep_count = {"value": 0}
+
+    def _fake_sleep(_seconds: float) -> None:
+        sleep_count["value"] += 1
+        _write_sized_shard(Path(paths.shards_dir) / "actor3_e0_v34_t5010_late.pt", 1)
+
+    monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.sleep", _fake_sleep)
+
+    selected = learner._select_shards()
+
+    assert sleep_count["value"] == 1
+    assert len(selected) == 4
 
 
 def test_resolve_sample_token_uses_scene_and_frame_assets() -> None:

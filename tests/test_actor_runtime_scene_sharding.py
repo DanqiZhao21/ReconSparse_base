@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from framework.io.buffer import BufferPaths, ensure_buffer_layout
-from framework.runner.actor_runtime import _actor_main_impl
+from framework.runner.actor_runtime import _actor_main_impl, _shard_num_steps
 
 
 class _StopVectorActor(RuntimeError):
@@ -74,6 +74,16 @@ def _fake_shard() -> dict:
         "replay": [{}],
         "meta": {"timing": {}},
     }
+
+
+def test_shard_num_steps_prefers_actual_meta_count() -> None:
+    shard = {
+        "reward": torch.zeros(32),
+        "replay": [{} for _ in range(32)],
+        "meta": {"num_steps": 8},
+    }
+
+    assert _shard_num_steps(shard, default=32) == 8
 
 
 def test_vector_actor_env_builds_receive_total_actors(

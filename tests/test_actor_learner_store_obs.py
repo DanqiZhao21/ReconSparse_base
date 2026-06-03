@@ -145,6 +145,49 @@ def test_collect_single_env_shard_injects_current_gt_reference_info() -> None:
     assert shard["replay"][1]["gt_frame_idx_override"] == 11
 
 
+def test_collect_single_env_shard_can_end_on_done_without_resetting() -> None:
+    class DoneEnv:
+        def __init__(self) -> None:
+            self.step_count = 0
+            self.reset_count = 0
+
+        def step(self, action: Any):
+            del action
+            self.step_count += 1
+            done = self.step_count == 2
+            return _obs(self.step_count), 1.0, done, False, {"step": self.step_count}
+
+        def reset(self):
+            self.reset_count += 1
+            return _obs(100 + self.reset_count), {"reset": self.reset_count}
+
+    env = DoneEnv()
+
+    shard, next_obs, info = collect_single_env_shard(
+        env=env,
+        agent=_TinyAgent(),
+        obs=_obs(0),
+        horizon=4,
+        eta=1.0,
+        mode_idx=-1,
+        mode_select="sample",
+        actor_id=0,
+        local_ver=1,
+        shard_idx=0,
+        store_obs=False,
+        return_info=True,
+        end_shard_on_done=True,
+    )
+
+    assert env.reset_count == 0
+    assert shard["reward"].shape == (2,)
+    assert shard["done"].tolist() == [0.0, 1.0]
+    assert shard["meta"]["num_steps"] == 2
+    assert shard["meta"]["needs_reset_after"] is True
+    assert next_obs is None
+    assert info == {"step": 2}
+
+
 def test_collect_vector_env_shards_injects_current_gt_reference_info() -> None:
     class VecEnvWithGtInfo:
         def __init__(self) -> None:

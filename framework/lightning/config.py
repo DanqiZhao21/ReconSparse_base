@@ -49,17 +49,21 @@ class ActorLearnerLightningConfig:
     mode: str = "async"
     num_actors: int = 1
     shards_per_update: int = 1
+    samples_per_update: int = 0
     max_inflight_per_actor: int = 1
     poll_s: float = 0.2
     shard_collect_timeout_s: float = 0.0
     allow_partial_updates_after_timeout: bool = False
     actor_heartbeat_timeout_s: float = 0.0
+    actor_shard_stall_timeout_s: float = 0.0
     max_shard_version_lag: int = 2
     norm_eps: float = 1e-8
     inner_epochs: int = 1
     accumulate_grad_batches: int = 1
     gradient_clip_val: float = 0.0
     max_updates: int = 0
+    wandb_log_minibatch_metrics: bool = False
+    wandb_log_legacy_raw_metrics: bool = False
 
 
 def optimizer_config_from_algorithm(algo: Any, train_cfg: Dict[str, Any]) -> LearnerOptimizerConfig:
@@ -113,6 +117,9 @@ def actor_learner_lightning_config_from_algorithm(
     grpo_cfg = resolve_grpo_config(train_cfg)
     raw_max_shard_version_lag = actor_learner_cfg.get("max_shard_version_lag", 2)
     raw_max_updates = actor_learner_cfg.get("max_updates", train_cfg.get("updates", 50))
+    wandb_cfg = train_cfg.get("wandb", {}) or {}
+    if not isinstance(wandb_cfg, dict):
+        wandb_cfg = {}
     shard_collect_timeout_s = float(actor_learner_cfg.get("shard_collect_timeout_s", 0.0) or 0.0)
     raw_actor_heartbeat_timeout_s = actor_learner_cfg.get("actor_heartbeat_timeout_s", None)
     actor_heartbeat_timeout_s = (
@@ -177,11 +184,13 @@ def actor_learner_lightning_config_from_algorithm(
         mode=str(mode),
         num_actors=int(actor_learner_cfg.get("num_actors", 1)),
         shards_per_update=int(actor_learner_cfg.get("shards_per_update", actor_learner_cfg.get("num_actors", 1))),
+        samples_per_update=int(actor_learner_cfg.get("samples_per_update", 0) or 0),
         max_inflight_per_actor=int(actor_learner_cfg.get("max_inflight_per_actor", 1)),
         poll_s=float(actor_learner_cfg.get("poll_interval_s", 0.2)),
         shard_collect_timeout_s=float(shard_collect_timeout_s),
         allow_partial_updates_after_timeout=bool(allow_partial_updates_after_timeout),
         actor_heartbeat_timeout_s=float(actor_heartbeat_timeout_s),
+        actor_shard_stall_timeout_s=float(actor_learner_cfg.get("actor_shard_stall_timeout_s", 0.0) or 0.0),
         max_shard_version_lag=int(raw_max_shard_version_lag),
         norm_eps=float(algo_meta.get("rpp_norm_eps", 1e-8)),
         inner_epochs=max(1, int(inner_epochs)),
@@ -190,6 +199,8 @@ def actor_learner_lightning_config_from_algorithm(
         ),
         gradient_clip_val=float(getattr(algo, "max_grad_norm", train_cfg.get("max_grad_norm", 0.0))),
         max_updates=int(raw_max_updates or 0),
+        wandb_log_minibatch_metrics=bool(wandb_cfg.get("log_minibatch_metrics", False)),
+        wandb_log_legacy_raw_metrics=bool(wandb_cfg.get("log_legacy_raw_metrics", False)),
     )
 
 

@@ -254,7 +254,8 @@ train:
     - 6
     - 7
     actors_per_gpu: 4
-    auto_max_inflight_per_actor: true
+    auto_max_inflight_per_actor: false
+    max_inflight_per_actor: 2
     pause_actor_on_learner_gpu: true
     scene_shard_by_actor: true
     scene_shard_strategy: round_robin
@@ -262,7 +263,9 @@ train:
     num_envs_per_actor: 1
     vec_env_mode: serial
     max_shard_version_lag: 2
-    shards_per_update: 24
+    variable_shard_on_done: true
+    samples_per_update: 768
+    shards_per_update: 48
     poll_interval_s: 0.1
     shard_collect_timeout_s: 240
     allow_partial_updates_after_timeout: true

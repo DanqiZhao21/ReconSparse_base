@@ -39,44 +39,44 @@ env:
       CRAFT:
         enable: true
         real_reward_model: close loop
-        off_global_route_threshold_m: 6.0
+        off_global_route_threshold_m: 3.0
         lateral_safe_m: 0.2
-        lateral_max_m: 3.0
+        lateral_max_m: 2.8
         heading_max_deg: 60.0
         progress_weight: 5.0
         progress_max_m: 1.2
         progress_min_m: 0.0
-        w_g: 3.0
-        w_c: 0.8
-        w_h: 2.0
-        efficiency_floor: 0.0
-        ddev_clip: 0.1
-        k_g: 0.4
-        k_c: 0.2
-        k_h: 0.4
-        correction_apply_thresh_global: 0.08
-        correction_apply_thresh_center: 0.08
-        correction_apply_thresh_heading: 0.08
-        correction_clip: 0.5
-        cost_off_road: 1.5
-        cost_opposite_lane: 0.1
-        cost_off_global_route: 1.5
-        cost_emergency_lane: 1.0
-        cost_red_light: 40.0
-        cost_stop_sign: 40.0
-        term_collision: 40.0
+        w_g: 3.5
+        w_c: 0.6
+        w_h: 2.2
+        efficiency_floor: 0.08
+        ddev_clip: 0.2
+        k_g: 0.5
+        k_c: 0.25
+        k_h: 0.45
+        correction_apply_thresh_global: 0.04
+        correction_apply_thresh_center: 0.04
+        correction_apply_thresh_heading: 0.04
+        correction_clip: 0.45
+        cost_off_road: 8.0
+        cost_opposite_lane: 2.0
+        cost_off_global_route: 6.0
+        cost_emergency_lane: 4.0
+        cost_red_light: 12.0
+        cost_stop_sign: 12.0
+        term_collision: 45.0
         collision_cost_static: null
         collision_cost_dynamic: null
-        severe_lateral_error_m: null
-        severe_lateral_cost: 0.0
-        severe_heading_error_deg: null
-        severe_heading_cost: 0.0
-        term_route_dev: 40.0
-        reward_completed: 0.0
+        severe_lateral_error_m: 4.0
+        severe_lateral_cost: 8.0
+        severe_heading_error_deg: 70.0
+        severe_heading_cost: 4.0
+        term_route_dev: 45.0
+        reward_completed: 6.0
         map:
           center_dev_max_m: 2.0
           heading_dev_max_deg: 90.0
-          off_global_route_threshold_m: 6.0
+          off_global_route_threshold_m: 3.0
           reverse_dot_threshold: -0.5
           same_dir_dot_threshold: 0.2
           same_dir_distance_margin_m: 0.75
@@ -229,7 +229,7 @@ train:
   wandb:
     enabled: true
     project: ReconDiff
-    group: HUGSIM_CloseLoop_NoGRPOCraft_Substeps1
+    group: HUGSIM_RewardPDMSafety_NoGRPOCraft_Substeps1
   algo: reinforcepp
   eta: 1.0
   mode_idx: -1
@@ -240,7 +240,7 @@ train:
   clip_eps: 0.2
   actor_learner:
     mode: async
-    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_CloseLoop_NoGRPOCraft_Substeps2
+    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_RewardPDMSafety_NoGRPOCraft_Substeps1
     timestamp_buffer_dir: true
     learner_gpu_id: 0
     learner_gpu_ids:
@@ -255,7 +255,7 @@ train:
     - 7
     actors_per_gpu: 4
     auto_max_inflight_per_actor: false
-    max_inflight_per_actor: 2
+    max_inflight_per_actor: 3
     pause_actor_on_learner_gpu: true
     scene_shard_by_actor: true
     scene_shard_strategy: round_robin
@@ -268,7 +268,10 @@ train:
     shards_per_update: 48
     poll_interval_s: 0.1
     shard_collect_timeout_s: 240
+    actor_shard_stall_timeout_s: 900
     allow_partial_updates_after_timeout: true
+    restart_failed_actors: true
+    max_actor_restarts: 2
     max_updates: 32
   minibatch_size: 4
   gamma: 0.99
@@ -286,7 +289,7 @@ train:
     use_rank_adv: false
     score_clip: null
     debug_visualize: false
-    debug_dir: outputs/visualize/HUGSIM_CloseLoop_NoGRPOCraft_Substeps2
+    debug_dir: outputs/visualize/HUGSIM_RewardPDMSafety_NoGRPOCraft_Substeps1
     debug_max_batches: 24
     debug_top_k: 8
   reinforcepp:
@@ -309,28 +312,28 @@ agent:
     ea_gate_enabled: false
     driving_direction_gate_enabled: false
     center_dev_max_m: 2.0
-    heading_dev_max_deg: 90.0
-    off_global_route_threshold_m: 6.0
+    heading_dev_max_deg: 75.0
+    off_global_route_threshold_m: 3.0
     carl:
       dp_min: 0.0
       dp_max: 1.2
       w_prog: 8.0
-      w_g: 3.0
-      w_c: 0.8
-      w_h: 2.0
-      efficiency_floor: 0.0
-      ddev_clip: 0.1
-      k_g: 0.4
-      k_c: 0.2
-      k_h: 0.4
-      correction_apply_thresh_global: 0.08
-      correction_apply_thresh_center: 0.08
+      w_g: 3.5
+      w_c: 0.6
+      w_h: 2.2
+      efficiency_floor: 0.08
+      ddev_clip: 0.2
+      k_g: 0.5
+      k_c: 0.25
+      k_h: 0.45
+      correction_apply_thresh_global: 0.04
+      correction_apply_thresh_center: 0.04
       corr_clip: 0.5
-      cost_off_road: 5.0
-      cost_opposite_lane: 0.1
-      cost_off_global_route: 4.0
-      cost_emergency_lane: 1.0
-      term_collision: 40.0
-      term_route_dev: 40.0
-      term_red_light: 40.0
-      term_stop_sign: 40.0
+      cost_off_road: 8.0
+      cost_opposite_lane: 2.0
+      cost_off_global_route: 6.0
+      cost_emergency_lane: 4.0
+      term_collision: 45.0
+      term_route_dev: 45.0
+      term_red_light: 12.0
+      term_stop_sign: 12.0

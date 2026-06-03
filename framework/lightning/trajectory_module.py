@@ -317,39 +317,56 @@ class TrajectoryLightningModule(L.LightningModule):
     ) -> None:
         if not bool(getattr(self, "wandb_enabled", False)) or wandb is None:
             return
+        if not bool(getattr(self.learner_config, "wandb_log_minibatch_metrics", False)):
+            return
 
         seen_step = int(getattr(self, "global_train_seen_sample_step", 0)) + int(max(1, int(batch_size)))
         setattr(self, "global_train_seen_sample_step", int(seen_step))
 
         payload: Dict[str, float | int] = {
-            "global_train_seen_sample_step": int(seen_step),
-            "ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
-            "ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
-            "adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,
-            "seen_batch_size": int(batch_size),
+            "debug/train_seen_samples": int(seen_step),
+            "debug/minibatch/ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
+            "debug/minibatch/ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
+            "debug/minibatch/adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,
+            "debug/minibatch/seen_batch_size": int(batch_size),
         }
         update_fn = getattr(self, "_update_index", None)
         if callable(update_fn):
             try:
-                payload["update"] = int(update_fn())
+                payload["progress/update"] = int(update_fn())
             except Exception:
                 pass
-        trainer = getattr(self, "trainer", None)
+        trainer = None
+        try:
+            trainer = getattr(self, "trainer", None)
+        except RuntimeError:
+            trainer = None
         if trainer is not None:
             try:
-                payload["global_step"] = int(getattr(trainer, "global_step"))
+                payload["debug/lightning_global_step"] = int(getattr(trainer, "global_step"))
             except Exception:
                 pass
 
         for key, value in metrics.items():
             try:
-                payload[f"train_seen_samples/{key}"] = float(value.detach().cpu().item())
+                payload[f"debug/minibatch/{key}"] = float(value.detach().cpu().item())
             except Exception:
                 continue
-        payload["train_seen_samples/ret_mean"] = float(payload["ret_mean"])
-        payload["train_seen_samples/ret_std"] = float(payload["ret_std"])
-        payload["train_seen_samples/adv_std"] = float(payload["adv_std"])
-        payload["train_seen_samples/seen_batch_size"] = float(payload["seen_batch_size"])
+        if bool(getattr(self.learner_config, "wandb_log_legacy_raw_metrics", False)):
+            payload["global_train_seen_sample_step"] = int(seen_step)
+            payload["ret_mean"] = float(payload["debug/minibatch/ret_mean"])
+            payload["ret_std"] = float(payload["debug/minibatch/ret_std"])
+            payload["adv_std"] = float(payload["debug/minibatch/adv_std"])
+            payload["seen_batch_size"] = int(batch_size)
+            for key, value in metrics.items():
+                try:
+                    payload[f"train_seen_samples/{key}"] = float(value.detach().cpu().item())
+                except Exception:
+                    continue
+            payload["train_seen_samples/ret_mean"] = float(payload["debug/minibatch/ret_mean"])
+            payload["train_seen_samples/ret_std"] = float(payload["debug/minibatch/ret_std"])
+            payload["train_seen_samples/adv_std"] = float(payload["debug/minibatch/adv_std"])
+            payload["train_seen_samples/seen_batch_size"] = float(batch_size)
         try:
             wandb.log(payload)
         except Exception:

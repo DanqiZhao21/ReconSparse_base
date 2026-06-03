@@ -12,9 +12,9 @@ CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_
   --mode-select sample
   
 CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_grpo_hugsim_online.py \
-  --config script/configs/sparsedrive_v2/202605280811_HUGSM_reinforcepp_closed_loop_Noclose_GRPOCrafty.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606021200_HUGSM_reinforcepp_closed_loop_reward-progress_hd_GRPOCraft_substeps1.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
-  --scenario-path /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0166-medium-00.yaml \
+  --scenario-path /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0411-medium-00.yaml \
   --max-steps 42 \
   --num-candidates 64 \
   --top-k 3 \

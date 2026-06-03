@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import ctypes
 import os
+import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from framework.io.buffer import BufferPaths, actor_failure_flag_path, ensure_buffer_layout, write_actor_failure
+from framework.io.buffer import (
+    BufferPaths,
+    actor_failure_flag_path,
+    ensure_buffer_layout,
+    list_failed_actor_ids,
+    write_actor_failure,
+)
 from framework.runner.config_normalization import resolve_actor_gpu_ids, resolve_learner_gpu_ids
 from framework.runner.launch_env import build_launch_env
 from framework.runner.logging import stage
@@ -20,6 +28,40 @@ def _write_text(path: str, text: str) -> None:
     os.makedirs(directory, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
+
+
+def _set_parent_death_signal(*, parent_pid: int, sig: int = signal.SIGTERM) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = getattr(libc, "prctl")
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        if int(prctl(1, int(sig), 0, 0, 0)) != 0:
+            return
+        if os.getppid() != int(parent_pid):
+            os.kill(os.getpid(), int(sig))
+    except Exception:
+        return
+
+
+def _make_worker_preexec(parent_pid: int) -> Any:
+    def _worker_preexec() -> None:
+        try:
+            os.setpgrp()
+        except Exception:
+            pass
+        _set_parent_death_signal(parent_pid=int(parent_pid), sig=signal.SIGTERM)
+
+    return _worker_preexec
+
+
+def _launch_worker(cmd: List[str], *, env: Dict[str, str]) -> subprocess.Popen:
+    kwargs: Dict[str, Any] = {"env": env}
+    if os.name == "posix":
+        kwargs["preexec_fn"] = _make_worker_preexec(os.getpid())
+    return subprocess.Popen(cmd, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -63,6 +105,70 @@ def build_learner_launch_specs(
     return specs
 
 
+def _build_actor_launch(
+    *,
+    python_executable: str,
+    entry: str,
+    config_path: str,
+    actor_id: int,
+    gpu_id: int,
+    num_actors: int,
+    base_env: Dict[str, str],
+) -> tuple[List[str], Dict[str, str]]:
+    actor_cmd = [
+        python_executable,
+        entry,
+        "--config",
+        str(config_path),
+        "--role",
+        "actor",
+        "--actor-id",
+        str(int(actor_id)),
+        "--gpu-id",
+        str(int(gpu_id)),
+        "--num-actors",
+        str(int(num_actors)),
+    ]
+    actor_env = dict(base_env)
+    actor_env.setdefault("LOCAL_RANK", str(int(gpu_id if gpu_id >= 0 else 0)))
+    return actor_cmd, actor_env
+
+
+def _terminate_process(proc: subprocess.Popen, *, timeout_s: float) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+
+    pid = getattr(proc, "pid", None)
+    signaled_group = False
+    try:
+        if os.name == "posix" and pid is not None:
+            try:
+                os.killpg(int(pid), signal.SIGTERM)
+                signaled_group = True
+            except Exception:
+                proc.terminate()
+        else:
+            proc.terminate()
+        proc.wait(timeout=float(timeout_s))
+        return
+    except Exception:
+        pass
+    try:
+        if os.name == "posix" and pid is not None:
+            try:
+                os.killpg(int(pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+        elif not signaled_group:
+            proc.kill()
+        proc.wait(timeout=max(1.0, min(5.0, float(timeout_s))))
+    except Exception:
+        pass
+
+
 def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) -> None:
     train_cfg = cfg.get("train", {}) or {}
     al_cfg = train_cfg.get("actor_learner", {}) or {}
@@ -74,6 +180,8 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
     learner_gpu_ids = resolve_learner_gpu_ids(al_cfg)
     learner_gpu_id = int(learner_gpu_ids[0])
     paths = BufferPaths(root=str(al_cfg.get("buffer_dir", "outputs/actor_learner")))
+    restart_failed_actors = bool(al_cfg.get("restart_failed_actors", False))
+    max_actor_restarts = int(al_cfg.get("max_actor_restarts", 1 if restart_failed_actors else 0) or 0)
     ensure_buffer_layout(paths)
     training_lock_file = os.path.join(paths.root, "TRAINING_LOCK")
     for path in [paths.stop_file, training_lock_file]:
@@ -101,29 +209,23 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
         config_path=str(config_path),
         python_executable=py,
     )
-    learner_procs = [subprocess.Popen(spec.cmd, env=spec.env) for spec in learner_specs]
+    learner_procs = [_launch_worker(spec.cmd, env=spec.env) for spec in learner_specs]
     actor_procs: List[subprocess.Popen] = []
     reported_actor_exits: set[int] = set()
+    actor_restart_counts: Dict[int, int] = {}
     try:
         for aid in range(num_actors):
             gpu_id = int(actor_gpu_plan[aid]) if aid < len(actor_gpu_plan) else -1
-            actor_cmd = [
-                py,
-                entry,
-                "--config",
-                str(config_path),
-                "--role",
-                "actor",
-                "--actor-id",
-                str(int(aid)),
-                "--gpu-id",
-                str(int(gpu_id)),
-                "--num-actors",
-                str(int(num_actors)),
-            ]
-            actor_env = launch_env.copy()
-            actor_env.setdefault("LOCAL_RANK", str(int(gpu_id if gpu_id >= 0 else 0)))
-            actor_procs.append(subprocess.Popen(actor_cmd, env=actor_env))
+            actor_cmd, actor_env = _build_actor_launch(
+                python_executable=py,
+                entry=entry,
+                config_path=str(config_path),
+                actor_id=int(aid),
+                gpu_id=int(gpu_id),
+                num_actors=int(num_actors),
+                base_env=launch_env,
+            )
+            actor_procs.append(_launch_worker(actor_cmd, env=actor_env))
         while True:
             learner_exit: tuple[int, int] | None = None
             for spec, proc in zip(learner_specs, learner_procs):
@@ -147,6 +249,32 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
                             message=f"orchestrator observed actor exit code={int(pret)}",
                         )
                     stage(f"[orchestrator] actor{i} exited early code={pret}")
+            if bool(restart_failed_actors) and int(max_actor_restarts) > 0:
+                for actor_id in list_failed_actor_ids(paths):
+                    aid = int(actor_id)
+                    if aid < 0 or aid >= len(actor_procs):
+                        continue
+                    restart_count = int(actor_restart_counts.get(aid, 0))
+                    if restart_count >= int(max_actor_restarts):
+                        continue
+                    gpu_id = int(actor_gpu_plan[aid]) if aid < len(actor_gpu_plan) else -1
+                    stage(
+                        f"[orchestrator] restarting actor{aid} after failure marker "
+                        f"restart={restart_count + 1}/{int(max_actor_restarts)}"
+                    )
+                    _terminate_process(actor_procs[aid], timeout_s=10.0)
+                    actor_cmd, actor_env = _build_actor_launch(
+                        python_executable=py,
+                        entry=entry,
+                        config_path=str(config_path),
+                        actor_id=aid,
+                        gpu_id=int(gpu_id),
+                        num_actors=int(num_actors),
+                        base_env=launch_env,
+                    )
+                    actor_procs[aid] = _launch_worker(actor_cmd, env=actor_env)
+                    actor_restart_counts[aid] = restart_count + 1
+                    reported_actor_exits.discard(aid)
             time.sleep(2.0)
     finally:
         try:
@@ -154,21 +282,9 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
         except Exception:
             pass
         for proc in actor_procs:
-            try:
-                proc.wait(timeout=15)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+            _terminate_process(proc, timeout_s=15.0)
         for proc in learner_procs:
-            try:
-                proc.wait(timeout=15)
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+            _terminate_process(proc, timeout_s=15.0)
 
 
 __all__ = ["LearnerLaunchSpec", "build_learner_launch_specs", "orchestrator_main"]

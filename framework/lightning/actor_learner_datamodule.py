@@ -14,6 +14,7 @@ from framework.io.buffer import (
     mark_stale_actor_heartbeats,
     read_int,
     stop_requested,
+    write_actor_failure,
 )
 from framework.io.shard_policy import (
     discard_incompatible_shards,
@@ -73,6 +74,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
         self.mode = str(learner_config.mode).strip().lower()
         self.num_actors = int(learner_config.num_actors)
         self.shards_per_update = int(learner_config.shards_per_update)
+        self.samples_per_update = int(getattr(learner_config, "samples_per_update", 0) or 0)
         self.max_inflight_per_actor = int(getattr(learner_config, "max_inflight_per_actor", 1))
         self.poll_s = float(learner_config.poll_s)
         self.shard_collect_timeout_s = float(getattr(learner_config, "shard_collect_timeout_s", 0.0))
@@ -80,6 +82,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
             getattr(learner_config, "allow_partial_updates_after_timeout", False)
         )
         self.actor_heartbeat_timeout_s = float(getattr(learner_config, "actor_heartbeat_timeout_s", 0.0))
+        self.actor_shard_stall_timeout_s = float(getattr(learner_config, "actor_shard_stall_timeout_s", 0.0))
         self.max_shard_version_lag = int(learner_config.max_shard_version_lag)
         self.norm_eps = float(learner_config.norm_eps)
         self.inner_epochs = max(1, int(learner_config.inner_epochs))
@@ -107,6 +110,68 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
             except Exception:
                 continue
         return sorted(present)
+
+    def _actor_id_from_shard_path(self, shard_path: str) -> Optional[int]:
+        name = os.path.basename(shard_path)
+        if not name.startswith("actor"):
+            return None
+        tail = name[len("actor") :]
+        actor_text = tail.split("_", 1)[0]
+        try:
+            return int(actor_text)
+        except Exception:
+            return None
+
+    def _mark_stalled_actor_shards(
+        self,
+        shard_files: List[str],
+        *,
+        failed_actor_ids: List[int],
+        now: float,
+    ) -> List[int]:
+        timeout = float(self.actor_shard_stall_timeout_s)
+        if timeout <= 0.0:
+            return []
+
+        failed = {int(actor_id) for actor_id in failed_actor_ids}
+        progress: Dict[int, tuple[int, float]] = {}
+        for fp in shard_files:
+            actor_id = self._actor_id_from_shard_path(fp)
+            if actor_id is None:
+                continue
+            try:
+                mtime = float(os.path.getmtime(fp))
+            except Exception:
+                continue
+            count, latest_mtime = progress.get(int(actor_id), (0, 0.0))
+            progress[int(actor_id)] = (count + 1, max(float(latest_mtime), float(mtime)))
+
+        marked: List[int] = []
+        max_inflight = max(1, int(self.max_inflight_per_actor))
+        for actor_id in range(int(self.num_actors)):
+            aid = int(actor_id)
+            if aid in failed:
+                continue
+            count, latest_mtime = progress.get(aid, (0, 0.0))
+            if int(count) <= 0 or int(count) >= int(max_inflight):
+                continue
+            age_s = float(now) - float(latest_mtime)
+            if age_s < timeout:
+                continue
+            write_actor_failure(
+                self.paths,
+                aid,
+                message=(
+                    "actor shard stall "
+                    f"age_s={age_s:.2f} timeout_s={timeout:.2f} "
+                    f"shards={int(count)}/{int(max_inflight)}"
+                ),
+            )
+            marked.append(aid)
+
+        if marked and callable(self.stage_fn):
+            self.stage_fn(f"[learner] marked shard-stalled actor(s) failed: {marked}")
+        return marked
 
     def current_inner_epoch_index(self) -> int:
         trainer = getattr(self, "trainer", None)
@@ -159,6 +224,17 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                 effective_shards_per_update = int(self.shards_per_update)
                 if self.mode.startswith("async"):
                     timed_out_actors = []
+                    if float(self.actor_shard_stall_timeout_s) > 0.0:
+                        marked_stalled_actors = self._mark_stalled_actor_shards(
+                            files,
+                            failed_actor_ids=list(failed_actor_ids),
+                            now=float(time.time()),
+                        )
+                        if len(marked_stalled_actors) > 0:
+                            failed_actor_ids = sorted(
+                                {int(actor_id) for actor_id in failed_actor_ids}
+                                | {int(actor_id) for actor_id in marked_stalled_actors}
+                            )
                     effective_shards_per_update = resolve_async_shards_per_update(
                         requested_shards_per_update=int(self.shards_per_update),
                         num_actors=int(self.num_actors),
@@ -192,6 +268,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                     mode=self.mode,
                     num_actors=self.num_actors,
                     shards_per_update=effective_shards_per_update,
+                    samples_per_update=int(self.samples_per_update),
                 )
                 if len(selected) > 0:
                     break

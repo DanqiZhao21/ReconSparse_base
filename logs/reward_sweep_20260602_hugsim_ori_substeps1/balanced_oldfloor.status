@@ -1,0 +1,3 @@
+[sweep] balanced_oldfloor start 2026-06-02T16:26:30+00:00 config=/root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606021200_HUGSM_reinforcepp_closed_loop_reward-balanced_oldfloor_NoGRPOCraft_substeps1.yaml algo_tag=hugsim_ori_reinforcepp_balanced_oldfloor_nogrpo_substeps1
+[sweep] balanced_oldfloor pipeline rc=0 2026-06-02T18:29:24+00:00
+[sweep] balanced_oldfloor done 2026-06-02T18:29:24+00:00

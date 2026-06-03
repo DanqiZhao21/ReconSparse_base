@@ -56,16 +56,20 @@ def test_actor_learner_config_reads_async_collection_timing_options() -> None:
             "mode": "async",
             "num_actors": 12,
             "shards_per_update": 24,
+            "samples_per_update": 768,
             "poll_interval_s": 0.1,
             "shard_collect_timeout_s": 30.0,
+            "actor_shard_stall_timeout_s": 300.0,
             "allow_partial_updates_after_timeout": True,
         },
         algo_meta={"algo_key": "ppo", "eta": 1.0, "clip_eps": 0.2},
     )
 
     assert cfg.shard_collect_timeout_s == 30.0
+    assert cfg.samples_per_update == 768
     assert cfg.allow_partial_updates_after_timeout is True
     assert cfg.actor_heartbeat_timeout_s == 150.0
+    assert cfg.actor_shard_stall_timeout_s == 300.0
 
 
 def test_actor_learner_config_defaults_partial_async_updates_when_timeout_is_configured() -> None:
@@ -87,3 +91,30 @@ def test_actor_learner_config_defaults_partial_async_updates_when_timeout_is_con
     )
 
     assert cfg.allow_partial_updates_after_timeout is True
+
+
+def test_actor_learner_config_reads_wandb_logging_cleanup_flags() -> None:
+    class _Algo:
+        eta = 1.0
+        clip_eps = 0.2
+        minibatch_size = 4
+
+    cfg = actor_learner_lightning_config_from_algorithm(
+        _Algo(),
+        train_cfg={
+            "gamma": 0.99,
+            "wandb": {
+                "log_minibatch_metrics": True,
+                "log_legacy_raw_metrics": True,
+            },
+        },
+        actor_learner_cfg={
+            "mode": "async",
+            "num_actors": 1,
+            "shards_per_update": 1,
+        },
+        algo_meta={"algo_key": "ppo", "eta": 1.0, "clip_eps": 0.2},
+    )
+
+    assert cfg.wandb_log_minibatch_metrics is True
+    assert cfg.wandb_log_legacy_raw_metrics is True

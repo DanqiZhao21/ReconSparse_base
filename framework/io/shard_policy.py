@@ -92,12 +92,36 @@ def discard_incompatible_shards(
     return kept
 
 
+def shard_sample_count(shard_path: str) -> int:
+    try:
+        shard = torch.load(shard_path, map_location="cpu")
+    except Exception:
+        return 0
+
+    reward = shard.get("reward", None) if isinstance(shard, dict) else None
+    if torch.is_tensor(reward):
+        return max(0, int(reward.view(-1).shape[0]))
+
+    replay = shard.get("replay", None) if isinstance(shard, dict) else None
+    if isinstance(replay, list):
+        return max(0, int(len(replay)))
+
+    meta = shard.get("meta", {}) if isinstance(shard, dict) else {}
+    if isinstance(meta, dict):
+        try:
+            return max(0, int(meta.get("num_steps", 0)))
+        except Exception:
+            return 0
+    return 0
+
+
 def select_shards_for_update(
     shard_files: List[str],
     *,
     mode: str,
     num_actors: int,
     shards_per_update: int,
+    samples_per_update: int = 0,
 ) -> List[str]:
     files = list(shard_files)
     if str(mode).strip().lower().startswith("sync"):
@@ -119,6 +143,19 @@ def select_shards_for_update(
         return [per[a] for a in sorted(per.keys())][: int(num_actors)]
 
     need = max(1, int(shards_per_update))
+    sample_target = max(0, int(samples_per_update))
+    if sample_target > 0:
+        selected: List[str] = []
+        sample_count = 0
+        for fp in files:
+            selected.append(fp)
+            sample_count += int(shard_sample_count(fp))
+            if sample_count >= int(sample_target):
+                return selected
+            if len(selected) >= need:
+                return selected
+        return []
+
     if len(files) < need:
         return []
     return files[:need]
@@ -145,4 +182,5 @@ __all__ = [
     "parse_shard_weights_version",
     "resolve_async_shards_per_update",
     "select_shards_for_update",
+    "shard_sample_count",
 ]

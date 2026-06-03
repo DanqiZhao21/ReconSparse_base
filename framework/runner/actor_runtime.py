@@ -35,6 +35,22 @@ def _stop_before_writing_shard(paths: BufferPaths, *, actor_id: int, shard_count
     return True
 
 
+def _shard_num_steps(shard: Dict[str, Any], *, default: int) -> int:
+    meta = shard.get("meta", {}) if isinstance(shard, dict) else {}
+    if isinstance(meta, dict):
+        try:
+            return max(0, int(meta.get("num_steps", default)))
+        except Exception:
+            pass
+    reward = shard.get("reward", None) if isinstance(shard, dict) else None
+    if torch.is_tensor(reward):
+        return max(0, int(reward.view(-1).shape[0]))
+    replay = shard.get("replay", None) if isinstance(shard, dict) else None
+    if isinstance(replay, list):
+        return max(0, int(len(replay)))
+    return max(0, int(default))
+
+
 def _actor_should_pause_for_learner(al_cfg: Dict[str, Any], *, cuda: int) -> bool:
     if int(cuda) < 0:
         return False
@@ -221,6 +237,9 @@ def _actor_main_impl(
     mode_select = str(train_cfg.get("policy_mode_select", train_cfg.get("ddv2_mode_select", "sample"))).strip().lower()
     store_obs = resolve_store_obs(train_cfg, al_cfg, agent)
     stage(f"[actor{actor_id}] store_obs={bool(store_obs)}")
+    end_shard_on_done = bool(al_cfg.get("variable_shard_on_done", al_cfg.get("end_shard_on_done", False)))
+    if bool(end_shard_on_done):
+        stage(f"[actor{actor_id}] variable_shard_on_done=True")
     shard_idx = 0
     shard_idx_per_env = [0 for _ in range(int(num_envs_per_actor))]
     if bool(runtime_cfg["use_vector_env"]):
@@ -292,6 +311,7 @@ def _actor_main_impl(
                     info=_info,
                     return_info=True,
                     heartbeat_fn=heartbeat,
+                    end_shard_on_done=bool(end_shard_on_done),
                 )
             except Exception:
                 if close_env_between_shards:
@@ -316,7 +336,11 @@ def _actor_main_impl(
             timing["save_shard_s"] = float(time.perf_counter() - save_t0)
             timing_summary = format_rollout_timing_summary(timing)
             suffix = f" {timing_summary}" if timing_summary else ""
-            stage(f"[actor{actor_id}] wrote shard {shard_idx} horizon={horizon} ver={local_ver}{suffix}")
+            true_horizon = _shard_num_steps(shard, default=int(horizon))
+            stage(
+                f"[actor{actor_id}] wrote shard {shard_idx} "
+                f"horizon={horizon} true_horizon={true_horizon} ver={local_ver}{suffix}"
+            )
             shard_idx += 1
             if mode.startswith("sync"):
                 wait_for_version(paths, min_version=int(local_ver) + 1, poll_s=poll_s, timeout_s=None, stop_file=paths.stop_file)
@@ -343,6 +367,8 @@ def _actor_main_impl(
                 )
             )
         vec_env = SerialVecEnv(env_fns) if not vec_env_mode.startswith("sub") else SubprocVecEnv(env_fns)
+        if bool(end_shard_on_done):
+            stage(f"[actor{actor_id}] variable_shard_on_done ignored for vector actor mode")
         obs_list, _info = vec_env.reset()
         while True:
             if stop_requested(paths):
@@ -408,7 +434,11 @@ def _actor_main_impl(
                 timing["save_shard_s"] = float(time.perf_counter() - save_t0)
                 timing_summary = format_rollout_timing_summary(timing)
                 suffix = f" {timing_summary}" if timing_summary else ""
-                stage(f"[actor{actor_id}] wrote shard env={i} idx={shard_idx_per_env[i]} horizon={horizon} ver={local_ver}{suffix}")
+                true_horizon = _shard_num_steps(shard, default=int(horizon))
+                stage(
+                    f"[actor{actor_id}] wrote shard env={i} idx={shard_idx_per_env[i]} "
+                    f"horizon={horizon} true_horizon={true_horizon} ver={local_ver}{suffix}"
+                )
                 shard_idx_per_env[i] += 1
             if mode.startswith("sync"):
                 wait_for_version(paths, min_version=int(local_ver) + 1, poll_s=poll_s, timeout_s=None, stop_file=paths.stop_file)

@@ -186,6 +186,7 @@ def collect_single_env_shard(
     info: Any = None,
     return_info: bool = False,
     heartbeat_fn: Any | None = None,
+    end_shard_on_done: bool = False,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -203,6 +204,7 @@ def collect_single_env_shard(
     step_records: List[Dict[str, float]] = []
     counters: Dict[str, int] = {"done_count": 0, "reset_count": 0}
     reward_summary = _reward_summary_defaults()
+    needs_reset_after = False
 
     step_count = 0
     collect_t0 = time.perf_counter()
@@ -249,12 +251,18 @@ def collect_single_env_shard(
 
         if done:
             counters["done_count"] += 1
-            t0 = time.perf_counter()
-            _emit_heartbeat(heartbeat_fn, "env_reset_start", step_count, force=True)
-            obs, _info = env.reset()
-            _emit_heartbeat(heartbeat_fn, "env_reset_done", step_count, force=True)
-            step_timing["env_reset_s"] = float(time.perf_counter() - t0)
-            counters["reset_count"] += 1
+            if bool(end_shard_on_done):
+                needs_reset_after = True
+                current_info = _info
+                step_records.append(step_timing)
+                break
+            else:
+                t0 = time.perf_counter()
+                _emit_heartbeat(heartbeat_fn, "env_reset_start", step_count, force=True)
+                obs, _info = env.reset()
+                _emit_heartbeat(heartbeat_fn, "env_reset_done", step_count, force=True)
+                step_timing["env_reset_s"] = float(time.perf_counter() - t0)
+                counters["reset_count"] += 1
         current_info = _info
         step_records.append(step_timing)
 
@@ -284,6 +292,8 @@ def collect_single_env_shard(
             "actor_id": int(actor_id),
             "env_id": 0,
             "horizon": int(horizon),
+            "num_steps": int(step_count),
+            "needs_reset_after": bool(needs_reset_after),
             "weights_version": int(local_ver),
             "time": float(time.time()),
             "shard_idx": int(shard_idx),
@@ -296,9 +306,10 @@ def collect_single_env_shard(
         shard["next_obs"] = next_obs_t
     if next_value_feature is not None:
         shard["next_value_feature"] = next_value_feature
+    obs_after = None if bool(needs_reset_after) else obs
     if bool(return_info):
-        return shard, obs, current_info
-    return shard, obs
+        return shard, obs_after, current_info
+    return shard, obs_after
 
 
 def collect_vector_env_shards(
@@ -440,6 +451,7 @@ def collect_vector_env_shards(
                     "actor_id": int(actor_id),
                     "env_id": int(i),
                     "horizon": int(horizon),
+                    "num_steps": int(len(rew_bufs[i])),
                     "weights_version": int(local_ver),
                     "time": float(time.time()),
                     "shard_idx": int(shard_idx_per_env[i]),

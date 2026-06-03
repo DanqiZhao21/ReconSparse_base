@@ -152,65 +152,109 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             if self.wandb_enabled and wandb is not None:
                 global_sample_step = int(self.global_sample_step + n)
                 payload: Dict[str, Any] = {
-                    "update": int(self._update_index()),
-                    "global_step": int(global_sample_step),
-                    "global_sample_step": int(global_sample_step),
-                    "global_train_seen_sample_step": int(self.global_train_seen_sample_step),
-                    "weights_version": int(new_v),
-                    "shards": int(len(selected)),
-                    "samples": int(n),
-                    "collect_time_s": float(getattr(datamodule, "current_wait_shards_s", 0.0)),
-                    "load_shards_time_s": float(getattr(datamodule, "current_load_shards_s", 0.0)),
-                    "prepare_batch_time_s": float(getattr(datamodule, "current_prepare_batch_s", 0.0)),
-                    "train_time_s": float(train_time_s),
-                    "update_time_s": float(update_time_s),
-                    "save_broadcast_time_s": float(save_broadcast_s),
-                    "reward_sum": float(reward_sum),
-                    "reward_mean": float(reward_mean),
-                    "done_rate": float(done_rate),
-                    "positive_reward_mean": float(reward_summary_view["positive_reward_mean"]),
-                    "gated_positive_reward_mean": float(reward_summary_view["gated_positive_reward_mean"]),
-                    "cost_reward_mean": float(reward_summary_view["cost_reward_mean"]),
-                    "safety_gate_rate": float(reward_summary_view["safety_gate_rate"]),
-                    "collision_gate_rate": float(reward_summary_view["collision_gate_rate"]),
-                    "severe_tracking_lateral_gate_rate": float(reward_summary_view["severe_tracking_lateral_gate_rate"]),
-                    "severe_tracking_yaw_gate_rate": float(reward_summary_view["severe_tracking_yaw_gate_rate"]),
-                    "terminal_failure_rate": float(reward_summary_view["terminal_failure_rate"]),
-                    "terminal_timeout_rate": float(reward_summary_view["terminal_timeout_rate"]),
-                    "terminal_env_done_rate": float(reward_summary_view["terminal_env_done_rate"]),
-                    "ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
-                    "ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
-                    "adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,
-                    "time_per_sample_s": float(train_time_s / float(max(1, n))),
-                    "time_per_shard_s": float(train_time_s / float(max(1, len(selected)))),
+                    "progress/update": int(self._update_index()),
+                    "progress/weights_version": int(new_v),
+                    "progress/global_sample_step": int(global_sample_step),
+                    "data/samples": int(n),
+                    "data/shards": int(len(selected)),
+                    "data/done_rate": float(done_rate),
+                    "time/collect_s": float(getattr(datamodule, "current_wait_shards_s", 0.0)),
+                    "time/load_shards_s": float(getattr(datamodule, "current_load_shards_s", 0.0)),
+                    "time/prepare_batch_s": float(getattr(datamodule, "current_prepare_batch_s", 0.0)),
+                    "time/train_s": float(train_time_s),
+                    "time/update_s": float(update_time_s),
+                    "time/save_broadcast_s": float(save_broadcast_s),
+                    "time/per_sample_s": float(train_time_s / float(max(1, n))),
+                    "time/per_shard_s": float(train_time_s / float(max(1, len(selected)))),
+                    "reward/sum": float(reward_sum),
+                    "reward/mean": float(reward_mean),
+                    "reward/positive_mean": float(reward_summary_view["positive_reward_mean"]),
+                    "reward/gated_positive_mean": float(reward_summary_view["gated_positive_reward_mean"]),
+                    "reward/cost_mean": float(reward_summary_view["cost_reward_mean"]),
+                    "reward_gate/safety_rate": float(reward_summary_view["safety_gate_rate"]),
+                    "reward_gate/collision_rate": float(reward_summary_view["collision_gate_rate"]),
+                    "reward_gate/severe_tracking_lateral_rate": float(
+                        reward_summary_view["severe_tracking_lateral_gate_rate"]
+                    ),
+                    "reward_gate/severe_tracking_yaw_rate": float(
+                        reward_summary_view["severe_tracking_yaw_gate_rate"]
+                    ),
+                    "terminal/failure_rate": float(reward_summary_view["terminal_failure_rate"]),
+                    "terminal/timeout_rate": float(reward_summary_view["terminal_timeout_rate"]),
+                    "terminal/env_done_rate": float(reward_summary_view["terminal_env_done_rate"]),
+                    "batch/ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
+                    "batch/ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
+                    "batch/adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,
                 }
                 for key, value in metrics.items():
                     try:
-                        payload[str(key)] = float(value)
+                        payload[f"optim/{key}"] = float(value)
                     except Exception:
                         continue
-                update_view = {
-                    "reward_sum": float(reward_sum),
-                    "reward_mean": float(reward_mean),
-                    "done_rate": float(done_rate),
-                    "ret_mean": float(payload["ret_mean"]),
-                    "ret_std": float(payload["ret_std"]),
-                    "adv_std": float(payload["adv_std"]),
-                    "samples": float(n),
-                    "shards": float(len(selected)),
-                    "weights_version": float(new_v),
-                    "collect_time_s": float(payload["collect_time_s"]),
-                    "load_shards_time_s": float(payload["load_shards_time_s"]),
-                    "prepare_batch_time_s": float(payload["prepare_batch_time_s"]),
-                    "train_time_s": float(payload["train_time_s"]),
-                    "update_time_s": float(payload["update_time_s"]),
-                    "save_broadcast_time_s": float(payload["save_broadcast_time_s"]),
-                    "time_per_sample_s": float(payload["time_per_sample_s"]),
-                    "time_per_shard_s": float(payload["time_per_shard_s"]),
-                }
-                update_view.update({key: float(value) for key, value in metrics.items()})
-                for key, value in update_view.items():
-                    payload[f"train_update/{key}"] = float(value)
+                if bool(getattr(self.learner_config, "wandb_log_legacy_raw_metrics", False)):
+                    legacy_payload = {
+                        "update": int(self._update_index()),
+                        "global_step": int(global_sample_step),
+                        "global_sample_step": int(global_sample_step),
+                        "global_train_seen_sample_step": int(self.global_train_seen_sample_step),
+                        "weights_version": int(new_v),
+                        "shards": int(len(selected)),
+                        "samples": int(n),
+                        "collect_time_s": float(payload["time/collect_s"]),
+                        "load_shards_time_s": float(payload["time/load_shards_s"]),
+                        "prepare_batch_time_s": float(payload["time/prepare_batch_s"]),
+                        "train_time_s": float(payload["time/train_s"]),
+                        "update_time_s": float(payload["time/update_s"]),
+                        "save_broadcast_time_s": float(payload["time/save_broadcast_s"]),
+                        "reward_sum": float(payload["reward/sum"]),
+                        "reward_mean": float(payload["reward/mean"]),
+                        "done_rate": float(payload["data/done_rate"]),
+                        "positive_reward_mean": float(payload["reward/positive_mean"]),
+                        "gated_positive_reward_mean": float(payload["reward/gated_positive_mean"]),
+                        "cost_reward_mean": float(payload["reward/cost_mean"]),
+                        "safety_gate_rate": float(payload["reward_gate/safety_rate"]),
+                        "collision_gate_rate": float(payload["reward_gate/collision_rate"]),
+                        "severe_tracking_lateral_gate_rate": float(
+                            payload["reward_gate/severe_tracking_lateral_rate"]
+                        ),
+                        "severe_tracking_yaw_gate_rate": float(payload["reward_gate/severe_tracking_yaw_rate"]),
+                        "terminal_failure_rate": float(payload["terminal/failure_rate"]),
+                        "terminal_timeout_rate": float(payload["terminal/timeout_rate"]),
+                        "terminal_env_done_rate": float(payload["terminal/env_done_rate"]),
+                        "ret_mean": float(payload["batch/ret_mean"]),
+                        "ret_std": float(payload["batch/ret_std"]),
+                        "adv_std": float(payload["batch/adv_std"]),
+                        "time_per_sample_s": float(payload["time/per_sample_s"]),
+                        "time_per_shard_s": float(payload["time/per_shard_s"]),
+                    }
+                    for key, value in metrics.items():
+                        try:
+                            legacy_payload[str(key)] = float(value)
+                        except Exception:
+                            continue
+                    update_view = {
+                        "reward_sum": float(legacy_payload["reward_sum"]),
+                        "reward_mean": float(legacy_payload["reward_mean"]),
+                        "done_rate": float(legacy_payload["done_rate"]),
+                        "ret_mean": float(legacy_payload["ret_mean"]),
+                        "ret_std": float(legacy_payload["ret_std"]),
+                        "adv_std": float(legacy_payload["adv_std"]),
+                        "samples": float(n),
+                        "shards": float(len(selected)),
+                        "weights_version": float(new_v),
+                        "collect_time_s": float(legacy_payload["collect_time_s"]),
+                        "load_shards_time_s": float(legacy_payload["load_shards_time_s"]),
+                        "prepare_batch_time_s": float(legacy_payload["prepare_batch_time_s"]),
+                        "train_time_s": float(legacy_payload["train_time_s"]),
+                        "update_time_s": float(legacy_payload["update_time_s"]),
+                        "save_broadcast_time_s": float(legacy_payload["save_broadcast_time_s"]),
+                        "time_per_sample_s": float(legacy_payload["time_per_sample_s"]),
+                        "time_per_shard_s": float(legacy_payload["time_per_shard_s"]),
+                    }
+                    update_view.update({key: float(value) for key, value in metrics.items()})
+                    for key, value in update_view.items():
+                        legacy_payload[f"train_update/{key}"] = float(value)
+                    payload.update(legacy_payload)
                 try:
                     self.global_sample_step += int(n)
                     wandb.log(payload)

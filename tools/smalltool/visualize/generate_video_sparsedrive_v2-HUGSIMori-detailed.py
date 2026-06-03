@@ -20,7 +20,7 @@ python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   --hugsim-scene scene-0411-medium-00 \
   --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606021200_HUGSM_reinforcepp_closed_loop_reward-progress_hd_GRPOCraft_substeps1.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
-  --mode-select greedy
+  
 """
 
 from __future__ import annotations
