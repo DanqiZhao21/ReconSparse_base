@@ -11,7 +11,6 @@ from framework.io.buffer import BufferPaths, list_failed_actor_ids, list_shards,
 from framework.io.shard_policy import (
     discard_incompatible_shards,
     discard_stale_shards,
-    resolve_async_shards_per_update,
     select_shards_for_update,
 )
 from framework.lightning.config import ActorLearnerLightningConfig
@@ -140,15 +139,6 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                 effective_shards_per_update = int(self.shards_per_update)
                 if self.mode.startswith("async"):
                     timed_out_actors = []
-                    effective_shards_per_update = resolve_async_shards_per_update(
-                        requested_shards_per_update=int(self.shards_per_update),
-                        num_actors=int(self.num_actors),
-                        max_inflight_per_actor=int(self.max_inflight_per_actor),
-                        failed_actor_ids=list(failed_actor_ids),
-                    )
-                    if effective_shards_per_update <= 0:
-                        selected = []
-                        break
                     if (
                         float(self.shard_collect_timeout_s) > 0.0
                         and len(files) > 0
@@ -161,12 +151,6 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                             for actor_id in range(int(self.num_actors))
                             if int(actor_id) not in present_actor_ids and int(actor_id) not in failed_actor_ids
                         ]
-                        effective_shards_per_update = resolve_async_shards_per_update(
-                            requested_shards_per_update=int(self.shards_per_update),
-                            num_actors=int(self.num_actors),
-                            max_inflight_per_actor=int(self.max_inflight_per_actor),
-                            failed_actor_ids=list(failed_actor_ids) + list(timed_out_actors),
-                        )
                 selected = select_shards_for_update(
                     files,
                     mode=self.mode,

@@ -4,6 +4,7 @@ import errno
 import os
 import pickle
 import select
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ def write_fifo_payload(
     fifo_path = str(path)
     deadline = time.monotonic() + float(timeout_s)
     data = pickle.dumps(payload)
+    packet = struct.pack("!Q", int(len(data))) + data
 
     fd = None
     while fd is None:
@@ -37,7 +39,7 @@ def write_fifo_payload(
             time.sleep(min(float(poll_interval_s), remaining))
 
     try:
-        view = memoryview(data)
+        view = memoryview(packet)
         while view:
             _ensure_process_alive(process)
             remaining = _remaining_time(deadline, fifo_path, "write")
@@ -76,7 +78,8 @@ def read_fifo_payload(
             time.sleep(min(float(poll_interval_s), remaining))
 
     try:
-        chunks: list[bytes] = []
+        chunks = bytearray()
+        expected_size: int | None = None
         while True:
             _ensure_process_alive(process)
             remaining = _remaining_time(deadline, fifo_path, "read")
@@ -89,11 +92,18 @@ def read_fifo_payload(
                 continue
 
             if chunk:
-                chunks.append(chunk)
+                chunks.extend(chunk)
+                if expected_size is None and len(chunks) >= 8:
+                    expected_size = int(struct.unpack("!Q", bytes(chunks[:8]))[0])
+                if expected_size is not None and len(chunks) >= 8 + int(expected_size):
+                    payload_bytes = bytes(chunks[8 : 8 + int(expected_size)])
+                    return pickle.loads(payload_bytes)
                 continue
 
-            if chunks:
-                return pickle.loads(b"".join(chunks))
+            if len(chunks) > 0:
+                raise FifoCommunicationError(
+                    f"FIFO writer closed before sending a complete framed payload: {fifo_path}"
+                )
 
             time.sleep(min(float(poll_interval_s), remaining))
     finally:

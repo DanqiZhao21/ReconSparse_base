@@ -17,6 +17,7 @@ from framework.runner.learner_factory import ValueHead, ValueNet
 class _TinyEnv:
     def __init__(self) -> None:
         self.step_count = 0
+        self.reset_count = 0
 
     def step(self, action: Any):
         del action
@@ -24,7 +25,23 @@ class _TinyEnv:
         return _obs(self.step_count), 1.0, False, False, {}
 
     def reset(self):
+        self.reset_count += 1
         return _obs(0), {}
+
+
+class _DoneAfterFirstStepEnv:
+    def __init__(self) -> None:
+        self.step_count = 0
+        self.reset_count = 0
+
+    def step(self, action: Any):
+        del action
+        self.step_count += 1
+        return _obs(self.step_count), 1.0, True, False, {"terminal_kind": "failure"}
+
+    def reset(self):
+        self.reset_count += 1
+        return _obs(100 + self.reset_count), {}
 
 
 class _TinyAgent:
@@ -104,6 +121,31 @@ def test_collect_single_env_shard_can_skip_obs_storage() -> None:
     assert "next_obs" not in shard
     assert shard["reward"].shape == (2,)
     assert len(shard["replay"]) == 2
+
+
+def test_collect_single_env_shard_can_finish_early_on_done_for_expensive_envs() -> None:
+    env = _DoneAfterFirstStepEnv()
+    shard, next_obs = collect_single_env_shard(
+        env=env,
+        agent=_TinyAgent(),
+        obs=_obs(0),
+        horizon=4,
+        eta=1.0,
+        mode_idx=-1,
+        mode_select="sample",
+        actor_id=0,
+        local_ver=1,
+        shard_idx=0,
+        store_obs=False,
+        end_shard_on_done=True,
+    )
+
+    assert shard["reward"].shape == (1,)
+    assert int(shard["meta"]["timing"]["done_count"]) == 1
+    assert int(shard["meta"]["timing"]["reset_count"]) == 1
+    assert env.step_count == 1
+    assert env.reset_count == 1
+    assert int(next_obs["front"][0, 0, 0]) == 101
 
 
 def test_replay_feature_ppo_batch_accepts_shard_without_obs(tmp_path: Path) -> None:

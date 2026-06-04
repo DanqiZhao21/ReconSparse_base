@@ -123,7 +123,12 @@ def build_actor_env(
             "pixi_cmd": hugsim_cfg.get("pixi_cmd", "pixi"),
             "fifo_timeout_s": float(hugsim_cfg.get("fifo_timeout_s", 300.0)),
             "fifo_poll_interval_s": float(hugsim_cfg.get("fifo_poll_interval_s", 0.2)),
+            "fifo_step_timeout_s": float(hugsim_cfg.get("fifo_step_timeout_s", 60.0)),
             "min_gt_route_points": int(hugsim_cfg.get("min_gt_route_points", 2)),
+            "session_tag": (
+                f"actor{int(actor_id)}_worker{int(worker_id) if worker_id is not None else int(actor_id)}"
+                f"_rank{int(os.environ.get('RANK', '0'))}_cuda{int(cuda)}"
+            ),
         }
         alignment_cfg = hugsim_cfg.get("alignment", {}) or {}
         if isinstance(alignment_cfg, dict):

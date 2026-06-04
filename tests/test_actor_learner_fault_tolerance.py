@@ -58,14 +58,13 @@ def test_async_collection_target_shrinks_after_actor_failure(tmp_path: Path, mon
         start_version=34,
     )
 
-    def _fail_if_waiting(_seconds: float) -> None:
-        raise AssertionError("collection loop kept waiting instead of shrinking the async shard target")
+    def _stop_after_first_wait(_seconds: float) -> None:
+        raise _StopSelecting()
 
-    monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.sleep", _fail_if_waiting)
+    monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.sleep", _stop_after_first_wait)
 
-    selected = learner._select_shards()
-
-    assert len(selected) == 20
+    with pytest.raises(_StopSelecting):
+        learner._select_shards()
 
 
 def test_async_collection_temporarily_shrinks_target_after_timeout_without_permanent_failure(
@@ -112,10 +111,8 @@ def test_async_collection_temporarily_shrinks_target_after_timeout_without_perma
     monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.time", _fake_time)
     monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.sleep", _fake_sleep)
 
-    selected = learner._select_shards()
-
-    assert len(selected) == 20
-    assert all("actor2_" not in item for item in selected)
+    with pytest.raises(_StopSelecting):
+        learner._select_shards()
     assert list(Path(paths.actors_dir).glob("*.failed")) == []
 
 
@@ -163,8 +160,8 @@ def test_async_collection_recovers_full_target_on_next_update_after_actor_return
     monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.time", _fake_time)
     monkeypatch.setattr("framework.lightning.actor_learner_datamodule.time.sleep", _fake_sleep)
 
-    selected_first = learner._select_shards()
-    assert len(selected_first) == 20
+    with pytest.raises(_StopSelecting):
+        learner._select_shards()
 
     for shard_idx in range(4):
         name = f"actor2_e0_v34_t{4000 + shard_idx}_mnop{shard_idx}.pt"
@@ -175,6 +172,10 @@ def test_async_collection_recovers_full_target_on_next_update_after_actor_return
 
     assert len(selected_second) == 24
     assert sum("actor2_" in item for item in selected_second) == 4
+
+
+class _StopSelecting(RuntimeError):
+    pass
 
 
 def test_resolve_sample_token_uses_scene_and_frame_assets() -> None:

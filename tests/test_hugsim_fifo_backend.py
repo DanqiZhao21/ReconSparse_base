@@ -273,3 +273,180 @@ def test_hugsim_recon_env_fifo_output_dir_is_unique_per_scenario(monkeypatch, tm
     assert output_dirs[0] != output_dirs[1]
     assert output_dirs[0].name == "scene-0013-easy-00"
     assert output_dirs[1].name == "scene-0013-medium-00"
+
+
+def test_hugsim_recon_env_fifo_output_dir_nests_session_tag(monkeypatch, tmp_path: Path):
+    from framework.env_wrapper import hugsim_adapter
+
+    output_dirs = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            output_dirs.append(Path(kwargs["output_dir"]))
+
+    monkeypatch.setattr(hugsim_adapter, "HUGSIMFifoClient", FakeClient)
+
+    hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=object(),
+        reward_cfg={},
+        output_root=tmp_path,
+        launch_mode="fifo",
+        session_tag="actor0_worker0_rank0_cuda1",
+        recon_data_root=tmp_path,
+    )
+
+    assert output_dirs == [tmp_path / "scene-0013-easy-00" / "actor0_worker0_rank0_cuda1"]
+
+
+def test_hugsim_recon_env_fifo_timeout_turns_into_truncated_terminal(monkeypatch, tmp_path: Path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.fifo_io import FifoCommunicationError
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    calls = []
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok0",
+                frame_idx=0,
+                sample_index=0,
+                sample_relative_time_s=0.0,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def reset(self):
+            calls.append(("reset",))
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+        def step(self, plan_traj):
+            calls.append(("step", plan_traj.copy()))
+            raise FifoCommunicationError("Timed out waiting to read FIFO")
+
+        def close(self):
+            calls.append(("close",))
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            calls.append(("reward_reset",))
+
+        def compute(self, *, env, info, step_idx, done):
+            calls.append(("reward_compute", done, info.get("done_reason")))
+            out = dict(info)
+            out["reward"] = -3.0
+            return TrackingRewardResult(reward=-3.0, info=out)
+
+    monkeypatch.setattr(hugsim_adapter, "HUGSIMFifoClient", FakeClient)
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={},
+        output_root="outputs/test_hugsim_fifo_timeout",
+        launch_mode="fifo",
+        recon_data_root=tmp_path,
+    )
+
+    env.reset()
+    env.set_external_plan_local_xyyaw([[1.0, 0.0, 0.0]] * 8)
+    obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert reward == -3.0
+    assert not terminated
+    assert truncated
+    assert info["done_reason"] == "timeout"
+    assert "fifo_timeout_error" in info
+    assert obs["frame_idx"] == np.int32(0)
+    assert any(call[0] == "close" for call in calls)
+
+
+def test_hugsim_recon_env_fifo_closes_session_when_wrapper_marks_collision_terminal(monkeypatch, tmp_path: Path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    calls = []
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name=official_scene_name,
+                recon_scene_id=12,
+                sample_token="tok0" if relative_time_s < 0.25 else "tok1",
+                frame_idx=0 if relative_time_s < 0.25 else 5,
+                sample_index=0 if relative_time_s < 0.25 else 1,
+                sample_relative_time_s=0.0 if relative_time_s < 0.25 else 0.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def reset(self):
+            calls.append(("reset",))
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+        def step(self, plan_traj):
+            calls.append(("step", plan_traj.copy()))
+            info = _fake_hugsim_info(0.5)
+            info["collision"] = True
+            info["rc"] = 0.2
+            return _fake_hugsim_obs(image), 0.0, False, False, info
+
+        def close(self):
+            calls.append(("close",))
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            calls.append(("reward_reset",))
+
+        def compute(self, *, env, info, step_idx, done):
+            calls.append(("reward_compute", done, info.get("done_reason")))
+            out = dict(info)
+            out["reward"] = -7.0
+            return TrackingRewardResult(reward=-7.0, info=out)
+
+    monkeypatch.setattr(hugsim_adapter, "HUGSIMFifoClient", FakeClient)
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={},
+        output_root="outputs/test_hugsim_fifo_collision_close",
+        launch_mode="fifo",
+        recon_data_root=tmp_path,
+    )
+
+    env.reset()
+    env.set_external_plan_local_xyyaw([[1.0, 0.0, 0.0]] * 8)
+    _obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+    env.reset()
+
+    assert reward == -7.0
+    assert terminated
+    assert not truncated
+    assert info["done_reason"] == "hugsim_collision"
+    assert ("reward_compute", True, "hugsim_collision") in calls
+    assert calls.count(("close",)) == 1
+    close_idx = calls.index(("close",))
+    assert ("reset",) in calls[close_idx + 1 :]

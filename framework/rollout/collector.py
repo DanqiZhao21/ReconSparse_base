@@ -160,6 +160,7 @@ def collect_single_env_shard(
     local_ver: int,
     shard_idx: int,
     store_obs: bool = True,
+    end_shard_on_done: bool = False,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -220,7 +221,11 @@ def collect_single_env_shard(
             obs, _info = env.reset()
             step_timing["env_reset_s"] = float(time.perf_counter() - t0)
             counters["reset_count"] += 1
-        step_records.append(step_timing)
+            step_records.append(step_timing)
+            if bool(end_shard_on_done):
+                break
+        else:
+            step_records.append(step_timing)
 
     next_obs_t = None
     if bool(store_obs):

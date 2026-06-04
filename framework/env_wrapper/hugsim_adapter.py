@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import numpy as np
 from shapely.geometry import Polygon
 from scipy.spatial.transform import Rotation, Slerp
 
+from framework.env_wrapper.fifo_io import FifoCommunicationError
 from framework.env_wrapper.hugsim_recon_alignment import (
     HUGSIMReconAlignment,
     Sim2Transform,
@@ -45,6 +47,12 @@ ALL_CAMERA_INDEX = {
 
 RECON_DATA_ROOT_DEFAULT = Path(__file__).resolve().parents[2] / "assets" / "nus" / "data"
 FIFO_RUNNER_DEFAULT = Path(__file__).resolve().parent / "hugsim_fifo_runner.py"
+
+
+def _safe_output_segment(value: Any) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or "session"
 
 
 def _fov2focal(fov: float, pixels: int) -> float:
@@ -328,6 +336,10 @@ def _augment_hugsim_reward_info(
             except Exception:
                 continue
         out["obj_boxes"] = obj_boxes
+    if "fifo_timeout_error" in hugsim_info:
+        out["fifo_timeout_error"] = str(hugsim_info["fifo_timeout_error"])
+    if "fifo_timeout" in hugsim_info:
+        out["fifo_timeout"] = bool(hugsim_info["fifo_timeout"])
 
     if bool(terminated or truncated):
         if collision:
@@ -558,6 +570,7 @@ class HUGSIMFifoClient:
         runner_path: str | Path = FIFO_RUNNER_DEFAULT,
         ad: str = "sparsedrive_v2",
         fifo_timeout_s: float = 300.0,
+        fifo_step_timeout_s: float = 60.0,
         fifo_poll_interval_s: float = 0.2,
         cuda: int | None = None,
     ) -> None:
@@ -572,6 +585,7 @@ class HUGSIMFifoClient:
         self.runner_path = str(runner_path)
         self.ad = str(ad)
         self.fifo_timeout_s = float(fifo_timeout_s)
+        self.fifo_step_timeout_s = max(1.0, float(fifo_step_timeout_s))
         self.fifo_poll_interval_s = float(fifo_poll_interval_s)
         self.cuda = None if cuda is None else int(cuda)
         self.process: subprocess.Popen[Any] | None = None
@@ -623,7 +637,7 @@ class HUGSIMFifoClient:
         if self._episode_done:
             self.close()
         self.start()
-        obs, info = self._read_obs_info()
+        obs, info = self._read_obs_info(timeout_s=self.fifo_timeout_s)
         self._episode_done = False
         return dict(obs), dict(info)
 
@@ -636,10 +650,10 @@ class HUGSIMFifoClient:
             self.plan_pipe,
             np.asarray(plan_traj, dtype=np.float32),
             process=self.process,
-            timeout_s=self.fifo_timeout_s,
+            timeout_s=min(self.fifo_timeout_s, self.fifo_step_timeout_s),
             poll_interval_s=self.fifo_poll_interval_s,
         )
-        obs, info = self._read_obs_info()
+        obs, info = self._read_obs_info(timeout_s=min(self.fifo_timeout_s, self.fifo_step_timeout_s))
         terminated = bool(info.get("terminated", False) or info.get("done", False))
         truncated = bool(info.get("truncated", False))
         self._episode_done = bool(terminated or truncated)
@@ -672,7 +686,7 @@ class HUGSIMFifoClient:
         self.process = None
         self._episode_done = False
 
-    def _read_obs_info(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _read_obs_info(self, *, timeout_s: float) -> tuple[dict[str, Any], dict[str, Any]]:
         if self.process is None:
             raise RuntimeError("HUGSIM FIFO client is not started")
         from framework.env_wrapper.fifo_io import read_fifo_payload
@@ -680,7 +694,7 @@ class HUGSIMFifoClient:
         payload = read_fifo_payload(
             self.obs_pipe,
             process=self.process,
-            timeout_s=self.fifo_timeout_s,
+            timeout_s=float(timeout_s),
             poll_interval_s=self.fifo_poll_interval_s,
         )
         if not isinstance(payload, tuple) or len(payload) != 2:
@@ -712,10 +726,12 @@ class HUGSIMReconEnv:
         launch_mode: str = "direct",
         pixi_cmd: str = "pixi",
         fifo_timeout_s: float = 300.0,
+        fifo_step_timeout_s: float = 60.0,
         fifo_poll_interval_s: float = 0.2,
         fifo_runner_path: str | Path = FIFO_RUNNER_DEFAULT,
         cuda: int | None = None,
         min_gt_route_points: int = 2,
+        session_tag: str | None = None,
     ) -> None:
         self.official_scene_name = str(scenario_name)
         self.scenario_path = str(scenario_path)
@@ -742,7 +758,10 @@ class HUGSIMReconEnv:
         self._external_plan_local_xyyaw = None
         self.min_gt_route_points = max(0, int(min_gt_route_points))
         scenario_output_name = Path(self.scenario_path).stem or self.official_scene_name
-        output_dir = (Path(output_root) / scenario_output_name).resolve()
+        output_dir = Path(output_root) / scenario_output_name
+        if session_tag is not None and str(session_tag).strip():
+            output_dir = output_dir / _safe_output_segment(session_tag)
+        output_dir = output_dir.resolve()
         if self.launch_mode == "fifo":
             self.env = HUGSIMFifoClient(
                 hugsim_repo=self.hugsim_repo,
@@ -754,6 +773,7 @@ class HUGSIMReconEnv:
                 pixi_cmd=pixi_cmd,
                 runner_path=fifo_runner_path,
                 fifo_timeout_s=fifo_timeout_s,
+                fifo_step_timeout_s=fifo_step_timeout_s,
                 fifo_poll_interval_s=fifo_poll_interval_s,
                 cuda=cuda,
             )
@@ -974,7 +994,12 @@ class HUGSIMReconEnv:
         del scene, start_frame, step_frames
         self._hugsim_step_idx = 0
         self._reward_computer.reset()
-        hugsim_obs, hugsim_info = self.env.reset()
+        try:
+            hugsim_obs, hugsim_info = self.env.reset()
+        except FifoCommunicationError:
+            if hasattr(self.env, "close"):
+                self.env.close()
+            hugsim_obs, hugsim_info = self.env.reset()
         self._last_hugsim_obs = hugsim_obs
         self._last_hugsim_info = hugsim_info
         mapping = self.scene_index.map_time(self.official_scene_name, float(hugsim_info.get("timestamp", 0.0)))
@@ -1025,8 +1050,21 @@ class HUGSIMReconEnv:
             raise RuntimeError("HUGSIMReconEnv.step called before reset")
         plan_traj = self._plan_from_action(action)
         if self.launch_mode == "fifo":
-            hugsim_obs, base_reward, terminated, truncated, hugsim_info = self.env.step(plan_traj)
-            self._hugsim_step_idx += 1
+            try:
+                hugsim_obs, base_reward, terminated, truncated, hugsim_info = self.env.step(plan_traj)
+                self._hugsim_step_idx += 1
+            except FifoCommunicationError as exc:
+                if self._last_hugsim_obs is None or self._last_hugsim_info is None:
+                    raise
+                hugsim_obs = dict(self._last_hugsim_obs)
+                hugsim_info = dict(self._last_hugsim_info)
+                hugsim_info["fifo_timeout_error"] = str(exc)
+                hugsim_info["fifo_timeout"] = True
+                base_reward = 0.0
+                terminated = False
+                truncated = True
+                if hasattr(self.env, "close"):
+                    self.env.close()
         else:
             hugsim_obs, base_reward, terminated, truncated, hugsim_info = execute_hugsim_control_horizon(
                 env=self.env,
@@ -1092,6 +1130,8 @@ class HUGSIMReconEnv:
             else:
                 info["terminal_kind"] = "env_done"
                 info["done_reason"] = "hugsim_terminated"
+        if self.launch_mode == "fifo" and bool(terminated or truncated) and hasattr(self.env, "close"):
+            self.env.close()
         reward_pose, _pose_info = self._reward_pose_from_alignment(alignment=alignment, hugsim_info=dict(hugsim_info))
         self._reward_proxy.update_from_hugsim_info(
             recon_scene_id=int(mapping.recon_scene_id),

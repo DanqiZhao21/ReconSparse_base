@@ -59,6 +59,25 @@ def resolve_actor_env_runtime(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def resolve_finish_shard_on_done(cfg: Dict[str, Any], actor_learner_cfg: Dict[str, Any], *, use_vector_env: bool) -> bool:
+    raw = actor_learner_cfg.get("finish_shard_on_done", "auto")
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return not bool(use_vector_env)
+        if text in {"false", "0", "no", "off"}:
+            return False
+        if text != "auto":
+            raise ValueError(
+                f"Unsupported actor_learner.finish_shard_on_done={raw!r}; expected true, false, or auto"
+            )
+    elif raw is not None:
+        return bool(raw) and not bool(use_vector_env)
+
+    env_backend = str(((cfg.get("env", {}) or {}).get("backend", "recon"))).strip().lower()
+    return env_backend == "hugsim_ori" and not bool(use_vector_env)
+
+
 def _normalize_algo_key(value: Any) -> str:
     text = str(value or "ppo").strip().lower()
     if text in {"reinforce++", "reinforce_pp", "reinforce_clip"}:
@@ -142,6 +161,11 @@ def _actor_main_impl(
     runtime_cfg = resolve_actor_env_runtime(cfg)
     num_envs_per_actor = int(runtime_cfg["num_envs_per_actor"])
     vec_env_mode = str(runtime_cfg["vec_env_mode"])
+    finish_shard_on_done = resolve_finish_shard_on_done(
+        cfg,
+        al_cfg,
+        use_vector_env=bool(runtime_cfg["use_vector_env"]),
+    )
 
     if torch.cuda.is_available():
         if gpu_id is None:
@@ -224,6 +248,7 @@ def _actor_main_impl(
                 local_ver=local_ver,
                 shard_idx=shard_idx,
                 store_obs=bool(store_obs),
+                end_shard_on_done=bool(finish_shard_on_done),
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=1):
                 break

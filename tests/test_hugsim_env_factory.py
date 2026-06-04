@@ -120,4 +120,6 @@ def test_build_actor_env_passes_hugsim_backend_without_recon_ckpt(monkeypatch, t
     assert captured["hugsim_kwargs"]["launch_mode"] == "fifo"
     assert captured["hugsim_kwargs"]["pixi_cmd"] == "pixi"
     assert captured["hugsim_kwargs"]["fifo_timeout_s"] == 120.0
+    assert captured["hugsim_kwargs"]["fifo_step_timeout_s"] == 60.0
     assert captured["hugsim_kwargs"]["min_gt_route_points"] == 3
+    assert captured["hugsim_kwargs"]["session_tag"] == "actor0_worker0_rank0_cuda0"

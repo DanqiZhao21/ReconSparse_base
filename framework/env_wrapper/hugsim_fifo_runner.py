@@ -55,9 +55,10 @@ def run_fifo_env(args: argparse.Namespace) -> None:
             pipe.unlink()
         os.mkfifo(pipe)
 
-    _write_status(output_dir, state="starting", pid=os.getpid(), started_at=time.time())
+    _write_status(output_dir, state="starting", phase="boot", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
     env = None
     try:
+        _write_status(output_dir, state="starting", phase="loading_config", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
         cfg, _output = load_closed_loop_cfg(
             scenario_path=str(args.scenario_path),
             base_path=str(args.base_path),
@@ -65,26 +66,31 @@ def run_fifo_env(args: argparse.Namespace) -> None:
             kinematic_path=str(args.kinematic_path),
             ad=str(args.ad),
         )
+        _write_status(output_dir, state="starting", phase="creating_env", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
         env = gymnasium.make("hugsim_env/HUGSim-v0", cfg=cfg, output=str(output_dir))
+        _write_status(output_dir, state="starting", phase="resetting", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
         obs, info = env.reset()
-        _write_status(output_dir, state="running", pid=os.getpid(), started_at=time.time())
+        _write_status(output_dir, state="running", phase="waiting_plan", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
 
         while True:
+            _write_status(output_dir, state="running", phase="writing_obs", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
             write_fifo_payload(
                 obs_pipe,
                 (obs, info),
                 timeout_s=float(args.fifo_timeout_s),
                 poll_interval_s=float(args.fifo_poll_interval_s),
             )
+            _write_status(output_dir, state="running", phase="waiting_plan", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
             plan = read_fifo_payload(
                 plan_pipe,
                 timeout_s=float(args.fifo_timeout_s),
                 poll_interval_s=float(args.fifo_poll_interval_s),
             )
             if plan is None or (isinstance(plan, str) and plan == "STOP"):
-                _write_status(output_dir, state="stopped", pid=os.getpid(), completed_at=time.time())
+                _write_status(output_dir, state="stopped", phase="stopped", pid=os.getpid(), completed_at=time.time(), last_event_at=time.time())
                 return
 
+            _write_status(output_dir, state="running", phase="stepping", pid=os.getpid(), started_at=time.time(), last_event_at=time.time())
             acc, steer_rate = traj2control(np.asarray(plan, dtype=np.float32), dict(info))
             obs, reward, terminated, truncated, info = env.step(
                 {"acc": float(acc), "steer_rate": float(steer_rate)}
@@ -103,8 +109,10 @@ def run_fifo_env(args: argparse.Namespace) -> None:
                 _write_status(
                     output_dir,
                     state="completed",
+                    phase="completed",
                     pid=os.getpid(),
                     completed_at=time.time(),
+                    last_event_at=time.time(),
                     terminated=bool(terminated),
                     truncated=bool(truncated),
                 )
@@ -113,10 +121,12 @@ def run_fifo_env(args: argparse.Namespace) -> None:
         _write_status(
             output_dir,
             state="error",
+            phase="error",
             pid=os.getpid(),
             error=repr(exc),
             traceback=traceback.format_exc(),
             completed_at=time.time(),
+            last_event_at=time.time(),
         )
         raise
     finally:
