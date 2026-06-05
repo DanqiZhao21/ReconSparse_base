@@ -249,6 +249,7 @@ def _actor_main_impl(
                 shard_idx=shard_idx,
                 store_obs=bool(store_obs),
                 end_shard_on_done=bool(finish_shard_on_done),
+                stop_checker=lambda: stop_requested(paths),
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=1):
                 break
@@ -330,6 +331,7 @@ def _actor_main_impl(
                 local_ver=local_ver,
                 shard_idx_per_env=shard_idx_per_env,
                 store_obs=bool(store_obs),
+                stop_checker=lambda: stop_requested(paths),
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=len(shards)):
                 break

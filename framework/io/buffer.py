@@ -80,6 +80,17 @@ def stop_requested(paths: BufferPaths) -> bool:
         return False
 
 
+def request_stop(paths: BufferPaths, *, reason: str | None = None) -> None:
+    ensure_buffer_layout(paths)
+    tmp = f"{paths.stop_file}.tmp.{uuid.uuid4().hex}"
+    text = "stop requested\n"
+    if reason is not None and str(reason).strip():
+        text += f"reason={str(reason).strip()}\n"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, paths.stop_file)
+
+
 def ensure_buffer_layout(paths: BufferPaths) -> None:
     _mkdir(paths.shards_dir)
     _mkdir(paths.consumed_dir)

@@ -1,0 +1,222 @@
+env: # 环境配置根节点，控制仿真后端、场景采样和奖励
+  backend: hugsim_ori # 使用 HUGSIM-ORI 作为闭环仿真后端
+  max_steps: 40 # 每个 episode 最多执行 40 个 RL step
+  step_frames: 5 # 每个 RL step 对应仿真前进 5 帧
+  debug: false # 关闭环境调试输出
+  render_w: 800 # 渲染视频宽度
+  render_h: 450 # 渲染视频高度
+  use_all_scenes: true # 训练时使用场景目录下全部场景
+  scene_sampling: random # 从可用场景中随机采样
+  start_frame: # 起始帧采样策略
+    mode: zero # 固定从轨迹起点开始
+    allow_short_tail: false # 不允许从剩余帧太短的位置启动
+    min: 0 # 起始帧下界
+  hugsim: # HUGSIM 后端细节配置
+    repo: /root/clone/HUGSIM-ORI # HUGSIM-ORI 仓库根目录
+    # scenario_dir: /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes # 旧的默认场景目录，当前停用
+    scenario_dir: /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes_denso_benchmark_v1 # 当前训练使用的 benchmark 场景目录
+    base_path: /root/clone/HUGSIM-ORI/configs/sim/nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml # HUGSIM 主仿真配置模板
+    camera_path: /root/clone/HUGSIM-ORI/configs/sim/nuscenes_camera.yaml # 相机配置文件
+    kinematic_path: /root/clone/HUGSIM-ORI/configs/sim/kinematic.yaml # 车辆运动学配置文件
+    model_base: /OpenDataset/HUGSIM_data/scenes/nuscenes # HUGSIM 所需场景资产根目录
+    launch_mode: fifo # 通过 FIFO 子进程方式启动 HUGSIM
+    pixi_cmd: pixi # 启动 HUGSIM 使用的 pixi 命令名
+    fifo_timeout_s: 300 # FIFO 通信整体超时时间，单位秒
+    fifo_poll_interval_s: 0.2 # FIFO 轮询间隔，单位秒
+    substeps_per_rl_step: 2 # 每个 RL step 内部执行 2 个 HUGSIM 子步
+    output_root: checkpoints/hugsim_rl_eval_new # HUGSIM rollout 结果输出目录
+    recon_data_root: /root/clone/ReconDreamer-RL/assets/nus/data # ReconDreamer 对齐用的重建数据目录
+    nuscenes_root: /root/clone/ReconDreamer-RL/assets/nuscenes/v1.0-trainval # nuScenes 原始数据目录
+    frame2token_dir: /root/clone/ReconDreamer-RL/assets/nus/information/frame2token # frame 到 sample token 的映射目录
+    alignment: # HUGSIM 与 ReconDreamer 坐标对齐配置
+      enabled: true # 启用 HUGSIM 到 recon 全局坐标对齐
+      max_rmse_m: 2.0 # 对齐 RMSE 超过 2 米时视为无效
+      use_recon_cache_objects: true # 对齐后引入 recon cache 里的动态目标
+      use_hugsim_inserted_objects: true # 对齐后引入 HUGSIM 插入车辆用于 reward 和碰撞分析
+  reward: # step reward 配置
+    mode: step_path # 使用 path-based dense reward
+    dt: 0.5 # reward 计算的时间间隔，单位秒
+    CRAFT: # CRAFT corrective reward 分支配置，当前未启用
+      enable: false # 关闭 CRAFT 分支，使用普通 step_path reward
+      real_reward_model: close loop # CRAFT 若启用时使用闭环 reward 形式
+      corrective_progress: # CRAFT 进度矫正项参数
+        enable: true # 保留该分支配置，便于后续切回 CRAFT
+        weight: 0.4 # 进度矫正奖励权重
+        max_m: 1.2 # 进度矫正的正向裁剪上限，单位米
+        min_m: 0.0 # 进度矫正的下限，单位米
+        lateral_safe_m: 0.3 # 横向偏差小于该值时视为安全
+        lateral_max_m: 2.5 # 横向偏差归一化上限
+        heading_max_deg: 60.0 # 航向偏差归一化上限
+        w_lateral_efficiency: 1.5 # 横向偏差对效率衰减的权重
+        w_heading_efficiency: 1.0 # 航向偏差对效率衰减的权重
+        efficiency_floor: 0.0 # 效率项的最小下界
+      corrective: # CRAFT 稀疏安全代价参数
+        cost_off_road: 0.5 # 越界到道路外的代价
+        cost_emergency_lane: 0.2 # 占用应急车道的代价
+        cost_off_global_route: 0.5 # 偏离全局路线的代价
+        cost_red_light: 2.0 # 闯红灯代价
+        cost_stop_sign: 2.0 # 闯停牌代价
+        cost_collision: 5.0 # 碰撞代价
+      map: # CRAFT 地图约束参数
+        center_dev_max_m: 2.0 # 车道中心偏差归一化上限
+        heading_dev_max_deg: 90.0 # 航向偏差归一化上限
+        reverse_dot_threshold: -0.5 # 逆行判定的方向点积阈值
+        same_dir_dot_threshold: 0.2 # 同向车道判定阈值
+        same_dir_distance_margin_m: 0.75 # 同向匹配时的距离裕量
+    path: # 路径跟踪型 dense reward 参数
+      interp_ds_m: 0.25 # expert path 稠密插值间距，单位米
+      w_progress: 0.1 # 前向进度奖励权重，刻意压低避免激进前冲
+      progress_forward_cap_m: 0.5 # 单步正向进度奖励裁剪上限，单位米
+      progress_backward_cap_m: 0.3 # 单步反向进度裁剪上限，单位米
+      w_lateral: 0.01 # 横向偏差惩罚权重，降低以允许绕行
+      lateral_free_m: 2.0 # 横向偏差在 2 米内不惩罚
+      lateral_huber_delta_m: 1.6 # 横向偏差 Huber 转折点
+      severe_lateral_error_m: 3.5 # 超过该横向偏差视为严重偏离
+      severe_lateral_cost: 2.0 # 严重横向偏离追加代价
+      w_yaw: 0.01 # 航向偏差惩罚权重，降低以允许绕行动作
+      yaw_free_deg: 20.0 # 20 度内航向偏差不惩罚
+      yaw_huber_delta_deg: 28.0 # 航向偏差 Huber 转折点
+      severe_yaw_error_deg: 55.0 # 超过该航向误差视为严重偏离
+      severe_yaw_cost: 2.0 # 严重航向偏离追加代价
+    comfort: # 舒适性约束参数
+      w_longitudinal_jerk: 0.01 # 纵向 jerk 惩罚权重
+      longitudinal_jerk_free: 1.5 # 纵向 jerk 免罚区间
+      longitudinal_jerk_delta: 2.0 # 纵向 jerk Huber 转折点
+      w_yaw_jerk: 0.001 # 横摆 jerk 惩罚权重，极低以避免压制绕行动作
+      yaw_jerk_free: 0.2 # 横摆 jerk 免罚区间
+      yaw_jerk_delta: 0.3 # 横摆 jerk Huber 转折点
+      jerk_clip: 50.0 # jerk 数值截断上限，防止异常值爆炸
+    collision: # 碰撞惩罚参数
+      mode: dense_penalty # 发生碰撞时直接扣 dense reward
+      w_static: 19.0 # 静态碰撞惩罚
+      w_dynamic: 34.0 # 动态碰撞惩罚，设置得更重以压制顶撞策略
+    safety: # 前方障碍物安全约束参数
+      enable: true # 启用前障碍物安全门控和代价
+      lookahead_m: 40.0 # 向前看 40 米搜索风险目标
+      corridor_half_width_m: 5.5 # 前向风险走廊半宽，足够覆盖 cut-in 车辆
+      safe_gap_m: 42.0 # 期望安全间距，低于该值开始增加 clearance 风险
+      safe_ttc_s: 8.5 # 期望安全 TTC，低于该值开始增加 TTC 风险
+      w_clearance: 6.0 # 前向间距风险代价权重
+      w_ttc: 9.0 # TTC 风险代价权重
+      progress_gate_strength: 2.5 # 安全风险对 progress 奖励门控的强度
+      min_progress_gate: 0.0 # 安全门控最小值，允许完全关掉 progress 正奖励
+      default_object_half_length_m: 2.5 # 无法读到目标长度时使用的默认半车长
+    logging: # reward 日志配置
+      wandb: # reward 相关 wandb 日志配置
+        enable: true # 开启 reward 指标的 wandb 记录
+        prefix: rl # reward 指标在 wandb 中使用 rl 前缀
+    terminal: # 终局惩罚配置
+      enable: true # 启用终局奖励修正
+      xz_err_m_max: 25.0 # 位置误差阈值，超过可触发失败
+      yaw_err_deg_max: 45.0 # 航向误差阈值，超过可触发失败
+      terminate_on_xz_err: true # 超过位置误差阈值时立即终止
+      terminate_on_yaw_err: true # 超过航向误差阈值时立即终止
+      terminate_on_static_collision: true # 静态碰撞时立即终止
+      terminate_on_dynamic_collision: true # 动态碰撞时立即终止
+      penalty: -40.0 # 失败终局追加惩罚，进一步放大撞车负反馈
+      success_bonus: 0.0 # 成功到达时不额外加分
+      apply_on_failure: true # 失败场景应用 terminal penalty
+      apply_on_timeout: false # 超时场景不应用 terminal penalty
+      apply_on_env_done: false # 正常 env_done 不应用 terminal penalty
+      yaw_err_patience_steps: 5 # 航向误差连续超标 5 步后触发终止
+      xy_err_patience_steps: 4 # 位置误差连续超标 4 步后触发终止
+train: # 训练配置根节点
+  wandb: # 训练过程 wandb 配置
+    enabled: true # 开启训练 wandb 记录
+    project: ReconDiff # wandb 项目名
+    group: HUGSIM_StepPathYieldSafety_NoGRPOCraft_yieldExtreme # 当前实验组名
+  algo: reinforcepp # 使用 Reinforce++ 算法
+  eta: 1.0 # 算法内部混合系数，保留默认值
+  mode_idx: -1 # 不固定策略 mode，交给采样逻辑决定
+  policy_mode_select: sample # 通过采样选择 policy mode
+  policy_execute_mode: first_step # 执行候选轨迹的第一步动作
+  max_grad_norm: 0.5 # 梯度裁剪上限
+  policy_lr: 3.0e-06 # policy 学习率
+  clip_eps: 0.2 # 概率比裁剪阈值
+  actor_learner: # 异步 actor-learner 训练拓扑
+    mode: async # 使用异步 actor-learner 模式
+    buffer_dir: /root/clone/ReconDreamer-RL/checkpoints/actor_learner/HUGSIM_StepPathYieldSafety_NoGRPOCraft_yieldExtreme # shard 与权重交换目录
+    timestamp_buffer_dir: true # 每次运行自动在 buffer_dir 前加时间戳
+    learner_gpu_id: 0 # 单 learner 默认使用 GPU 0
+    learner_gpu_ids: # learner GPU 列表
+      - 0 # learner 实际占用的 GPU 编号
+    actor_gpu_pool: # actor 可分配 GPU 池
+      - 1 # actor 可使用 GPU 1
+      - 2 # actor 可使用 GPU 2
+      - 3 # actor 可使用 GPU 3
+    actors_per_gpu: 4 # 每张 actor GPU 上启动 4 个 actor 进程
+    auto_max_inflight_per_actor: true # 自动决定每个 actor 的最大在途 shard 数
+    pause_actor_on_learner_gpu: true # learner 所在 GPU 不再额外跑 actor
+    scene_shard_by_actor: true # 不同 actor 按场景切分采样
+    scene_shard_strategy: round_robin # 场景切分采用轮转分配
+    actor_horizon: 32 # 每个 actor 每次 rollout 的时域长度
+    num_envs_per_actor: 1 # 每个 actor 只绑定 1 个环境
+    vec_env_mode: serial # actor 内部串行执行环境
+    max_shard_version_lag: 2 # learner 允许消费的最大权重版本落后数
+    shards_per_update: 24 # learner 每次更新等待 24 个 shard
+    poll_interval_s: 0.1 # actor-learner 轮询间隔
+    shard_collect_timeout_s: 60 # 收集一轮 shard 的超时时间
+    max_updates: 32 # 本次训练最多做 32 次 learner 更新
+  minibatch_size: 4 # learner 单次小批量大小
+  gamma: 0.99 # 折扣因子
+  ddp: # 分布式训练配置
+    grad_accum_steps: 8 # 梯度累计 8 步后再做一次优化
+  grpo: # GRPO 分支配置，当前关闭
+    enable: false # 不启用 GRPO
+    config_path: null # 不加载额外 GRPO 配置文件
+    coef: 1.0 # 若启用时的 GRPO 损失系数
+    num_candidates: 8 # 若启用时每步采样 8 个候选
+    candidate_select: topk # 若启用时按 top-k 选择候选
+    objective: expected_prob # 若启用时使用 expected_prob 目标
+    temperature: 1.0 # 候选采样温度
+    norm_eps: 1.0e-06 # 数值稳定项
+    use_rank_adv: false # 不使用 rank-based advantage
+    score_clip: null # 不对 GRPO score 做额外裁剪
+    debug_visualize: false # 关闭 GRPO 调试可视化
+    debug_dir: checkpoints/visualize/HUGSIM_StepPathYieldSafety_NoGRPOCraft_yieldExtreme # GRPO 调试输出目录
+    debug_max_batches: 24 # GRPO 调试最多保存 24 个 batch
+    debug_top_k: 8 # GRPO 调试时最多展示 top 8 候选
+  reinforcepp: # Reinforce++ 特有配置
+    norm_eps: 1.0e-08 # advantage / 概率归一化的稳定项
+    kl_coef: 0.0 # 不额外加标准 KL 惩罚
+    epochs: 1 # 每轮数据只训练 1 个 epoch
+    policy_grad_weight: 0.5 # policy gradient 项权重
+    forward_kl_coef: 0.0 # forward KL 蒸馏项权重为 0
+    reverse_kl_coef: 0.5 # reverse KL 蒸馏项权重
+    distill_temperature: 1.0 # 蒸馏温度
+agent: # 被训练策略模型配置
+  type: sparsedrive_v2 # 使用 SparseDrive V2 策略
+  ckpt: SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt # 初始化权重 checkpoint
+  trainable_prefixes: [] # 不显式限定可训练前缀，交由 frozen_prefixes 控制
+  frozen_prefixes: [_backbone] # 冻结 backbone，避免底层视觉特征被 RL 过度破坏
+  nuscenes_scorer: # 轨迹级 scorer 配置，主要服务候选评估
+    backend: craft_carl # 使用 craft_carl scorer 后端
+    scene_cache_root: /root/clone/ReconDreamer-RL/assets/nus/cache # scene cache 根目录
+    ea_gate_enabled: false # 不启用 EA gate
+    driving_direction_gate_enabled: false # 不启用行驶方向 gate
+    center_dev_max_m: 2.0 # 中心线偏差归一化上限
+    heading_dev_max_deg: 90.0 # 航向偏差归一化上限
+    off_global_route_threshold_m: 3.0 # 偏离全局路线超过 3 米视为 off-route
+    carl: # CARL 打分细节参数
+      dp_min: 0.0 # 进度增益归一化下界
+      dp_max: 1.2 # 进度增益归一化上界
+      w_prog: 8.0 # progress 项权重
+      w_g: 3.0 # global deviation 项权重
+      w_c: 0.8 # center deviation 项权重
+      w_h: 2.0 # heading deviation 项权重
+      efficiency_floor: 0.0 # 效率项下界
+      ddev_clip: 0.1 # 偏差裁剪阈值
+      k_g: 0.4 # global deviation 指数衰减系数
+      k_c: 0.2 # center deviation 指数衰减系数
+      k_h: 0.4 # heading deviation 指数衰减系数
+      correction_apply_thresh_global: 0.08 # global correction 启动阈值
+      correction_apply_thresh_center: 0.08 # center correction 启动阈值
+      corr_clip: 0.5 # correction 裁剪上限
+      cost_off_road: 1.5 # off-road 代价
+      cost_opposite_lane: 0.1 # 逆向车道代价
+      cost_off_global_route: 1.5 # 偏离全局路线代价
+      cost_emergency_lane: 1.0 # 进入应急车道代价
+      term_collision: 40.0 # 碰撞终局代价
+      term_route_dev: 40.0 # 路线严重偏离终局代价
+      term_red_light: 40.0 # 闯红灯终局代价
+      term_stop_sign: 40.0 # 闯停牌终局代价

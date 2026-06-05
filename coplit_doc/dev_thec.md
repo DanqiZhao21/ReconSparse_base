@@ -263,7 +263,7 @@ class Agent:
 
 | 文件 | 策略模型 | 说明 |
 |------|----------|------|
-| `policy_sparsedrive_v2.py` | SparseDriveV2 | 当前主用，扩散模型策略 |
+| `policy_sparsedrive_v2.py` | SparseDriveV2 | 当前主用，dense anchor策略 |
 | `policy_sparsedrive.py` | SparseDrive | 老版本 |
 | `policy_diffusiondrivev2.py` | DiffusionDriveV2 | 另一套扩散驾驶策略 |
 | `policy_dummy.py` | 虚拟 Agent | 测试/调试用 |
@@ -299,25 +299,29 @@ graph LR
 通过 FIFO 管道与 HUGSIM-ORI 子进程通信：
 
 ```mermaid
-sequenceDiagram
-    participant Actor as Actor进程
-    participant Adapter as hugsim_adapter.py
-    participant Runner as hugsim_fifo_runner.py(子进程)
-    participant HUGSIM as HUGSIM-ORI(pixi环境)
+HUGSIM 自动驾驶强化学习 跨进程通信流程
 
-    Actor->>Adapter: env.reset()
-    Adapter->>Runner: 写 reset 命令到 FIFO
-    Runner->>HUGSIM: 调用 HUGSIM API
-    HUGSIM->>Runner: 返回 obs
-    Runner->>Adapter: 写 obs 到 FIFO
-    Adapter->>Actor: 返回标准化后的 obs
+==================== 单个 Episode 开始 ====================
 
-    Actor->>Adapter: env.step(action)
-    Adapter->>Runner: 写 action 到 FIFO
-    Runner->>HUGSIM: 执行 step
-    HUGSIM->>Runner: 返回 next_obs, reward_info
-    Runner->>Adapter: 写结果到 FIFO
-    Adapter->>Actor: 返回 (obs, reward, done, info)
+1. Actor 进程           -->  Adapter: env.reset
+2. Adapter              -->  Runner: 写入 reset 命令到 FIFO
+3. Runner               -->  HUGSIM: 调用仿真 API 重置环境
+4. HUGSIM               -->  Runner: 返回观测值 obs
+5. Runner               -->  Adapter: 写入 obs 到 FIFO
+6. Adapter              -->  Actor 进程: 返回标准化 obs
+
+--------------------- Step 循环（直到 done）---------------------
+
+7. Actor 进程           -->  Adapter: env.step(action)
+8. Adapter              -->  Runner: 写入 action 到 FIFO
+9. Runner               -->  HUGSIM: 执行仿真单步
+10. HUGSIM              -->  Runner: 返回 next_obs, reward
+11. Runner              -->  Adapter: 写入结果到 FIFO
+12. Adapter             -->  Actor 进程: 返回 (obs, reward, done, info)
+
+重复 7~12 步 ……
+
+==================== 单个 Episode 结束 ====================
 ```
 
 **HUGSIM 对齐**：`hugsim_recon_alignment.py` 负责把 HUGSIM 坐标系的目标框、自车位姿转换到 Recon 坐标系，让奖励函数可以统一处理。

@@ -101,7 +101,7 @@ def _resolve_repo_path(path: str) -> str:
 
 
 _DEFAULT_CKPT = os.path.join(_resolve_ego_ads_subdir("SparseDriveV2"), "ckpt", "sparsedrive_navsimv2.ckpt")
-_DEFAULT_OUTPUT_ROOT = os.path.join(_REPO_ROOT, "outputs", "RewardCheckandVideo")
+_DEFAULT_OUTPUT_ROOT = os.path.join(_REPO_ROOT, "checkpoints", "RewardCheckandVideo")
 _DEFAULT_HUGSIM_OUTPUT_ROOT = os.path.join(_DEFAULT_OUTPUT_ROOT, "HUGSIM")
 
 
@@ -1991,6 +1991,7 @@ def main() -> None:
     if step_dt_s <= 0:
         raise RuntimeError("Invalid step dt")
     max_steps = None if args.duration_s is None else max(1, int(round(float(args.duration_s) / step_dt_s)))
+    print(f"zjh Calculated max_steps={max_steps} from duration_s={args.duration_s} and step_dt_s={step_dt_s:.3f}")
     fps = float(args.fps) if args.fps is not None else (1.0 / step_dt_s)
 
     print("==== generate_video_sparsedrive_v2 ====")

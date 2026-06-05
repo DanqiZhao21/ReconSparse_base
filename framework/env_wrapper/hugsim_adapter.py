@@ -462,9 +462,12 @@ def _compute_front_obstacle_metrics(
     ego_yaw: float,
     ego_speed_mps: float,
     objects: list[dict[str, Any]],
+    ego_half_length_m: float = 2.5,
+    corridor_half_width_m: float | None = None,
 ) -> dict[str, Any]:
     heading = np.asarray([math.cos(float(ego_yaw)), math.sin(float(ego_yaw))], dtype=np.float64)
     lateral_axis = np.asarray([-heading[1], heading[0]], dtype=np.float64)
+    ego_proj = float(np.dot(np.asarray(ego_xy, dtype=np.float64), heading))
     best: dict[str, Any] | None = None
     for obj in objects:
         if not isinstance(obj, dict):
@@ -474,10 +477,13 @@ def _compute_front_obstacle_metrics(
             continue
         center = np.mean(poly, axis=0)
         rel_center = center - np.asarray(ego_xy, dtype=np.float64)
-        gap = float(np.dot(rel_center, heading))
+        lateral = float(np.dot(rel_center, lateral_axis))
+        if corridor_half_width_m is not None and abs(lateral) > float(corridor_half_width_m):
+            continue
+        poly_proj = poly @ heading
+        gap = float(np.min(poly_proj) - ego_proj - float(ego_half_length_m))
         if gap <= 0.0:
             continue
-        lateral = float(np.dot(rel_center, lateral_axis))
         velocity = np.asarray(obj.get("velocity", obj.get("velocity_xy", [0.0, 0.0])), dtype=np.float64).reshape(-1)
         obj_forward_v = float(np.dot(velocity[:2], heading)) if velocity.shape[0] >= 2 else 0.0
         closing = max(0.0, float(ego_speed_mps) - obj_forward_v)
@@ -489,6 +495,8 @@ def _compute_front_obstacle_metrics(
             "front_obstacle_closing_speed_mps": closing,
             "front_obstacle_ttc_s": ttc,
             "front_obstacle_category": str(obj.get("category", obj.get("type", ""))),
+            "front_obstacle_source": str(obj.get("source", "")),
+            "front_obstacle_token": str(obj.get("token", "")),
         }
         if best is None or gap < float(best["front_obstacle_gap_m"]):
             best = item
@@ -501,6 +509,8 @@ def _compute_front_obstacle_metrics(
         "front_obstacle_closing_speed_mps": 0.0,
         "front_obstacle_ttc_s": math.inf,
         "front_obstacle_category": "",
+        "front_obstacle_source": "",
+        "front_obstacle_token": "",
     }
 
 
@@ -976,6 +986,13 @@ class HUGSIMReconEnv:
         if reward_pose is not None:
             ego_xy = np.asarray(reward_pose[:3, 3][[0, 2]], dtype=np.float64)
             ego_yaw = float(alignment.transform.transform_yaw(float(np.asarray(hugsim_info.get("ego_box", [0, 0, 0, 0, 0, 0, 0])).reshape(-1)[6])))
+            safety_cfg = self.reward_cfg.get("safety", {}) if isinstance(self.reward_cfg, dict) else {}
+            if not isinstance(safety_cfg, dict):
+                safety_cfg = {}
+            ego_box = np.asarray(hugsim_info.get("ego_box", [0.0, 0.0, 0.0, 2.0, 5.0, 1.5, 0.0]), dtype=np.float64).reshape(-1)
+            ego_half_length_m = 2.5
+            if ego_box.shape[0] >= 5:
+                ego_half_length_m = max(0.0, 0.5 * float(ego_box[4]))
             try:
                 ego_speed = float(hugsim_info.get("ego_velo", 0.0))
             except Exception:
@@ -985,7 +1002,9 @@ class HUGSIMReconEnv:
                     ego_xy=ego_xy,
                     ego_yaw=ego_yaw,
                     ego_speed_mps=ego_speed,
-                    objects=objects,
+                    objects=[*hugsim_objects, *objects],
+                    ego_half_length_m=ego_half_length_m,
+                    corridor_half_width_m=float(safety_cfg.get("corridor_half_width_m", 5.0)),
                 )
             )
         return out
@@ -1145,6 +1164,14 @@ class HUGSIMReconEnv:
             step_idx=int(mapping.frame_idx),
             done=bool(terminated or truncated),
         )
+        term_cfg = self.reward_cfg.get("terminal", {}) if isinstance(self.reward_cfg, dict) else {}
+        if bool(terminated or truncated) and isinstance(term_cfg, dict) and bool(term_cfg.get("enable", False)):
+            reward_result = self._reward_computer.apply_terminal_penalty(
+                reward=float(reward_result.reward),
+                info=reward_result.info,
+                term_cfg=term_cfg,
+                terminal_kind=str(info.get("terminal_kind", "")).strip() or None,
+            )
         return obs, float(reward_result.reward), bool(terminated), bool(truncated), reward_result.info
 
     def close(self) -> None:

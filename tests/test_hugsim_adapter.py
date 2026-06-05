@@ -480,6 +480,87 @@ def test_hugsim_recon_env_exposes_collision_terminal_metadata(monkeypatch, tmp_p
     assert info["obj_boxes"] == terminal_info["obj_boxes"]
 
 
+def test_hugsim_recon_env_applies_terminal_penalty_to_recondreamer_reward(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+    calls = []
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name="scene-0013",
+                recon_scene_id=12,
+                sample_token="tok1",
+                frame_idx=5,
+                sample_index=1,
+                sample_relative_time_s=0.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    class FakeEnv:
+        def reset(self):
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            self.reward_cfg = reward_cfg
+
+        def reset(self):
+            pass
+
+        def compute(self, *, env, info, step_idx, done):
+            calls.append(("compute", done, dict(info)))
+            out = dict(info)
+            out["reward"] = -3.0
+            return TrackingRewardResult(reward=-3.0, info=out)
+
+        def apply_terminal_penalty(self, *, reward, info, term_cfg, terminal_kind):
+            calls.append(("terminal", reward, dict(term_cfg), terminal_kind))
+            out = dict(info)
+            out["terminal_penalty"] = float(term_cfg["penalty"])
+            out["terminal_penalty_applied"] = True
+            out["reward"] = float(reward) + float(term_cfg["penalty"])
+            return TrackingRewardResult(reward=out["reward"], info=out)
+
+    terminal_info = _fake_hugsim_info(0.5)
+    terminal_info["collision"] = True
+
+    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        hugsim_adapter,
+        "execute_hugsim_control_horizon",
+        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
+            _fake_hugsim_obs(image),
+            0.0,
+            True,
+            False,
+            terminal_info,
+        ),
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={"mode": "step_path", "terminal": {"enable": True, "penalty": -40.0, "apply_on_failure": True}},
+        output_root=tmp_path,
+        recon_data_root=tmp_path,
+    )
+
+    env.reset()
+    _obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert terminated is True
+    assert truncated is False
+    assert reward == pytest.approx(-43.0)
+    assert info["terminal_penalty"] == pytest.approx(-40.0)
+    assert info["terminal_penalty_applied"] is True
+    assert ("terminal", -3.0, {"enable": True, "penalty": -40.0, "apply_on_failure": True}, "failure") in calls
+
+
 def test_hugsim_recon_env_forces_done_when_hugsim_reports_collision_without_termination(monkeypatch, tmp_path):
     from framework.env_wrapper import hugsim_adapter
     from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
@@ -551,6 +632,92 @@ def test_hugsim_recon_env_forces_done_when_hugsim_reports_collision_without_term
     assert info["dynamic_collision"] is True
     assert info["terminal_kind"] == "failure"
     assert info["done_reason"] == "hugsim_collision"
+
+
+def test_hugsim_recon_env_front_obstacle_prefers_hugsim_inserted_objects(monkeypatch, tmp_path):
+    from framework.env_wrapper import hugsim_adapter
+    from framework.env_wrapper.hugsim_recon_alignment import HUGSIMReconAlignment, Sim2Transform
+    from framework.env_wrapper.hugsim_scene_index import HUGSIMFrameMapping
+
+    image = np.zeros((450, 800, 3), dtype=np.uint8)
+
+    class FakeSceneIndex:
+        def map_time(self, official_scene_name, relative_time_s):
+            return HUGSIMFrameMapping(
+                official_scene_name="scene-0013",
+                recon_scene_id=12,
+                sample_token="tok1",
+                frame_idx=5,
+                sample_index=1,
+                sample_relative_time_s=0.5,
+                hugsim_relative_time_s=relative_time_s,
+            )
+
+    class FakeEnv:
+        def reset(self):
+            return _fake_hugsim_obs(image), _fake_hugsim_info(0.0)
+
+    class FakeRewardComputer:
+        def __init__(self, reward_cfg):
+            pass
+
+        def reset(self):
+            pass
+
+        def compute(self, *, env, info, step_idx, done):
+            out = dict(info)
+            out["reward"] = 0.0
+            return TrackingRewardResult(reward=0.0, info=out)
+
+    step_info = _fake_hugsim_info(0.5)
+    step_info["collision"] = False
+    step_info["ego_box"] = [0.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]
+    step_info["obj_boxes"] = [[8.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0]]
+    alignment = HUGSIMReconAlignment(
+        official_scene_name="scene-0013",
+        recon_scene_id=12,
+        transform=Sim2Transform(scale=1.0, rotation=np.eye(2), translation_xy=np.asarray([0.0, 0.0])),
+        valid=True,
+    )
+
+    monkeypatch.setattr(hugsim_adapter, "create_hugsim_env", lambda **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        hugsim_adapter,
+        "execute_hugsim_control_horizon",
+        lambda env, plan_traj, initial_info, substeps_per_rl_step, hugsim_repo: (
+            _fake_hugsim_obs(image),
+            0.0,
+            False,
+            False,
+            step_info,
+        ),
+    )
+    monkeypatch.setattr(hugsim_adapter, "TrackingRewardComputer", FakeRewardComputer)
+    monkeypatch.setattr(hugsim_adapter, "build_hugsim_recon_alignment", lambda **kwargs: alignment)
+
+    env = hugsim_adapter.HUGSIMReconEnv(
+        scenario_name="scene-0013",
+        scenario_path="/tmp/scene-0013-easy-00.yaml",
+        scene_index=FakeSceneIndex(),
+        reward_cfg={"mode": "step_path", "safety": {"corridor_half_width_m": 5.5}},
+        output_root=tmp_path,
+        recon_data_root=tmp_path,
+        use_recon_cache_objects=False,
+        use_hugsim_inserted_objects=True,
+        hugsim_model_base=tmp_path / "hugsim",
+    )
+
+    env.reset()
+    _obs, reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
+
+    assert reward == 0.0
+    assert terminated is False
+    assert truncated is False
+    assert info["front_obstacle_available"] is True
+    assert info["front_obstacle_source"] == "hugsim_inserted"
+    assert info["front_obstacle_token"] == "hugsim_obj_0"
+    assert info["front_obstacle_category"] == "vehicle.car"
+    assert info["front_obstacle_gap_m"] == pytest.approx(4.0)
 
 
 def test_hugsim_recon_env_forces_done_when_aligned_bev_objects_collide(monkeypatch, tmp_path):
@@ -968,7 +1135,7 @@ def test_hugsim_recon_env_adds_recon_cache_dynamic_objects_and_front_obstacle_me
                         {
                             "token": "veh_a",
                             "category": "vehicle.car",
-                            "poly": [[113.0, 51.0], [113.0, 49.0], [111.0, 49.0], [111.0, 51.0]],
+                            "poly": [[116.0, 51.0], [116.0, 49.0], [114.0, 49.0], [114.0, 51.0]],
                             "velocity": [0.0, 0.0],
                         }
                     ]

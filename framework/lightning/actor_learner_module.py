@@ -4,7 +4,7 @@ import os
 import time
 from typing import Any, Dict
 
-from framework.io.buffer import move_to_consumed, prune_consumed, read_int, write_int
+from framework.io.buffer import move_to_consumed, prune_consumed, read_int, request_stop, write_int
 from framework.lightning.trajectory_module import TrajectoryLightningModule
 
 try:
@@ -36,6 +36,12 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
         self.global_train_seen_sample_step = 0
         self._update_train_t0 = 0.0
         self._latest_epoch_had_data = False
+
+    def _should_request_stop_after_update_end(self) -> bool:
+        max_updates = int(self.learner_config.max_updates)
+        if max_updates <= 0:
+            return False
+        return int(self._update_index()) >= (max_updates - 1)
 
     def _inner_epochs(self) -> int:
         return max(1, int(self.learner_config.inner_epochs))
@@ -87,6 +93,11 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             try:
                 self.agent.save_checkpoint(self.paths.latest_ckpt)
                 write_int(self.paths.version_file, new_v)
+                if self._should_request_stop_after_update_end():
+                    request_stop(
+                        self.paths,
+                        reason=f"learner reached max_updates={int(self.learner_config.max_updates)}",
+                    )
                 for fp in selected:
                     move_to_consumed(self.paths, fp)
                 prune_consumed(self.paths, keep_basenames={os.path.basename(fp) for fp in selected})
@@ -128,6 +139,10 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             metrics = self.aggregated_update_metrics()
             timing_parts = self.aggregated_update_timing()
             self.stage_fn(f"[learner] stage3 broadcast: ver={new_v}")
+            if self._should_request_stop_after_update_end():
+                self.stage_fn(
+                    f"[learner] requested actor stop after final update={int(self._update_index())}"
+                )
             self.stage_fn(
                 f"[learner] update={int(self._update_index())} shards={len(selected)} "
                 f"samples={n} ver={new_v} metrics={metrics}"

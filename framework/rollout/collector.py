@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -161,6 +161,7 @@ def collect_single_env_shard(
     shard_idx: int,
     store_obs: bool = True,
     end_shard_on_done: bool = False,
+    stop_checker: Callable[[], bool] | None = None,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -181,6 +182,8 @@ def collect_single_env_shard(
     step_count = 0
     collect_t0 = time.perf_counter()
     while step_count < int(horizon):
+        if step_count > 0 and callable(stop_checker) and bool(stop_checker()):
+            break
         obs_decision = obs
         step_timing: Dict[str, float] = {}
         obs_t: torch.Tensor | None = None
@@ -208,12 +211,15 @@ def collect_single_env_shard(
         done_buf.append(1.0 if done else 0.0)
         terminated_buf.append(1.0 if bool(terminated) else 0.0)
         truncated_buf.append(1.0 if bool(truncated) else 0.0)
-        step_count += 1
 
         if bool(store_obs):
             last_next_obs_t = _default_obs_tensor(next_obs_after)
         last_done = 1.0 if done else 0.0
         last_terminated = 1.0 if bool(terminated) else 0.0
+        step_count += 1
+        if callable(stop_checker) and bool(stop_checker()):
+            step_records.append(step_timing)
+            break
 
         if done:
             counters["done_count"] += 1
@@ -282,6 +288,7 @@ def collect_vector_env_shards(
     local_ver: int,
     shard_idx_per_env: List[int],
     store_obs: bool = True,
+    stop_checker: Callable[[], bool] | None = None,
 ) -> tuple[List[Dict[str, Any]], List[Any]]:
     obs_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
     old_logp_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
@@ -301,6 +308,8 @@ def collect_vector_env_shards(
     step_count = 0
     collect_t0 = time.perf_counter()
     while step_count < int(horizon):
+        if step_count > 0 and callable(stop_checker) and bool(stop_checker()):
+            break
         act_t0 = time.perf_counter()
         obs_t_list = [_default_obs_tensor(obs) for obs in obs_list] if bool(store_obs) else []
         actions0, logps, replays = agent.act_batch(
@@ -356,6 +365,8 @@ def collect_vector_env_shards(
             step_records_by_env[i].append(step_timing)
 
         step_count += 1
+        if callable(stop_checker) and bool(stop_checker()):
+            break
 
     shards: List[Dict[str, Any]] = []
     for i in range(int(num_envs_per_actor)):

@@ -148,6 +148,28 @@ def test_collect_single_env_shard_can_finish_early_on_done_for_expensive_envs() 
     assert int(next_obs["front"][0, 0, 0]) == 101
 
 
+def test_collect_single_env_shard_stops_mid_shard_when_stop_requested() -> None:
+    env = _TinyEnv()
+
+    shard, _next_obs = collect_single_env_shard(
+        env=env,
+        agent=_TinyAgent(),
+        obs=_obs(0),
+        horizon=4,
+        eta=1.0,
+        mode_idx=-1,
+        mode_select="sample",
+        actor_id=0,
+        local_ver=1,
+        shard_idx=0,
+        store_obs=False,
+        stop_checker=lambda: env.step_count >= 1,
+    )
+
+    assert shard["reward"].shape == (1,)
+    assert env.step_count == 1
+
+
 def test_replay_feature_ppo_batch_accepts_shard_without_obs(tmp_path: Path) -> None:
     shard_path = tmp_path / "shard.pt"
     _write_shard(
