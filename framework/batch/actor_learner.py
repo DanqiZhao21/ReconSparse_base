@@ -258,7 +258,7 @@ def build_training_batch(
                             continue
 
                 ret_i = compute_returns(rewards=rewards_i, dones=dones_i, gamma=float(gamma))
-                adv_i = ret_i# no baseline
+                adv_i = ret_i # no baseline
                 if torch.is_tensor(old_logp_i) and int(old_logp_i.numel()) > 0:
                     old_logp_all.append(old_logp_i.to(device=device, dtype=torch.float32).view(-1))
                 adv_all.append(adv_i)

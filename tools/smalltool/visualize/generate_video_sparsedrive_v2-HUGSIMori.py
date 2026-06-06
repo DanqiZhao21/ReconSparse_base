@@ -18,8 +18,8 @@ python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   
 python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   --hugsim-scene scene-0411-medium-00 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606021200_HUGSM_reinforcepp_closed_loop_reward-progress_hd_GRPOCraft_substeps1.yaml \
-  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606051203_HUGSM_reinforcepp_closed_loop_steppath_hd_collision_only_extreme_NoGRPOCraft_substeps1.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
   --mode-select greedy
 """
 
@@ -1727,6 +1727,21 @@ def _collect_hugsim_shard_and_export(args: argparse.Namespace) -> None:
                 f"reward={float(row['reward']):.5f} cum_reward={float(row['cum_reward']):.5f} done={bool(row['done'])}",
                 f"mode_idx={row['mode_idx']} old_logp={float(row['old_logp']):.5f} sample={str(row['sample_token'])[:12]}",
             ]
+            if any(
+                key in info
+                for key in (
+                    "recon_cache_frame_idx",
+                    "recon_cache_dynamic_frame_idx",
+                    "recon_cache_time_frame_idx",
+                )
+            ):
+                lines.append(
+                    "cache "
+                    f"map={_maybe_int(info.get('recon_cache_frame_idx', -1))} "
+                    f"dyn={_maybe_int(info.get('recon_cache_dynamic_frame_idx', -1))} "
+                    f"time={_maybe_int(info.get('recon_cache_time_frame_idx', -1))} "
+                    f"dyn_src={str(info.get('recon_cache_dynamic_frame_source', ''))}"
+                )
             frame_out = _resize_frame_min_width(_grid_frame_available_cameras(obs), 960)
             frame_out = _overlay_debug_text(frame_out, lines)
             scene_id = _maybe_int(row.get("scene_id", -1))

@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_
   --max-steps 42 \
   --num-candidates 64 \
   --top-k 3 \
-  --mode-select sample
+  --mode-select greedy
 """
 
 from __future__ import annotations

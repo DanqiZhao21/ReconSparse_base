@@ -868,8 +868,8 @@ class HUGSIMReconEnv:
             if scene_id not in self._recon_env_cache:
                 self._recon_env_cache[scene_id] = _load_recon_env_cache(self.recon_data_root, scene_id)
             cache = self._recon_env_cache.get(scene_id, {})
-            time_frame_used, _time_snap = _snapshot_for_frame(cache, int(mapping.frame_idx))
-            frame_used, snap = time_frame_used, _time_snap
+            time_frame_used, time_snap = _snapshot_for_frame(cache, int(mapping.frame_idx))
+            frame_used, map_snap = time_frame_used, time_snap
             frame_source = "time_mapping"
             pose_dist_m: float | None = None
             if reward_pose is not None:
@@ -885,27 +885,35 @@ class HUGSIMReconEnv:
                 )
                 if nearest_frame is not None:
                     frame_used = int(nearest_frame)
-                    snap = dict(cache[int(nearest_frame)])
+                    map_snap = dict(cache[int(nearest_frame)])
                     frame_source = "nearest_pose"
                     pose_dist_m = float(nearest_dist) if nearest_dist is not None else None
+            dynamic_frame_used, dynamic_snap = frame_used, map_snap
+            dynamic_frame_source = frame_source
             out["recon_cache_frame_idx"] = -1 if frame_used is None else int(frame_used)
             out["recon_cache_time_frame_idx"] = -1 if time_frame_used is None else int(time_frame_used)
+            out["recon_cache_dynamic_frame_idx"] = -1 if dynamic_frame_used is None else int(dynamic_frame_used)
             out["recon_cache_frame_source"] = frame_source
+            out["recon_cache_dynamic_frame_source"] = dynamic_frame_source
             token_for_frame = getattr(self.scene_index, "sample_token_for_frame", None)
             if callable(token_for_frame):
                 if time_frame_used is not None:
                     time_token = token_for_frame(scene_id, int(time_frame_used))
                     if time_token is not None:
                         out["recon_cache_time_sample_token"] = str(time_token)
+                        if dynamic_frame_used == time_frame_used:
+                            out["recon_cache_dynamic_sample_token"] = str(time_token)
                 if frame_used is not None:
                     frame_token = token_for_frame(scene_id, int(frame_used))
                     if frame_token is not None:
                         out["recon_cache_sample_token"] = str(frame_token)
                         out["grpo_gt_sample_token"] = str(frame_token)
                         out["grpo_gt_frame_idx"] = int(frame_used)
+                        if dynamic_frame_used == frame_used and "recon_cache_dynamic_sample_token" not in out:
+                            out["recon_cache_dynamic_sample_token"] = str(frame_token)
             if pose_dist_m is not None:
                 out["recon_cache_frame_pose_dist_m"] = pose_dist_m
-            if reward_pose is not None and isinstance(snap, dict):
+            if reward_pose is not None and isinstance(map_snap, dict):
                 craft_cfg = self.reward_cfg.get("CRAFT", {}) if isinstance(self.reward_cfg, dict) else {}
                 if isinstance(craft_cfg, dict) and bool(craft_cfg.get("enable", False)):
                     map_cfg = craft_cfg.get("map", {}) or {}
@@ -917,7 +925,7 @@ class HUGSIMReconEnv:
                         ego_y = float(reward_pose[2, 3])
                         ego_yaw = float(math.atan2(float(reward_pose[2, 0]), float(reward_pose[0, 0])))
                         map_metrics = compute_craft_map_metrics(
-                            snap,
+                            map_snap,
                             ego_x=ego_x,
                             ego_y=ego_y,
                             ego_yaw=ego_yaw,
@@ -940,7 +948,7 @@ class HUGSIMReconEnv:
                         out.update(map_metrics)
                     except Exception as exc:
                         out["map_metrics_error"] = str(exc)
-            raw_objects = snap.get("dynamic_objects", []) if isinstance(snap, dict) else []
+            raw_objects = dynamic_snap.get("dynamic_objects", []) if isinstance(dynamic_snap, dict) else []
             objects = [dict(obj) for obj in raw_objects if isinstance(obj, dict)]
             for obj in objects:
                 obj.setdefault("source", "recon_cache")

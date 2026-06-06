@@ -717,7 +717,7 @@ def test_hugsim_recon_env_collides_with_recon_cache_objects_using_local_alignmen
     assert info["hugsim_aligned_collision_tokens"] == ["veh_cache"]
 
 
-def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
+def test_hugsim_recon_env_uses_nearest_pose_dynamic_objects_with_time_cache_metadata(
     monkeypatch, tmp_path
 ):
     from framework.env_wrapper import hugsim_adapter
@@ -739,9 +739,9 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
                 "125": {
                     "dynamic_objects": [
                         {
-                            "token": "wrong_time_vehicle",
+                            "token": "time_mapped_vehicle",
                             "category": "vehicle.car",
-                            "poly": [[171.0, 1.0], [171.0, -1.0], [167.0, -1.0], [167.0, 1.0]],
+                            "poly": [[131.0, 1.0], [131.0, -1.0], [127.0, -1.0], [127.0, 1.0]],
                         }
                     ]
                 },
@@ -750,7 +750,7 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
                         {
                             "token": "nearest_pose_vehicle",
                             "category": "vehicle.car",
-                            "poly": [[205.0, 1.0], [205.0, -1.0], [201.0, -1.0], [201.0, 1.0]],
+                            "poly": [[171.0, 1.0], [171.0, -1.0], [167.0, -1.0], [167.0, 1.0]],
                         }
                     ]
                 },
@@ -793,7 +793,7 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
             pass
 
         def compute(self, *, env, info, step_idx, done):
-            assert done is False
+            assert done is True
             return TrackingRewardResult(reward=1.0, info=dict(info))
 
     _install_fake_fifo_client(
@@ -817,12 +817,16 @@ def test_hugsim_recon_env_selects_recon_cache_frame_by_aligned_ego_position(
     env.reset()
     _obs, _reward, terminated, truncated, info = env.step((0.0, 0.0, 0.0, 2))
 
-    assert not terminated
+    assert terminated
     assert not truncated
-    assert info["collision"] is False
+    assert info["collision"] is True
+    assert info["dynamic_collision"] is True
+    assert info["hugsim_aligned_collision_tokens"] == ["nearest_pose_vehicle"]
     assert info["recon_cache_frame_idx"] == 169
     assert info["recon_cache_frame_source"] == "nearest_pose"
     assert info["recon_cache_time_frame_idx"] == 125
+    assert info["recon_cache_dynamic_frame_idx"] == 169
+    assert info["recon_cache_dynamic_frame_source"] == "nearest_pose"
     assert info["recon_cache_sample_token"] == "tok169"
     assert info["recon_cache_time_sample_token"] == "tok125"
     assert info["grpo_gt_sample_token"] == "tok169"

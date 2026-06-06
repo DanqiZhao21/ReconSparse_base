@@ -33,7 +33,7 @@ env:
       use_hugsim_inserted_objects: true
     substeps_per_rl_step: 1
   reward:
-    mode: craft_close_loop
+    mode: step_path
     craft_close_loop:
       dt: 0.5
       CRAFT:
@@ -166,13 +166,13 @@ env:
         enable: false
       path:
         interp_ds_m: 0.25
-        w_progress: 1.0
+        w_progress: 0.0
         progress_forward_cap_m: 2.0
         progress_backward_cap_m: 0.5
-        w_lateral: 0.25
+        w_lateral: 100.0
         lateral_free_m: 0.3
         lateral_huber_delta_m: 0.5
-        w_yaw: 0.1
+        w_yaw: 20.0
         yaw_free_deg: 5.0
         yaw_huber_delta_deg: 10.0
         severe_gate_scale: 0.0
@@ -181,28 +181,28 @@ env:
         severe_yaw_error_deg: null
         severe_yaw_cost: 0.0
       comfort:
-        w_longitudinal_jerk: 0.01
+        w_longitudinal_jerk: 0.0
         longitudinal_jerk_free: 1.5
         longitudinal_jerk_delta: 2.0
-        w_yaw_jerk: 0.01
+        w_yaw_jerk: 0.0
         yaw_jerk_free: 0.2
         yaw_jerk_delta: 0.3
         jerk_clip: 50.0
       collision:
-        mode: constraint_gate
-        w_static: 5.0
-        w_dynamic: 5.0
-        gate_scale: 0.0
+        mode: dense_penalty  # dense_penalty  && constraint_gate
+        w_static: 0.0
+        w_dynamic: 0.0
+        gate_scale: 0.0 #gate_scale 只在 constraint_gate 模式下用
       safety:
         enable: false
         lookahead_m: 15.0
         corridor_half_width_m: 2.5
         safe_gap_m: 8.0
         safe_ttc_s: 3.0
-        w_clearance: 0.0
-        w_ttc: 0.0
+        w_clearance: 1.0
+        w_ttc: 1.0
         progress_gate_strength: 1.0
-        min_progress_gate: 0.0
+        min_progress_gate: 0.3
       ea:
         enable: false
         weight: 0.0
@@ -229,7 +229,7 @@ train:
   wandb:
     enabled: true
     project: ReconDiff
-    group: HUGSIM_RewardProgressHD_NoGRPOCraft_Substeps1
+    group: HUGSIM_RewardTrackingPenaltyExtreme_NoGRPOCraft_Substeps1
   algo: reinforcepp
   eta: 1.0
   mode_idx: -1
@@ -240,7 +240,7 @@ train:
   clip_eps: 0.2
   actor_learner:
     mode: async
-    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_RewardProgressHD_NoGRPOCraft_Substeps1
+    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_RewardTrackingPenaltyExtreme_NoGRPOCraft_Substeps1
     timestamp_buffer_dir: true
     learner_gpu_id: 0
     learner_gpu_ids:
@@ -278,9 +278,9 @@ train:
   ddp:
     grad_accum_steps: 8
   grpo:
-    enable: true
+    enable: false
     config_path: null
-    coef: 2.0
+    coef: 0.0
     num_candidates: 8
     candidate_select: topk
     objective: expected_prob
@@ -289,16 +289,16 @@ train:
     use_rank_adv: false
     score_clip: null
     debug_visualize: false
-    debug_dir: outputs/visualize/HUGSIM_RewardProgressHD_NoGRPOCraft_Substeps1
+    debug_dir: outputs/visualize/HUGSIM_RewardTrackingPenaltyExtreme_NoGRPOCraft_Substeps1
     debug_max_batches: 24
     debug_top_k: 8
   reinforcepp:
     norm_eps: 1.0e-08
     kl_coef: 0.0
     epochs: 1
-    policy_grad_weight: 0.5
+    policy_grad_weight: 1.0
     forward_kl_coef: 0.0
-    reverse_kl_coef: 0.5
+    reverse_kl_coef: 0.0
     distill_temperature: 1.0
 agent:
   type: sparsedrive_v2

@@ -33,7 +33,7 @@ env:
       use_hugsim_inserted_objects: true
     substeps_per_rl_step: 1
   reward:
-    mode: craft_close_loop
+    mode: step_path
     craft_close_loop:
       dt: 0.5
       CRAFT:
@@ -166,7 +166,7 @@ env:
         enable: false
       path:
         interp_ds_m: 0.25
-        w_progress: 1.0
+        w_progress: 5.0  #前进奖励调高
         progress_forward_cap_m: 2.0
         progress_backward_cap_m: 0.5
         w_lateral: 0.25
@@ -189,20 +189,20 @@ env:
         yaw_jerk_delta: 0.3
         jerk_clip: 50.0
       collision:
-        mode: constraint_gate
-        w_static: 5.0
-        w_dynamic: 5.0
-        gate_scale: 0.0
+        mode: dense_penalty  # dense_penalty  && constraint_gate
+        w_static: 200.0
+        w_dynamic: 200.0
+        gate_scale: 0.0 #gate_scale 只在 constraint_gate 模式下用
       safety:
-        enable: false
+        enable: true #大概了saftey 开关
         lookahead_m: 15.0
         corridor_half_width_m: 2.5
         safe_gap_m: 8.0
         safe_ttc_s: 3.0
-        w_clearance: 0.0
-        w_ttc: 0.0
+        w_clearance: 1.0
+        w_ttc: 1.0
         progress_gate_strength: 1.0
-        min_progress_gate: 0.0
+        min_progress_gate: 0.3
       ea:
         enable: false
         weight: 0.0
@@ -230,7 +230,7 @@ train:
     enabled: true
     project: ReconDiff
     group: HUGSIM_RewardProgressHD_NoGRPOCraft_Substeps1
-  algo: reinforcepp
+  algo: grpo_only
   eta: 1.0
   mode_idx: -1
   policy_mode_select: sample
@@ -298,7 +298,7 @@ train:
     epochs: 1
     policy_grad_weight: 0.5
     forward_kl_coef: 0.0
-    reverse_kl_coef: 0.5
+    reverse_kl_coef: 0.0
     distill_temperature: 1.0
 agent:
   type: sparsedrive_v2
