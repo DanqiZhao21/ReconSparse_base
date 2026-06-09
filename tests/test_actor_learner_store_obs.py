@@ -45,6 +45,13 @@ class _ReplayFeatureAgent:
         return torch.ones((len(replay), 2), dtype=torch.float32)
 
 
+class _ZeroValueFeatureNet(torch.nn.Module):
+    expects_value_features = True
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((features.shape[0],), dtype=torch.float32, device=features.device)
+
+
 def _obs(seed: int) -> dict[str, np.ndarray]:
     image = np.full((8, 8, 3), int(seed), dtype=np.uint8)
     return {
@@ -143,6 +150,40 @@ def test_collect_single_env_shard_injects_current_gt_reference_info() -> None:
     assert shard["replay"][0]["gt_frame_idx_override"] == 10
     assert shard["replay"][1]["gt_sample_token_override"] == "tok-step-1"
     assert shard["replay"][1]["gt_frame_idx_override"] == 11
+
+
+def test_collect_single_env_shard_injects_front_obstacle_safety_context() -> None:
+    class EnvWithSafetyInfo(_TinyEnv):
+        def reset(self):
+            return _obs(0), {
+                "front_obstacle_available": True,
+                "front_obstacle_gap_m": 6.5,
+                "front_obstacle_lateral_m": 0.4,
+                "front_obstacle_closing_speed_mps": 3.0,
+                "front_obstacle_ttc_s": 1.2,
+                "front_obstacle_category": "vehicle.car",
+            }
+
+    shard, _next_obs = collect_single_env_shard(
+        env=EnvWithSafetyInfo(),
+        agent=_TinyAgent(),
+        obs=_obs(0),
+        horizon=1,
+        eta=1.0,
+        mode_idx=-1,
+        mode_select="sample",
+        actor_id=0,
+        local_ver=1,
+        shard_idx=0,
+        info=EnvWithSafetyInfo().reset()[1],
+        store_obs=False,
+    )
+
+    replay = shard["replay"][0]
+    assert replay["front_obstacle_available"] is True
+    assert replay["front_obstacle_gap_m"] == 6.5
+    assert replay["front_obstacle_ttc_s"] == 1.2
+    assert replay["front_obstacle_category"] == "vehicle.car"
 
 
 def test_collect_single_env_shard_can_end_on_done_without_resetting() -> None:
@@ -276,6 +317,66 @@ def test_replay_feature_ppo_batch_accepts_shard_without_obs(tmp_path: Path) -> N
 
     assert loaded.num_samples == 2
     assert loaded.batch["obs_batch"].shape == (0, 18, 64, 64)
+
+
+def test_reinforcepp_batch_keeps_raw_returns_as_advantage(tmp_path: Path) -> None:
+    shard_path = tmp_path / "shard.pt"
+    _write_shard(
+        shard_path,
+        {
+            "old_logp": torch.zeros(2),
+            "reward": torch.tensor([1.0, 0.0], dtype=torch.float32),
+            "done": torch.tensor([0.0, 1.0], dtype=torch.float32),
+            "replay": [{"step": 0}, {"step": 1}],
+        },
+    )
+
+    loaded = build_training_batch(
+        selected=[str(shard_path)],
+        agent=object(),
+        algo_key="reinforcepp",
+        device=torch.device("cpu"),
+        gamma=0.5,
+        gae_lambda=0.95,
+        value_net=None,
+        ddp_enabled=False,
+        dist_module=None,
+    )
+
+    assert torch.allclose(loaded.batch["ret"], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, 0.0]))
+
+
+def test_ppo_batch_keeps_raw_gae_as_advantage(tmp_path: Path) -> None:
+    shard_path = tmp_path / "shard.pt"
+    _write_shard(
+        shard_path,
+        {
+            "old_logp": torch.zeros(2),
+            "reward": torch.tensor([1.0, 0.0], dtype=torch.float32),
+            "done": torch.tensor([0.0, 1.0], dtype=torch.float32),
+            "terminated": torch.tensor([0.0, 1.0], dtype=torch.float32),
+            "done_last": torch.tensor(1.0),
+            "terminated_last": torch.tensor(1.0),
+            "replay": [{"step": 0}, {"step": 1}],
+            "next_value_feature": torch.ones(2),
+        },
+    )
+
+    loaded = build_training_batch(
+        selected=[str(shard_path)],
+        agent=_ReplayFeatureAgent(),
+        algo_key="ppo",
+        device=torch.device("cpu"),
+        gamma=0.5,
+        gae_lambda=0.95,
+        value_net=_ZeroValueFeatureNet(),
+        ddp_enabled=False,
+        dist_module=None,
+    )
+
+    assert torch.allclose(loaded.batch["ret"], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, 0.0]))
 
 
 def test_ppo_fallback_batch_requires_obs(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from framework.io.buffer import BufferPaths, write_actor_failure
+from framework.io.buffer import BufferPaths, list_failed_actor_ids, write_actor_failure
 from framework.runner.orchestrator import _launch_worker, _terminate_process, orchestrator_main
 
 
@@ -81,6 +81,7 @@ def test_orchestrator_restarts_actor_marked_failed(
     assert _FakeProc.actor_launches[0] == 2
     assert _FakeProc.actor_launches[1] == 1
     assert _FakeProc.terminated_actor_ids[0] == 0
+    assert list_failed_actor_ids(paths) == []
 
 
 def test_launch_worker_installs_parent_death_preexec_on_posix(monkeypatch: Any) -> None:

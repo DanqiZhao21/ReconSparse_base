@@ -118,16 +118,84 @@ def test_actor_learner_wandb_logs_clean_update_namespaces_by_default(
     assert payload["time/collect_s"] == 11.0
     assert payload["time/train_s"] == 50.0
     assert payload["time/update_s"] == 61.0
+    assert "time/prepare_batch_s" not in payload
+    assert "time/per_sample_s" not in payload
+    assert "time/per_shard_s" not in payload
     assert payload["optim/loss_pi"] == 0.25
     assert payload["optim/approx_kl"] == 0.01
     assert payload["reward/mean"] == 2.0
     assert payload["reward/positive_mean"] == 3.0
     assert payload["reward_gate/safety_rate"] == 1.0 / 3.0
-    assert payload["terminal/failure_rate"] == 1.0 / 3.0
+    assert payload["terminal/failure_rate"] == 1.0 / 2.0
+    assert payload["terminal/timeout_rate"] == 0.0
+    assert payload["terminal/env_done_rate"] == 1.0 / 2.0
     assert payload["batch/ret_mean"] == 2.0
     assert "train_update/reward_mean" not in payload
     assert "reward_mean" not in payload
     assert "global_step" not in payload
+
+
+def test_actor_learner_legacy_wandb_logs_omit_removed_time_visualizations(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    paths = BufferPaths(root=str(tmp_path / "buffer_root"))
+    ensure_buffer_layout(paths)
+    shard_path = Path(paths.shards_dir) / "actor0_e0_v7_t1000_deadbeef.pt"
+    torch.save({"replay": [{"ok": True}]}, shard_path)
+    Path(paths.version_file).write_text("7", encoding="utf-8")
+
+    loaded = SimpleNamespace(
+        num_samples=3,
+        reward_sum=6.0,
+        reward_count=3,
+        done_sum=1.0,
+        done_count=3,
+        reward_summary={"step_count": 3},
+        batch={
+            "ret": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
+            "adv": torch.tensor([0.5, 1.0, 1.5], dtype=torch.float32),
+        },
+    )
+    datamodule = SimpleNamespace(
+        current_selected=[str(shard_path)],
+        current_loaded=loaded,
+        current_wait_shards_s=11.0,
+        current_load_shards_s=2.0,
+        current_prepare_batch_s=3.0,
+    )
+    module = ActorLearnerLightningModule(
+        agent=_SavingAgent(),
+        learner_config=_learner_config(wandb_log_legacy_raw_metrics=True),
+        value_net=None,
+        paths=paths,
+        stage_fn=lambda *_args, **_kwargs: None,
+        ddp_enabled=False,
+        dist_module=None,
+        rank=0,
+        wandb_enabled=True,
+    )
+    module._trainer = SimpleNamespace(datamodule=datamodule, should_stop=False)
+    module._latest_epoch_had_data = True
+    module._update_train_t0 = 100.0
+    module._is_update_end = lambda: True  # type: ignore[method-assign]
+    module._update_index = lambda: 4  # type: ignore[method-assign]
+    monkeypatch.setattr(actor_learner_module.time, "time", lambda: 150.0)
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(actor_learner_module, "wandb", fake_wandb)
+
+    module.on_train_epoch_end()
+
+    payload = fake_wandb.logged[0]
+    assert "time/prepare_batch_s" not in payload
+    assert "time/per_sample_s" not in payload
+    assert "time/per_shard_s" not in payload
+    assert "prepare_batch_time_s" not in payload
+    assert "time_per_sample_s" not in payload
+    assert "time_per_shard_s" not in payload
+    assert "train_update/prepare_batch_time_s" not in payload
+    assert "train_update/time_per_sample_s" not in payload
+    assert "train_update/time_per_shard_s" not in payload
 
 
 def test_minibatch_wandb_logging_is_disabled_by_default(monkeypatch) -> None:

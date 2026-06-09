@@ -277,11 +277,9 @@ def build_training_batch(
             raise RuntimeError(f"obs_batch length mismatch: obs={int(obs_batch.shape[0])} adv={n}")
         if int(old_logp.shape[0]) != n:
             raise RuntimeError(f"old_logp length mismatch: old_logp={int(old_logp.shape[0])} adv={n}")
-        adv = normalize_advantages(adv, ddp_enabled=ddp_enabled, dist_module=dist_module, device=device, eps=float(norm_eps))
     else:
         if int(old_logp.numel()) not in {0, n}:
             raise RuntimeError(f"old_logp length mismatch: old_logp={int(old_logp.shape[0])} adv={n}")
-        adv = normalize_advantages(adv, ddp_enabled=ddp_enabled, dist_module=dist_module, device=device, eps=float(norm_eps))
 
     if len(replay_all) != n:
         raise RuntimeError(f"replay_all length mismatch: len={len(replay_all)} n={n}")

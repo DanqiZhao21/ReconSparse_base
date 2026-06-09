@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from framework.algorithms.trajectory_policy_core import TrajectoryGRPOObjective, TrajectoryPPOObjective
+from framework.algorithms.trajectory_policy_core import TrajectoryGRPOObjective, TrajectoryPPOObjective, TrajectorySACObjective
 from framework.lightning.config import ActorLearnerLightningConfig, LearnerOptimizerConfig
 from framework.lightning.trajectory_module import TrajectoryLightningModule
 
@@ -274,6 +274,62 @@ def test_training_step_applies_closed_loop_loss_coef_before_grpo(monkeypatch) ->
 
     assert torch.is_tensor(loss)
     assert torch.allclose(loss.detach(), torch.tensor(4.0, dtype=torch.float32))
+    assert module.latest_metrics["closed_loop_loss_coef"] == 0.5
+
+
+def test_sac_training_step_uses_entropy_regularized_objective(monkeypatch) -> None:
+    agent = _DummyAgent()
+    learner_config = ActorLearnerLightningConfig(
+        algo_kind="sac",
+        optimizer_config=LearnerOptimizerConfig(policy_lr=1.0e-4, value_lr=None, weight_decay=0.0),
+        eta=1.0,
+        clip_eps=0.2,
+        kl_coef=0.03,
+        sac_entropy_coef=0.02,
+        closed_loop_loss_coef=0.5,
+    )
+    module = TrajectoryLightningModule(agent=agent, learner_config=learner_config)
+
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.agent_logp_from_replay_batch",
+        lambda *args, **kwargs: torch.tensor([-0.1, -0.2], dtype=torch.float32),
+    )
+    seen = {}
+
+    def _fake_sac_objective(**kwargs):
+        seen.update(kwargs)
+        return TrajectorySACObjective(
+            loss=torch.tensor(2.0, dtype=torch.float32),
+            loss_pi=torch.tensor(2.0, dtype=torch.float32),
+            loss_pg=torch.tensor(1.8, dtype=torch.float32),
+            loss_entropy=torch.tensor(0.2, dtype=torch.float32),
+            approx_kl=torch.tensor(0.1, dtype=torch.float32),
+            clip_frac=torch.tensor(0.25, dtype=torch.float32),
+            ratio_mean=torch.tensor(1.1, dtype=torch.float32),
+            adv_mean=torch.tensor(0.0, dtype=torch.float32),
+            logp_mean=torch.tensor(-0.15, dtype=torch.float32),
+            entropy_coef=torch.tensor(0.02, dtype=torch.float32),
+        )
+
+    monkeypatch.setattr("framework.lightning.trajectory_module.compute_sac_objective", _fake_sac_objective)
+
+    batch = {
+        "replay": [{"step": 0}, {"step": 1}],
+        "adv": torch.tensor([0.2, 0.4], dtype=torch.float32),
+        "ret": torch.tensor([1.0, 1.5], dtype=torch.float32),
+        "old_logp": torch.tensor([-0.3, -0.4], dtype=torch.float32),
+    }
+
+    loss = module.training_step(batch, batch_idx=0)
+
+    assert torch.is_tensor(loss)
+    assert torch.allclose(loss.detach(), torch.tensor(1.0, dtype=torch.float32))
+    assert seen["entropy_coef"] == 0.02
+    assert seen["kl_coef"] == 0.03
+    assert torch.equal(seen["old_logp"], batch["old_logp"])
+    assert module.latest_metrics["sac_pg_loss"] == torch.tensor(1.8, dtype=torch.float32).item()
+    assert module.latest_metrics["sac_entropy_loss"] == torch.tensor(0.2, dtype=torch.float32).item()
+    assert module.latest_metrics["sac_logp_mean"] == torch.tensor(-0.15, dtype=torch.float32).item()
     assert module.latest_metrics["closed_loop_loss_coef"] == 0.5
 
 

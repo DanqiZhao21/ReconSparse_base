@@ -7,7 +7,7 @@
 - 从 batch 模块拿到已经整理好的 obs、adv、ret、old_logp、replay。
 - 调用 agent 的 replay 接口，重算当前策略下的 logp。
 - 计算 PPO 或 ReinforcePP 的目标函数、裁剪项、价值损失和统计指标。
-- 提供 PPO/ReinforcePP 规格对象（裁剪系数、优化超参数、梯度与采样相关参数）给 learner runtime 使用。
+- 提供 PPO/ReinforcePP/SAC 规格对象（裁剪系数、优化超参数、梯度与采样相关参数）给 learner runtime 使用。
 
 不属于这个目录的职责：
 
@@ -21,7 +21,7 @@
 
 懒加载导出层。
 
-- 暴露 Algorithm、PPO、ReinforcePP 三个对外入口。
+- 暴露 Algorithm、PPO、ReinforcePP、SAC 四个对外入口。
 - 避免在包初始化时过早导入重模块，减少入口脚本被旧导入路径拖垮的风险。
 
 ### base.py
@@ -47,12 +47,20 @@ ReinforcePP 的配置/规格容器。
 - 暴露 learner runtime 读取的训练相关字段。
 - 不直接创建 Trainer 或执行训练循环。
 
+### sac.py
+
+SAC-style 的配置/规格容器。
+
+- 当前 actor-learner shard 只保存 replay、闭环 reward、done 和 log-prob，不是标准 off-policy SAC replay buffer。
+- 因此这里的 `SAC` 是兼容现有闭环 reward 路径的 entropy-regularized policy-gradient 规格对象。
+- 它通过 `trajectory_policy_core.py` 里的 SAC-style objective 使用闭环 return/advantage 和 `entropy_coef`，不改变 shard schema。
+
 ### trajectory_policy_core.py
 
 策略目标函数公共库。
 
 - 提供 agent_logp_from_replay_batch，屏蔽不同 Agent 的 replay 接口差异。
-- 统一实现 PPO 目标函数、Reinforce 目标函数和对应 metrics 统计。
+- 统一实现 PPO、Reinforce、SAC-style 目标函数和对应 metrics 统计。
 - `framework/lightning/trajectory_module.py` 的 `training_step` 会直接依赖这里。
 
 ### nuscenes_pdm_scorer.py

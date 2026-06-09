@@ -20,6 +20,7 @@ class ActorLearnerLightningConfig:
     vf_coef: float = 0.0
     value_clip_eps: float = 0.0
     kl_coef: float = 0.0
+    sac_entropy_coef: float = 0.0
     closed_loop_loss_coef: float = 1.0
     forward_kl_coef: float = 0.0
     reverse_kl_coef: float = 0.0
@@ -39,6 +40,14 @@ class ActorLearnerLightningConfig:
     grpo_debug_dir: str | None = None
     grpo_debug_max_batches: int = 0
     grpo_debug_top_k: int = 4
+    aux_risk_decel_enabled: bool = False
+    aux_risk_decel_coef: float = 0.0
+    aux_risk_decel_dt_s: float = 0.5
+    aux_risk_decel_high_risk_gap_m: float = 8.0
+    aux_risk_decel_high_risk_ttc_s: float = 3.0
+    aux_risk_decel_lateral_m: float = 2.5
+    aux_risk_decel_speed_margin_mps: float = 0.1
+    aux_risk_decel_eps: float = 1.0e-6
     dual_clip: float | None = None
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -106,6 +115,30 @@ def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return resolved
 
 
+def resolve_auxiliary_objectives_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    aux_cfg = train_cfg.get("auxiliary_objectives", {}) or {}
+    if not isinstance(aux_cfg, dict):
+        aux_cfg = {}
+    risk_cfg = aux_cfg.get("risk_decel", {}) or {}
+    if not isinstance(risk_cfg, dict):
+        risk_cfg = {}
+
+    enabled = bool(risk_cfg.get("enable", False))
+    coef = float(risk_cfg.get("coef", 0.0))
+    if not enabled:
+        coef = 0.0
+    return {
+        "risk_decel_enabled": enabled,
+        "risk_decel_coef": coef,
+        "risk_decel_dt_s": float(risk_cfg.get("dt_s", 0.5)),
+        "risk_decel_high_risk_gap_m": float(risk_cfg.get("high_risk_gap_m", 8.0)),
+        "risk_decel_high_risk_ttc_s": float(risk_cfg.get("high_risk_ttc_s", 3.0)),
+        "risk_decel_lateral_m": float(risk_cfg.get("lateral_m", 2.5)),
+        "risk_decel_speed_margin_mps": float(risk_cfg.get("speed_margin_mps", 0.1)),
+        "risk_decel_eps": float(risk_cfg.get("eps", 1.0e-6)),
+    }
+
+
 def actor_learner_lightning_config_from_algorithm(
     algo: Any,
     *,
@@ -115,6 +148,10 @@ def actor_learner_lightning_config_from_algorithm(
 ) -> ActorLearnerLightningConfig:
     algo_kind = str(algo_meta.get("algo_key", getattr(algo, "variant", "ppo")))
     grpo_cfg = resolve_grpo_config(train_cfg)
+    aux_cfg = resolve_auxiliary_objectives_config(train_cfg)
+    sac_cfg = train_cfg.get("sac", {}) or {}
+    if not isinstance(sac_cfg, dict):
+        sac_cfg = {}
     raw_max_shard_version_lag = actor_learner_cfg.get("max_shard_version_lag", 2)
     raw_max_updates = actor_learner_cfg.get("max_updates", train_cfg.get("updates", 50))
     wandb_cfg = train_cfg.get("wandb", {}) or {}
@@ -150,10 +187,11 @@ def actor_learner_lightning_config_from_algorithm(
         vf_coef=float(getattr(algo, "vf_coef", 0.0)),
         value_clip_eps=float(getattr(algo, "value_clip_eps", algo_meta.get("value_clip_eps", 0.0))),
         kl_coef=float(getattr(algo, "kl_coef", 0.0)),
+        sac_entropy_coef=float(getattr(algo, "entropy_coef", sac_cfg.get("entropy_coef", 0.0))),
         closed_loop_loss_coef=float(
             (train_cfg.get("reinforcepp", {}) or {}).get(
                 "policy_grad_weight",
-                1.0,
+                sac_cfg.get("policy_grad_weight", 1.0),
             )
         ),
         forward_kl_coef=float(getattr(algo, "forward_kl_coef", 0.0)),
@@ -174,6 +212,14 @@ def actor_learner_lightning_config_from_algorithm(
         grpo_debug_dir=grpo_cfg["debug_dir"],
         grpo_debug_max_batches=int(grpo_cfg["debug_max_batches"]),
         grpo_debug_top_k=int(grpo_cfg["debug_top_k"]),
+        aux_risk_decel_enabled=bool(aux_cfg["risk_decel_enabled"]),
+        aux_risk_decel_coef=float(aux_cfg["risk_decel_coef"]),
+        aux_risk_decel_dt_s=float(aux_cfg["risk_decel_dt_s"]),
+        aux_risk_decel_high_risk_gap_m=float(aux_cfg["risk_decel_high_risk_gap_m"]),
+        aux_risk_decel_high_risk_ttc_s=float(aux_cfg["risk_decel_high_risk_ttc_s"]),
+        aux_risk_decel_lateral_m=float(aux_cfg["risk_decel_lateral_m"]),
+        aux_risk_decel_speed_margin_mps=float(aux_cfg["risk_decel_speed_margin_mps"]),
+        aux_risk_decel_eps=float(aux_cfg["risk_decel_eps"]),
         dual_clip=getattr(algo, "dual_clip", None),
         gamma=float(train_cfg.get("gamma", 0.99)),
         gae_lambda=float(train_cfg.get("gae_lambda", 0.95)),

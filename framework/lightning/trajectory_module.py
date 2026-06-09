@@ -14,6 +14,8 @@ from framework.algorithms.trajectory_policy_core import (
     compute_ppo_objective,
     compute_reinforce_metrics,
     compute_reinforce_objective,
+    compute_risk_decel_auxiliary_objective,
+    compute_sac_objective,
     score_counterfactual_trajectories,
 )
 from framework.lightning.config import ActorLearnerLightningConfig
@@ -142,9 +144,11 @@ class TrajectoryLightningModule(L.LightningModule):
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         grpo_coef = float(self.learner_config.grpo_coef)
         grpo_enabled = bool(getattr(self.learner_config, "grpo_enabled", False)) or (grpo_coef > 0.0)
+        aux_coef = float(getattr(self.learner_config, "aux_risk_decel_coef", 0.0))
+        aux_requested = bool(getattr(self.learner_config, "aux_risk_decel_enabled", False)) and aux_coef > 0.0
         debug_requested = bool(getattr(self.learner_config, "grpo_debug_visualize", False))
         loss_requested = bool(grpo_enabled and grpo_coef > 0.0)
-        if not loss_requested and not debug_requested:
+        if not loss_requested and not debug_requested and not aux_requested:
             return loss, metrics
 
         if candidates is None:
@@ -192,32 +196,61 @@ class TrajectoryLightningModule(L.LightningModule):
         if timing_parts is not None:
             timing_parts["grpo_debug_s"] = timing_parts.get("grpo_debug_s", 0.0) + debug_s
         self._maybe_report_slow_step_part(name="grpo_debug", seconds=debug_s, batch_idx=batch_idx)
-        if not loss_requested:
-            return loss, metrics
-        t0 = time.perf_counter()
-        grpo_loss = compute_grpo_objective(
-            candidate_log_probs=candidate_log_probs,
-            candidate_scores=candidate_scores,
-            candidate_score_logits=candidates.get("score_logits", None),
-            score_norm_eps=float(self.learner_config.grpo_norm_eps),
-            use_rank_adv=bool(self.learner_config.grpo_use_rank_adv),
-            score_clip=self.learner_config.grpo_score_clip,
-            objective=str(getattr(self.learner_config, "grpo_objective", "logprob")),
-            temperature=float(getattr(self.learner_config, "grpo_temperature", 1.0)),
-        )
-        objective_s = float(time.perf_counter() - t0)
-        if timing_parts is not None:
-            timing_parts["grpo_objective_s"] = timing_parts.get("grpo_objective_s", 0.0) + objective_s
-        self._maybe_report_slow_step_part(name="grpo_objective", seconds=objective_s, batch_idx=batch_idx)
-        out_loss = loss + grpo_coef * grpo_loss.loss
-        out_metrics = {
-            **metrics,
-            "grpo_loss": grpo_loss.loss.detach(),
-            "grpo_score_mean": grpo_loss.score_mean.detach(),
-            "grpo_score_std": grpo_loss.score_std.detach(),
-            "grpo_score_min": grpo_loss.score_min.detach(),
-            "grpo_score_max": grpo_loss.score_max.detach(),
-        }
+        out_loss = loss
+        out_metrics = dict(metrics)
+        if loss_requested:
+            t0 = time.perf_counter()
+            grpo_loss = compute_grpo_objective(
+                candidate_log_probs=candidate_log_probs,
+                candidate_scores=candidate_scores,
+                candidate_score_logits=candidates.get("score_logits", None),
+                score_norm_eps=float(self.learner_config.grpo_norm_eps),
+                use_rank_adv=bool(self.learner_config.grpo_use_rank_adv),
+                score_clip=self.learner_config.grpo_score_clip,
+                objective=str(getattr(self.learner_config, "grpo_objective", "logprob")),
+                temperature=float(getattr(self.learner_config, "grpo_temperature", 1.0)),
+            )
+            objective_s = float(time.perf_counter() - t0)
+            if timing_parts is not None:
+                timing_parts["grpo_objective_s"] = timing_parts.get("grpo_objective_s", 0.0) + objective_s
+            self._maybe_report_slow_step_part(name="grpo_objective", seconds=objective_s, batch_idx=batch_idx)
+            out_loss = out_loss + grpo_coef * grpo_loss.loss
+            out_metrics.update(
+                {
+                    "grpo_loss": grpo_loss.loss.detach(),
+                    "grpo_score_mean": grpo_loss.score_mean.detach(),
+                    "grpo_score_std": grpo_loss.score_std.detach(),
+                    "grpo_score_min": grpo_loss.score_min.detach(),
+                    "grpo_score_max": grpo_loss.score_max.detach(),
+                }
+            )
+
+        if aux_requested:
+            score_logits = candidates.get("score_logits", None)
+            if score_logits is not None:
+                t0 = time.perf_counter()
+                aux_loss = compute_risk_decel_auxiliary_objective(
+                    candidate_score_logits=score_logits,
+                    candidate_traj_xyyaw=candidates["traj_xyyaw"],
+                    high_risk_mask=self._risk_decel_high_risk_mask_from_replay(replay, device=device),
+                    ego_speed_mps=self._risk_decel_ego_speed_from_replay(replay, device=device),
+                    dt_s=float(getattr(self.learner_config, "aux_risk_decel_dt_s", 0.5)),
+                    speed_margin_mps=float(getattr(self.learner_config, "aux_risk_decel_speed_margin_mps", 0.1)),
+                    eps=float(getattr(self.learner_config, "aux_risk_decel_eps", 1.0e-6)),
+                )
+                aux_s = float(time.perf_counter() - t0)
+                if timing_parts is not None:
+                    timing_parts["aux_risk_decel_s"] = timing_parts.get("aux_risk_decel_s", 0.0) + aux_s
+                self._maybe_report_slow_step_part(name="aux_risk_decel", seconds=aux_s, batch_idx=batch_idx)
+                out_loss = out_loss + aux_coef * aux_loss.loss
+                out_metrics.update(
+                    {
+                        "aux_risk_decel_loss": aux_loss.loss.detach(),
+                        "aux_risk_decel_active_count": aux_loss.active_count.detach(),
+                        "aux_risk_decel_decel_prob": aux_loss.decel_prob_mean.detach(),
+                        "aux_risk_decel_accel_prob": aux_loss.accel_prob_mean.detach(),
+                    }
+                )
         return out_loss, out_metrics
 
     def _maybe_fused_replay_policy_outputs(
@@ -229,8 +262,12 @@ class TrajectoryLightningModule(L.LightningModule):
     ) -> Dict[str, Any] | None:
         grpo_coef = float(self.learner_config.grpo_coef)
         loss_requested = (bool(getattr(self.learner_config, "grpo_enabled", False)) or grpo_coef > 0.0) and grpo_coef > 0.0
+        aux_requested = (
+            bool(getattr(self.learner_config, "aux_risk_decel_enabled", False))
+            and float(getattr(self.learner_config, "aux_risk_decel_coef", 0.0)) > 0.0
+        )
         debug_requested = bool(getattr(self.learner_config, "grpo_debug_visualize", False))
-        if not loss_requested and not debug_requested:
+        if not loss_requested and not debug_requested and not aux_requested:
             return None
 
         fused_fn = getattr(self.agent, "replay_policy_outputs_from_replay_batch", None)
@@ -249,6 +286,58 @@ class TrajectoryLightningModule(L.LightningModule):
         if torch.is_tensor(new_logp):
             outputs["new_logp"] = new_logp.to(device=device, dtype=torch.float32).view(-1)
         return outputs
+
+    def _risk_decel_high_risk_mask_from_replay(
+        self,
+        replay: list[Dict[str, Any]],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        high_risk: list[bool] = []
+        max_gap = float(getattr(self.learner_config, "aux_risk_decel_high_risk_gap_m", 8.0))
+        max_ttc = float(getattr(self.learner_config, "aux_risk_decel_high_risk_ttc_s", 3.0))
+        max_lateral = float(getattr(self.learner_config, "aux_risk_decel_lateral_m", 2.5))
+        for rep in replay:
+            if not isinstance(rep, dict) or not bool(rep.get("front_obstacle_available", False)):
+                high_risk.append(False)
+                continue
+            try:
+                gap_m = float(rep.get("front_obstacle_gap_m", float("inf")))
+                lateral_m = abs(float(rep.get("front_obstacle_lateral_m", float("inf"))))
+                ttc_s = float(rep.get("front_obstacle_ttc_s", float("inf")))
+            except Exception:
+                high_risk.append(False)
+                continue
+            in_corridor = lateral_m <= max_lateral
+            risky_gap = gap_m <= max_gap
+            risky_ttc = ttc_s <= max_ttc
+            high_risk.append(bool(in_corridor and (risky_gap or risky_ttc)))
+        return torch.as_tensor(high_risk, device=device, dtype=torch.bool)
+
+    @staticmethod
+    def _risk_decel_ego_speed_from_replay(
+        replay: list[Dict[str, Any]],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        speeds: list[float] = []
+        for rep in replay:
+            speed = None
+            if isinstance(rep, dict):
+                raw_speed = rep.get("ego_speed_mps", None)
+                if raw_speed is not None:
+                    try:
+                        speed = float(raw_speed)
+                    except Exception:
+                        speed = None
+                if speed is None:
+                    status = rep.get("status_feature", None)
+                    if torch.is_tensor(status):
+                        status_t = status.detach().to(dtype=torch.float32).view(-1)
+                        if int(status_t.numel()) >= 6:
+                            speed = float(torch.linalg.norm(status_t[4:6]).item())
+            speeds.append(0.0 if speed is None else float(speed))
+        return torch.as_tensor(speeds, device=device, dtype=torch.float32)
 
     def _compute_grpo_only_loss(
         self,
@@ -533,6 +622,36 @@ class TrajectoryLightningModule(L.LightningModule):
                     )
                     timing_parts["metrics_compute_s"] = float(time.perf_counter() - t0)
                     loss = ppo_loss.loss * float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0))
+                    metrics["closed_loop_loss_coef"] = torch.as_tensor(
+                        float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0)),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                elif self.learner_config.algo_kind == "sac":
+                    sac_old_logp = old_logp if torch.is_tensor(old_logp) and int(old_logp.numel()) == int(adv.numel()) else None
+                    t0 = time.perf_counter()
+                    sac_loss = compute_sac_objective(
+                        new_logp=new_logp,
+                        old_logp=sac_old_logp,
+                        adv=adv,
+                        entropy_coef=float(getattr(self.learner_config, "sac_entropy_coef", 0.0)),
+                        kl_coef=float(self.learner_config.kl_coef),
+                        clip_eps=float(self.learner_config.clip_eps),
+                    )
+                    timing_parts["objective_s"] = float(time.perf_counter() - t0)
+                    metrics = {
+                        "loss_pi": sac_loss.loss_pi.detach(),
+                        "sac_pg_loss": sac_loss.loss_pg.detach(),
+                        "sac_entropy_loss": sac_loss.loss_entropy.detach(),
+                        "sac_logp_mean": sac_loss.logp_mean.detach(),
+                        "sac_entropy_coef": sac_loss.entropy_coef.detach(),
+                        "approx_kl": sac_loss.approx_kl.detach(),
+                        "clip_frac": sac_loss.clip_frac.detach(),
+                        "ratio_mean": sac_loss.ratio_mean.detach(),
+                        "adv_mean": sac_loss.adv_mean.detach(),
+                    }
+                    timing_parts["metrics_compute_s"] = 0.0
+                    loss = sac_loss.loss * float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0))
                     metrics["closed_loop_loss_coef"] = torch.as_tensor(
                         float(getattr(self.learner_config, "closed_loop_loss_coef", 1.0)),
                         device=device,

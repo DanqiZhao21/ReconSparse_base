@@ -161,6 +161,22 @@ def _inject_gt_reference_from_info(replay: Any, info: Any) -> None:
             pass
 
 
+def _inject_front_obstacle_context_from_info(replay: Any, info: Any) -> None:
+    if not isinstance(replay, dict) or not isinstance(info, dict):
+        return
+    keys = [
+        "front_obstacle_available",
+        "front_obstacle_gap_m",
+        "front_obstacle_lateral_m",
+        "front_obstacle_closing_speed_mps",
+        "front_obstacle_ttc_s",
+        "front_obstacle_category",
+    ]
+    for key in keys:
+        if key in info:
+            replay[key] = info[key]
+
+
 def _emit_heartbeat(heartbeat_fn: Any | None, phase: str, step: int | None = None, *, force: bool = False) -> None:
     if not callable(heartbeat_fn):
         return
@@ -223,6 +239,7 @@ def collect_single_env_shard(
         _emit_heartbeat(heartbeat_fn, "act_done", step_count, force=True)
         step_timing["act_s"] = float(time.perf_counter() - t0)
         _inject_gt_reference_from_info(replay, current_info)
+        _inject_front_obstacle_context_from_info(replay, current_info)
         _inject_external_plan_single_env(env, replay)
         t0 = time.perf_counter()
         _emit_heartbeat(heartbeat_fn, "env_step_start", step_count, force=True)
@@ -371,6 +388,7 @@ def collect_vector_env_shards(
         act_s = float(time.perf_counter() - act_t0) / float(max(1, int(num_envs_per_actor)))
         for i, replay in enumerate(replays):
             _inject_gt_reference_from_info(replay, current_info_list[i] if i < len(current_info_list) else None)
+            _inject_front_obstacle_context_from_info(replay, current_info_list[i] if i < len(current_info_list) else None)
             _inject_external_plan_vec_env(vec_env, i, replay)
 
         env_step_t0 = time.perf_counter()

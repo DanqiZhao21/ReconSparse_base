@@ -18,10 +18,15 @@ def __getattr__(name: str):
     from .reinforcepp import ReinforcePP
 
     return ReinforcePP
+  if name == "SAC":
+    from .sac import SAC
+
+    return SAC
   raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "Algorithm",
     "PPO",
     "ReinforcePP",
+    "SAC",
 ]

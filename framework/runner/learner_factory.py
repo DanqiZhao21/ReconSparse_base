@@ -8,6 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from framework.algorithms.ppo import PPO
 from framework.algorithms.reinforcepp import ReinforcePP
+from framework.algorithms.sac import SAC
 from framework.utils.repo_paths import resolve_repo_path
 
 
@@ -97,6 +98,7 @@ def build_algorithm_bundle(
     grad_accum_steps = int(((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))
     rpp_cfg = (train_cfg.get("reinforcepp", {}) or {})
     ppo_cfg = (train_cfg.get("ppo", {}) or {})
+    sac_cfg = (train_cfg.get("sac", {}) or {})
     policy_lr = _resolve_policy_lr(train_cfg, agent)
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
@@ -171,6 +173,31 @@ def build_algorithm_bundle(
             teacher_ckpt=_resolve_optional_repo_path(rpp_cfg.get("teacher_ckpt", None)),
         )
         value_net = None
+    elif algo_key in {"sac", "soft_actor_critic"}:
+        algo_key = "sac"
+        policy_params = _trainable_parameters(getattr(agent, "trainable_module", None) or agent)
+        if len(policy_params) == 0:
+            raise RuntimeError("No trainable policy parameters found for SAC learner")
+        algo = SAC(
+            entropy_coef=float(sac_cfg.get("entropy_coef", 0.01)),
+            kl_coef=float(sac_cfg.get("kl_coef", 0.0)),
+            epochs=int(sac_cfg.get("epochs", 1)),
+            minibatch_size=minibatch_size,
+            max_grad_norm=max_grad_norm,
+            grad_accum_steps=grad_accum_steps,
+            ddp_seed=ddp_seed,
+            eta=eta,
+            variant=algo_key,
+            policy_lr=float(policy_lr),
+            weight_decay=float(weight_decay),
+            forward_kl_coef=float(sac_cfg.get("forward_kl_coef", 0.0)),
+            reverse_kl_coef=float(sac_cfg.get("reverse_kl_coef", 0.0)),
+            distill_temperature=float(sac_cfg.get("distill_temperature", 1.0)),
+            teacher_ckpt=_resolve_optional_repo_path(sac_cfg.get("teacher_ckpt", None)),
+        )
+        value_net = None
+    else:
+        raise RuntimeError(f"Unsupported train.algo={algo_key!r}")
 
     meta = {
         "algo_key": algo_key,
@@ -179,7 +206,7 @@ def build_algorithm_bundle(
         "clip_eps": clip_eps,
         "minibatch_size": minibatch_size,
         "max_grad_norm": max_grad_norm,
-        "rpp_norm_eps": float(rpp_cfg.get("norm_eps", 1e-8)),
+        "rpp_norm_eps": float(sac_cfg.get("norm_eps", rpp_cfg.get("norm_eps", 1e-8))),
         "value_clip_eps": float(value_clip_eps),
         "critic_use_agent_features": bool(
             train_cfg.get("critic_use_agent_features", True)

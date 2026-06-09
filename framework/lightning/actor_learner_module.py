@@ -111,6 +111,12 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             reward_mean = float(reward_sum) / float(max(1, reward_count))
             done_rate = float(done_sum) / float(max(1, done_count))
             reward_summary_steps = float(max(1.0, float(reward_summary.get("step_count", 0.0))))
+            terminal_episode_count = float(
+                float(reward_summary.get("terminal_failure_count", 0.0))
+                + float(reward_summary.get("terminal_timeout_count", 0.0))
+                + float(reward_summary.get("terminal_env_done_count", 0.0))
+            )
+            terminal_episode_den = float(max(1.0, terminal_episode_count))
             reward_summary_view = {
                 "positive_reward_mean": float(reward_summary.get("positive_reward_sum", 0.0)) / reward_summary_steps,
                 "gated_positive_reward_mean": float(reward_summary.get("gated_positive_reward_sum", 0.0)) / reward_summary_steps,
@@ -119,9 +125,9 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                 "collision_gate_rate": float(reward_summary.get("collision_gate_count", 0.0)) / reward_summary_steps,
                 "severe_tracking_lateral_gate_rate": float(reward_summary.get("severe_tracking_lateral_gate_count", 0.0)) / reward_summary_steps,
                 "severe_tracking_yaw_gate_rate": float(reward_summary.get("severe_tracking_yaw_gate_count", 0.0)) / reward_summary_steps,
-                "terminal_failure_rate": float(reward_summary.get("terminal_failure_count", 0.0)) / reward_summary_steps,
-                "terminal_timeout_rate": float(reward_summary.get("terminal_timeout_count", 0.0)) / reward_summary_steps,
-                "terminal_env_done_rate": float(reward_summary.get("terminal_env_done_count", 0.0)) / reward_summary_steps,
+                "terminal_failure_rate": float(reward_summary.get("terminal_failure_count", 0.0)) / terminal_episode_den,
+                "terminal_timeout_rate": float(reward_summary.get("terminal_timeout_count", 0.0)) / terminal_episode_den,
+                "terminal_env_done_rate": float(reward_summary.get("terminal_env_done_count", 0.0)) / terminal_episode_den,
             }
             ret = datamodule.current_loaded.batch["ret"]
             adv = datamodule.current_loaded.batch["adv"]
@@ -160,12 +166,9 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                     "data/done_rate": float(done_rate),
                     "time/collect_s": float(getattr(datamodule, "current_wait_shards_s", 0.0)),
                     "time/load_shards_s": float(getattr(datamodule, "current_load_shards_s", 0.0)),
-                    "time/prepare_batch_s": float(getattr(datamodule, "current_prepare_batch_s", 0.0)),
                     "time/train_s": float(train_time_s),
                     "time/update_s": float(update_time_s),
                     "time/save_broadcast_s": float(save_broadcast_s),
-                    "time/per_sample_s": float(train_time_s / float(max(1, n))),
-                    "time/per_shard_s": float(train_time_s / float(max(1, len(selected)))),
                     "reward/sum": float(reward_sum),
                     "reward/mean": float(reward_mean),
                     "reward/positive_mean": float(reward_summary_view["positive_reward_mean"]),
@@ -202,7 +205,6 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                         "samples": int(n),
                         "collect_time_s": float(payload["time/collect_s"]),
                         "load_shards_time_s": float(payload["time/load_shards_s"]),
-                        "prepare_batch_time_s": float(payload["time/prepare_batch_s"]),
                         "train_time_s": float(payload["time/train_s"]),
                         "update_time_s": float(payload["time/update_s"]),
                         "save_broadcast_time_s": float(payload["time/save_broadcast_s"]),
@@ -224,8 +226,6 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                         "ret_mean": float(payload["batch/ret_mean"]),
                         "ret_std": float(payload["batch/ret_std"]),
                         "adv_std": float(payload["batch/adv_std"]),
-                        "time_per_sample_s": float(payload["time/per_sample_s"]),
-                        "time_per_shard_s": float(payload["time/per_shard_s"]),
                     }
                     for key, value in metrics.items():
                         try:
@@ -244,12 +244,9 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                         "weights_version": float(new_v),
                         "collect_time_s": float(legacy_payload["collect_time_s"]),
                         "load_shards_time_s": float(legacy_payload["load_shards_time_s"]),
-                        "prepare_batch_time_s": float(legacy_payload["prepare_batch_time_s"]),
                         "train_time_s": float(legacy_payload["train_time_s"]),
                         "update_time_s": float(legacy_payload["update_time_s"]),
                         "save_broadcast_time_s": float(legacy_payload["save_broadcast_time_s"]),
-                        "time_per_sample_s": float(legacy_payload["time_per_sample_s"]),
-                        "time_per_shard_s": float(legacy_payload["time_per_shard_s"]),
                     }
                     update_view.update({key: float(value) for key, value in metrics.items()})
                     for key, value in update_view.items():

@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 from framework.io.buffer import (
     BufferPaths,
     actor_failure_flag_path,
+    clear_actor_failure,
     ensure_buffer_layout,
     list_failed_actor_ids,
     write_actor_failure,
@@ -263,6 +264,7 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
                         f"restart={restart_count + 1}/{int(max_actor_restarts)}"
                     )
                     _terminate_process(actor_procs[aid], timeout_s=10.0)
+                    clear_actor_failure(paths, aid)
                     actor_cmd, actor_env = _build_actor_launch(
                         python_executable=py,
                         entry=entry,
