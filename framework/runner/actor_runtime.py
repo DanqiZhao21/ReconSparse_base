@@ -60,6 +60,19 @@ def _actor_should_pause_for_learner(al_cfg: Dict[str, Any], *, cuda: int) -> boo
     return int(cuda) in learner_gpu_ids
 
 
+def _parse_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
+    return bool(value)
+
+
 def resolve_actor_env_runtime(cfg: Dict[str, Any]) -> Dict[str, Any]:
     train_cfg = cfg.get("train", {}) or {}
     al_cfg = train_cfg.get("actor_learner", {}) or {}
@@ -237,6 +250,27 @@ def _actor_main_impl(
     mode_select = str(train_cfg.get("policy_mode_select", train_cfg.get("ddv2_mode_select", "sample"))).strip().lower()
     store_obs = resolve_store_obs(train_cfg, al_cfg, agent)
     stage(f"[actor{actor_id}] store_obs={bool(store_obs)}")
+    debug_replay_logp_check = _parse_bool(
+        os.environ.get("RECONDREAMER_DEBUG_REPLAY_LOGP_CHECK", al_cfg.get("debug_replay_logp_check", False))
+    )
+    debug_replay_logp_tolerance = float(
+        os.environ.get(
+            "RECONDREAMER_DEBUG_REPLAY_LOGP_TOLERANCE",
+            al_cfg.get("debug_replay_logp_tolerance", 1.0e-5),
+        )
+    )
+    debug_replay_logp_fail_on_error = _parse_bool(
+        os.environ.get(
+            "RECONDREAMER_DEBUG_REPLAY_LOGP_FAIL_ON_ERROR",
+            al_cfg.get("debug_replay_logp_fail_on_error", False),
+        )
+    )
+    if bool(debug_replay_logp_check):
+        stage(
+            f"[actor{actor_id}] debug_replay_logp_check=True "
+            f"tolerance={debug_replay_logp_tolerance:g} "
+            f"fail_on_error={bool(debug_replay_logp_fail_on_error)}"
+        )
     end_shard_on_done = bool(al_cfg.get("variable_shard_on_done", al_cfg.get("end_shard_on_done", False)))
     if bool(end_shard_on_done):
         stage(f"[actor{actor_id}] variable_shard_on_done=True")
@@ -312,6 +346,10 @@ def _actor_main_impl(
                     return_info=True,
                     heartbeat_fn=heartbeat,
                     end_shard_on_done=bool(end_shard_on_done),
+                    debug_replay_logp_check=bool(debug_replay_logp_check),
+                    debug_replay_logp_tolerance=float(debug_replay_logp_tolerance),
+                    debug_replay_logp_fail_on_error=bool(debug_replay_logp_fail_on_error),
+                    debug_replay_logp_log_fn=stage,
                 )
             except Exception:
                 if close_env_between_shards:
@@ -419,6 +457,10 @@ def _actor_main_impl(
                 info_list=_info,
                 return_info=True,
                 heartbeat_fn=heartbeat,
+                debug_replay_logp_check=bool(debug_replay_logp_check),
+                debug_replay_logp_tolerance=float(debug_replay_logp_tolerance),
+                debug_replay_logp_fail_on_error=bool(debug_replay_logp_fail_on_error),
+                debug_replay_logp_log_fn=stage,
             )
             if _stop_before_writing_shard(paths, actor_id=int(actor_id), shard_count=len(shards)):
                 break

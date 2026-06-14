@@ -558,8 +558,13 @@ class SparseDriveV2Policy(Agent):
     def _unwrap_model(module: torch.nn.Module | DDP) -> torch.nn.Module:
         return module.module if isinstance(module, DDP) else module
 
-    def _forward_policy_on_model(self, model: torch.nn.Module, features_dev: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        out, _loss_dict = model(features_dev, targets={})
+    def _forward_policy_on_model(
+        self,
+        model: torch.nn.Module,
+        features_dev: Dict[str, Any],
+        targets: Dict[str, Any] | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        out, _loss_dict = model(features_dev, targets={} if targets is None else targets)
         if "trajectory" not in out:
             raise RuntimeError("SparseDriveV2 output missing 'trajectory'")
 
@@ -581,9 +586,454 @@ class SparseDriveV2Policy(Agent):
         out["candidate_scores"] = candidate_scores.to(dtype=torch.float32)
         return out
 
-    def _forward_policy(self, features_dev: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    def _forward_policy(self, features_dev: Dict[str, Any], targets: Dict[str, Any] | None = None) -> Dict[str, torch.Tensor]:
         model = self._unwrap_model(self._model)
-        return self._forward_policy_on_model(model, features_dev)
+        return self._forward_policy_on_model(model, features_dev, targets=targets)
+
+    def _forward_policy_with_forced_global_indices(
+        self,
+        features_dev: Dict[str, Any],
+        forced_global_indices: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        model = self._unwrap_model(self._model)
+        head = getattr(model, "_trajectory_head", None)
+        decoder = getattr(head, "decoder", None)
+        layers = getattr(decoder, "layers", None)
+        if head is None or layers is None:
+            return self._forward_policy_on_model(
+                model,
+                features_dev,
+                targets={"forced_global_indices": forced_global_indices},
+            )
+
+        camera_feature = dict(features_dev["camera_feature"])
+        status_feature = features_dev["status_feature"]
+        status_encoding = model._status_encoding(status_feature)
+        feature_maps = model._backbone(camera_feature["imgs"])
+        camera_feature["feature_maps"] = feature_maps
+
+        batch_size = int(status_encoding.shape[0])
+        path_vocab = head.path_vocab.data[None].repeat(batch_size, 1, 1, 1)
+        vel_vocab = head.vel_vocab.data[None].repeat(batch_size, 1, 1)
+        traj_vocab = head.traj_vocab.data[None].repeat(batch_size, 1, 1, 1, 1)
+        traj_mask = head.traj_mask.data[None].repeat(batch_size, 1, 1, 1)
+        path_indices = torch.arange(path_vocab.shape[1], device=path_vocab.device, dtype=torch.long)[None].repeat(batch_size, 1)
+        vel_indices = torch.arange(vel_vocab.shape[1], device=vel_vocab.device, dtype=torch.long)[None].repeat(batch_size, 1)
+        path_embed = head.path_pos_embed(path_vocab.flatten(-2, -1))
+        vel_embed = head.vel_pos_embed(vel_vocab)
+
+        total_num_vel = int(vel_vocab.shape[1])
+        forced_global_indices = forced_global_indices.to(device=status_feature.device, dtype=torch.long).view(-1)
+        forced_path_indices = torch.div(forced_global_indices, total_num_vel, rounding_mode="floor")
+        forced_vel_indices = forced_global_indices.remainder(total_num_vel)
+        batch_indices = torch.arange(batch_size, device=status_feature.device, dtype=torch.long)
+
+        from navsim.agents.sparsedrive.ops import deformable_format
+
+        output: Dict[str, torch.Tensor] = {}
+        for layer in layers:
+            num_path = int(path_embed.shape[1])
+            num_vel = int(vel_embed.shape[1])
+            img_value = camera_feature["feature_maps"][-1].permute(0, 1, 3, 4, 2).flatten(1, 3)
+            deform_value = deformable_format(camera_feature["feature_maps"])
+
+            path_embed = path_embed + status_encoding.unsqueeze(1)
+            vel_embed = vel_embed + status_encoding.unsqueeze(1)
+
+            path_vocab_flat = path_vocab[..., :2].flatten(-2)
+            path_embed = layer.p_deform_model(
+                path_embed,
+                path_vocab_flat,
+                None,
+                deform_value,
+                camera_feature,
+                None,
+            )
+            path_embed = path_embed + layer.p_dropout1(layer.p_attention(path_embed, path_embed, path_embed)[0])
+            path_embed = layer.p_norm1(path_embed)
+            path_embed = path_embed + layer.p_dropout2(layer.p_ffn(path_embed))
+            path_embed = layer.p_norm2(path_embed)
+            path_scores = layer.path_mlp(path_embed).squeeze(-1)
+
+            vel_embed = vel_embed + layer.v_img_attention(vel_embed, img_value, img_value)[0]
+            vel_embed = vel_embed + layer.v_dropout1(layer.v_attention(vel_embed, vel_embed, vel_embed)[0])
+            vel_embed = layer.v_norm1(vel_embed)
+            vel_embed = vel_embed + layer.v_dropout2(layer.v_ffn(vel_embed))
+            vel_embed = layer.v_norm2(vel_embed)
+            vel_scores = layer.vel_mlp(vel_embed).squeeze(-1)
+
+            if num_path > layer._config.path_filter_num[layer.decoder_idx]:
+                _scores, topk_path_pos = torch.topk(
+                    path_scores,
+                    layer._config.path_filter_num[layer.decoder_idx],
+                    dim=1,
+                )
+                filter_path_embed = torch.gather(path_embed, 1, topk_path_pos.unsqueeze(-1).expand(-1, -1, path_embed.shape[-1]))
+                filter_path_vocab = torch.gather(
+                    path_vocab,
+                    1,
+                    topk_path_pos.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, path_vocab.shape[-2], path_vocab.shape[-1]),
+                )
+                filter_traj_vocab = torch.gather(
+                    traj_vocab,
+                    1,
+                    topk_path_pos[:, :, None, None, None].expand(
+                        -1,
+                        -1,
+                        traj_vocab.shape[-3],
+                        traj_vocab.shape[-2],
+                        traj_vocab.shape[-1],
+                    ),
+                )
+                filter_traj_mask = torch.gather(
+                    traj_mask,
+                    1,
+                    topk_path_pos[:, :, None, None].expand(-1, -1, traj_mask.shape[-2], traj_mask.shape[-1]),
+                )
+                filter_path_indices = torch.gather(path_indices, 1, topk_path_pos)
+            else:
+                filter_path_embed = path_embed
+                filter_path_vocab = path_vocab
+                filter_traj_vocab = traj_vocab
+                filter_traj_mask = traj_mask
+                filter_path_indices = path_indices
+
+            source_path_pos = (path_indices == forced_path_indices[:, None]).to(dtype=torch.long).argmax(dim=1)
+            path_missing = ~(filter_path_indices == forced_path_indices[:, None]).any(dim=1)
+            forced_path_embed = path_embed[batch_indices, source_path_pos].unsqueeze(1)
+            forced_path_vocab = path_vocab[batch_indices, source_path_pos].unsqueeze(1)
+            forced_path_traj_vocab = traj_vocab[batch_indices, source_path_pos].unsqueeze(1)
+            forced_path_traj_mask = traj_mask[batch_indices, source_path_pos].unsqueeze(1)
+            filter_path_embed = torch.cat(
+                [filter_path_embed, torch.where(path_missing[:, None, None], forced_path_embed, filter_path_embed[:, :1])],
+                dim=1,
+            )
+            filter_path_vocab = torch.cat(
+                [filter_path_vocab, torch.where(path_missing[:, None, None, None], forced_path_vocab, filter_path_vocab[:, :1])],
+                dim=1,
+            )
+            filter_traj_vocab = torch.cat(
+                [
+                    filter_traj_vocab,
+                    torch.where(path_missing[:, None, None, None, None], forced_path_traj_vocab, filter_traj_vocab[:, :1]),
+                ],
+                dim=1,
+            )
+            filter_traj_mask = torch.cat(
+                [
+                    filter_traj_mask,
+                    torch.where(path_missing[:, None, None, None], forced_path_traj_mask, filter_traj_mask[:, :1]),
+                ],
+                dim=1,
+            )
+            filter_path_indices = torch.cat(
+                [filter_path_indices, torch.where(path_missing[:, None], forced_path_indices[:, None], filter_path_indices[:, :1])],
+                dim=1,
+            )
+
+            pre_vel_traj_vocab = filter_traj_vocab
+            pre_vel_traj_mask = filter_traj_mask
+            if num_vel > layer._config.velocity_filter_num[layer.decoder_idx]:
+                _scores, topk_vel_pos = torch.topk(
+                    vel_scores,
+                    layer._config.velocity_filter_num[layer.decoder_idx],
+                    dim=1,
+                )
+                filter_vel_embed = torch.gather(vel_embed, 1, topk_vel_pos.unsqueeze(-1).expand(-1, -1, vel_embed.shape[-1]))
+                filter_vel_vocab = torch.gather(vel_vocab, 1, topk_vel_pos.unsqueeze(-1).expand(-1, -1, vel_vocab.shape[-1]))
+                filter_traj_vocab = torch.gather(
+                    pre_vel_traj_vocab,
+                    2,
+                    topk_vel_pos[:, None, :, None, None].expand(
+                        -1,
+                        pre_vel_traj_vocab.shape[-4],
+                        -1,
+                        pre_vel_traj_vocab.shape[-2],
+                        pre_vel_traj_vocab.shape[-1],
+                    ),
+                )
+                filter_traj_mask = torch.gather(
+                    pre_vel_traj_mask,
+                    2,
+                    topk_vel_pos[:, None, :, None].expand(-1, pre_vel_traj_mask.shape[-3], -1, pre_vel_traj_mask.shape[-1]),
+                )
+                filter_vel_indices = torch.gather(vel_indices, 1, topk_vel_pos)
+            else:
+                filter_vel_embed = vel_embed
+                filter_vel_vocab = vel_vocab
+                filter_vel_indices = vel_indices
+
+            source_vel_pos = (vel_indices == forced_vel_indices[:, None]).to(dtype=torch.long).argmax(dim=1)
+            vel_missing = ~(filter_vel_indices == forced_vel_indices[:, None]).any(dim=1)
+            forced_vel_embed = vel_embed[batch_indices, source_vel_pos].unsqueeze(1)
+            forced_vel_vocab = vel_vocab[batch_indices, source_vel_pos].unsqueeze(1)
+            forced_vel_traj_vocab = pre_vel_traj_vocab[
+                batch_indices[:, None],
+                torch.arange(pre_vel_traj_vocab.shape[1], device=pre_vel_traj_vocab.device)[None, :],
+                source_vel_pos[:, None],
+            ].unsqueeze(2)
+            forced_vel_traj_mask = pre_vel_traj_mask[
+                batch_indices[:, None],
+                torch.arange(pre_vel_traj_mask.shape[1], device=pre_vel_traj_mask.device)[None, :],
+                source_vel_pos[:, None],
+            ].unsqueeze(2)
+            filter_vel_embed = torch.cat(
+                [filter_vel_embed, torch.where(vel_missing[:, None, None], forced_vel_embed, filter_vel_embed[:, :1])],
+                dim=1,
+            )
+            filter_vel_vocab = torch.cat(
+                [filter_vel_vocab, torch.where(vel_missing[:, None, None], forced_vel_vocab, filter_vel_vocab[:, :1])],
+                dim=1,
+            )
+            filter_traj_vocab = torch.cat(
+                [
+                    filter_traj_vocab,
+                    torch.where(vel_missing[:, None, None, None, None], forced_vel_traj_vocab, filter_traj_vocab[:, :, :1]),
+                ],
+                dim=2,
+            )
+            filter_traj_mask = torch.cat(
+                [
+                    filter_traj_mask,
+                    torch.where(vel_missing[:, None, None, None], forced_vel_traj_mask, filter_traj_mask[:, :, :1]),
+                ],
+                dim=2,
+            )
+            filter_vel_indices = torch.cat(
+                [filter_vel_indices, torch.where(vel_missing[:, None], forced_vel_indices[:, None], filter_vel_indices[:, :1])],
+                dim=1,
+            )
+
+            base_path_indices = filter_path_indices[:, :-1]
+            base_vel_indices = filter_vel_indices[:, :-1]
+
+            path_embed = filter_path_embed
+            vel_embed = filter_vel_embed
+            path_vocab = filter_path_vocab
+            vel_vocab = filter_vel_vocab
+            traj_vocab = filter_traj_vocab
+            traj_mask = filter_traj_mask
+            path_indices = filter_path_indices
+            vel_indices = filter_vel_indices
+
+            if layer.decoder_idx != layer._config.decoder_num_layers - 1:
+                continue
+
+            traj_embed = path_embed.unsqueeze(2) + vel_embed.unsqueeze(1)
+            traj_embed = traj_embed.flatten(1, 2)
+            filter_traj_vocab_flat = traj_vocab[..., :2].flatten(1, 2).flatten(-2)
+            traj_embed = layer.t_deform_model(
+                traj_embed,
+                filter_traj_vocab_flat,
+                None,
+                deform_value,
+                camera_feature,
+                None,
+            )
+            traj_embed = traj_embed + layer.t_dropout1(layer.t_attention(traj_embed, traj_embed, traj_embed)[0])
+            traj_embed = layer.t_norm1(traj_embed)
+            traj_embed = traj_embed + layer.t_dropout2(layer.t_ffn(traj_embed))
+            traj_embed = layer.t_norm2(traj_embed)
+            traj_scores = layer.traj_mlp(traj_embed).squeeze(-1)
+            metric_logit: Dict[str, torch.Tensor] = {}
+            for metric in layer._config.metrics:
+                metric_logit[metric] = layer.metric_heads[metric](traj_embed).squeeze(-1)
+
+            candidate_trajectories = traj_vocab.flatten(1, 2)
+            candidate_path_indices = path_indices[:, :, None].expand(-1, -1, vel_indices.shape[1]).flatten(1, 2)
+            candidate_vel_indices = vel_indices[:, None, :].expand(-1, path_indices.shape[1], -1).flatten(1, 2)
+            candidate_global_indices = candidate_path_indices * int(total_num_vel) + candidate_vel_indices
+            if layer._config.dataset_version == "v1":
+                scores = (
+                    metric_logit["no_at_fault_collisions"].sigmoid()
+                    * metric_logit["drivable_area_compliance"].sigmoid()
+                ) * (
+                    5 * metric_logit["time_to_collision_within_bound"].sigmoid()
+                    + 5 * metric_logit["ego_progress"].sigmoid()
+                    + 2 * metric_logit["comfort"].sigmoid()
+                )
+            elif layer._config.dataset_version == "v2":
+                scores = (
+                    metric_logit["no_at_fault_collisions"].sigmoid()
+                    * metric_logit["drivable_area_compliance"].sigmoid()
+                    * metric_logit["driving_direction_compliance"].sigmoid()
+                    * metric_logit["traffic_light_compliance"].sigmoid()
+                ) * (
+                    5 * metric_logit["time_to_collision_within_bound"].sigmoid()
+                    + 5 * metric_logit["ego_progress"].sigmoid()
+                    + 2 * metric_logit["lane_keeping"].sigmoid()
+                    + 2 * metric_logit["history_comfort"].sigmoid()
+                )
+            else:
+                raise ValueError(f"Unsupported SparseDrive dataset_version={layer._config.dataset_version!r}")
+
+            base_candidate_path_indices = base_path_indices[:, :, None].expand(-1, -1, base_vel_indices.shape[1]).flatten(1, 2)
+            base_candidate_vel_indices = base_vel_indices[:, None, :].expand(-1, base_path_indices.shape[1], -1).flatten(1, 2)
+            base_candidate_global_indices = base_candidate_path_indices * int(total_num_vel) + base_candidate_vel_indices
+            base_source_pos = (
+                candidate_global_indices[:, :, None] == base_candidate_global_indices[:, None, :]
+            ).to(dtype=torch.long).argmax(dim=1)
+            forced_source_pos = (candidate_global_indices == forced_global_indices[:, None]).to(dtype=torch.long).argmax(dim=1)
+
+            base_candidate_trajectories = candidate_trajectories.gather(
+                1,
+                base_source_pos[:, :, None, None].expand(-1, -1, candidate_trajectories.shape[2], candidate_trajectories.shape[3]),
+            )
+            base_scores = torch.gather(scores, 1, base_source_pos)
+            base_traj_scores = torch.gather(traj_scores, 1, base_source_pos)
+            forced_candidate_trajectories = candidate_trajectories[batch_indices, forced_source_pos].unsqueeze(1)
+            forced_scores = scores[batch_indices, forced_source_pos].unsqueeze(1)
+            forced_traj_scores = traj_scores[batch_indices, forced_source_pos].unsqueeze(1)
+            present_in_base = (base_candidate_global_indices == forced_global_indices[:, None]).any(dim=1)
+            forced_scores = torch.where(
+                present_in_base[:, None],
+                torch.full_like(forced_scores, float("-inf")),
+                forced_scores,
+            )
+            candidate_trajectories = torch.cat([base_candidate_trajectories, forced_candidate_trajectories], dim=1)
+            scores = torch.cat([base_scores, forced_scores], dim=1)
+            traj_scores = torch.cat([base_traj_scores, forced_traj_scores], dim=1)
+            candidate_path_indices = torch.cat([base_candidate_path_indices, forced_path_indices[:, None]], dim=1)
+            candidate_vel_indices = torch.cat([base_candidate_vel_indices, forced_vel_indices[:, None]], dim=1)
+            candidate_global_indices = torch.cat([base_candidate_global_indices, forced_global_indices[:, None]], dim=1)
+            candidate_is_forced = torch.zeros_like(candidate_global_indices, dtype=torch.bool)
+            candidate_is_forced[:, -1] = True
+
+            bs_indices = torch.arange(scores.shape[0], device=scores.device)
+            mode_indices = scores.argmax(1)
+            output["trajectory"] = candidate_trajectories[bs_indices, mode_indices]
+            output["candidate_trajectories"] = candidate_trajectories
+            output["candidate_scores"] = scores
+            output["candidate_global_indices"] = candidate_global_indices
+            output["candidate_path_indices"] = candidate_path_indices
+            output["candidate_vel_indices"] = candidate_vel_indices
+            output["candidate_is_forced"] = candidate_is_forced
+            output["candidate_traj_logits"] = traj_scores
+            for metric_name, metric_value in metric_logit.items():
+                output[f"metric_logits/{metric_name}"] = torch.cat(
+                    [
+                        torch.gather(metric_value, 1, base_source_pos),
+                        metric_value[batch_indices, forced_source_pos].unsqueeze(1),
+                    ],
+                    dim=1,
+                )
+
+        if not output:
+            raise RuntimeError("SparseDriveV2 forced forward did not produce trajectory outputs")
+        return output
+
+    def _trajectory_anchor_lookup(self) -> tuple[Dict[bytes, int], int, tuple[int, ...]]:
+        model = self._unwrap_model(self._model)
+        head = getattr(model, "_trajectory_head", None)
+        traj_vocab = getattr(head, "traj_vocab", None)
+        if traj_vocab is None or not torch.is_tensor(traj_vocab):
+            raise RuntimeError("SparseDriveV2 global action identity requires model._trajectory_head.traj_vocab")
+
+        anchor = traj_vocab.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if anchor.ndim != 4:
+            raise RuntimeError(f"SparseDriveV2 traj_vocab must have shape (path, vel, horizon, dims); got {tuple(anchor.shape)}")
+        cache_key = tuple(int(v) for v in anchor.shape)
+        cached = getattr(self, "_trajectory_anchor_lookup_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 3 and cached[0] == cache_key:
+            return cached[1], int(cached[2]), cache_key
+
+        num_path, num_vel = int(anchor.shape[0]), int(anchor.shape[1])
+        flat = anchor.reshape(num_path * num_vel, int(anchor.shape[2]), int(anchor.shape[3]))
+        lookup: Dict[bytes, int] = {}
+        for global_idx in range(int(flat.shape[0])):
+            lookup[flat[global_idx].numpy().tobytes()] = int(global_idx)
+        self._trajectory_anchor_lookup_cache = (cache_key, lookup, int(num_vel))
+        return lookup, int(num_vel), cache_key
+
+    def _candidate_identity_from_trajectories(self, candidate_trajectories: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if not torch.is_tensor(candidate_trajectories) or candidate_trajectories.ndim != 4:
+            raise RuntimeError(
+                "SparseDriveV2 candidate identity requires candidate_trajectories with shape "
+                f"(batch, candidates, horizon, dims); got {tuple(candidate_trajectories.shape) if torch.is_tensor(candidate_trajectories) else type(candidate_trajectories)!r}"
+            )
+        lookup, num_vel, anchor_shape = self._trajectory_anchor_lookup()
+        if tuple(candidate_trajectories.shape[-2:]) != tuple(anchor_shape[-2:]):
+            raise RuntimeError(
+                "SparseDriveV2 candidate trajectory shape does not match traj_vocab anchors: "
+                f"candidate={tuple(candidate_trajectories.shape[-2:])} anchor={tuple(anchor_shape[-2:])}"
+            )
+
+        candidates_cpu = candidate_trajectories.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        batch_size, num_candidates = int(candidates_cpu.shape[0]), int(candidates_cpu.shape[1])
+        global_indices = torch.empty((batch_size, num_candidates), dtype=torch.long)
+        for batch_idx in range(batch_size):
+            for candidate_idx in range(num_candidates):
+                key = candidates_cpu[batch_idx, candidate_idx].numpy().tobytes()
+                global_idx = lookup.get(key, None)
+                if global_idx is None:
+                    raise RuntimeError(
+                        "SparseDriveV2 candidate trajectory was not found in the fixed traj_vocab; "
+                        f"batch={batch_idx} candidate={candidate_idx}"
+                    )
+                global_indices[batch_idx, candidate_idx] = int(global_idx)
+
+        path_indices = torch.div(global_indices, int(num_vel), rounding_mode="floor")
+        vel_indices = global_indices.remainder(int(num_vel))
+        return {
+            "candidate_global_indices": global_indices.to(device=candidate_trajectories.device),
+            "candidate_path_indices": path_indices.to(device=candidate_trajectories.device),
+            "candidate_vel_indices": vel_indices.to(device=candidate_trajectories.device),
+        }
+
+    def _candidate_identity_from_outputs(self, out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        identity = self._candidate_identity_from_trajectories(out["candidate_trajectories"])
+        out.update(identity)
+        return identity
+
+    @staticmethod
+    def _global_mode_indices_from_replay(replays: Sequence[Dict[str, Any]], *, device: torch.device) -> torch.Tensor:
+        values: List[int] = []
+        for idx, replay in enumerate(replays):
+            if "global_mode_idx" not in replay:
+                raise RuntimeError(f"SparseDriveV2 replay missing global_mode_idx at index {idx}")
+            values.append(int(replay["global_mode_idx"]))
+        return torch.as_tensor(values, dtype=torch.long, device=device)
+
+    @staticmethod
+    def _logp_for_global_modes_or_missing(
+        *,
+        score_logits: torch.Tensor,
+        candidate_global_indices: torch.Tensor,
+        target_global_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if candidate_global_indices.shape[:2] != score_logits.shape[:2]:
+            raise RuntimeError(
+                "candidate_global_indices must align with candidate_scores; "
+                f"indices={tuple(candidate_global_indices.shape)} scores={tuple(score_logits.shape)}"
+            )
+        matches = candidate_global_indices.to(device=score_logits.device, dtype=torch.long) == target_global_indices[:, None]
+        present = matches.any(dim=1)
+        local_indices = matches.to(dtype=torch.long).argmax(dim=1)
+        logp_all = torch.log_softmax(score_logits, dim=1)
+        batch_indices = torch.arange(score_logits.shape[0], device=score_logits.device)
+        logp = logp_all[batch_indices, local_indices]
+        return logp, present
+
+    @classmethod
+    def _logp_for_global_modes(
+        cls,
+        *,
+        score_logits: torch.Tensor,
+        candidate_global_indices: torch.Tensor,
+        target_global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        logp, present = cls._logp_for_global_modes_or_missing(
+            score_logits=score_logits,
+            candidate_global_indices=candidate_global_indices,
+            target_global_indices=target_global_indices,
+        )
+        if not bool(present.all().item()):
+            missing = (~present).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+            raise RuntimeError(
+                "SparseDriveV2 replay global_mode_idx was not present in current candidate_trajectories; "
+                f"missing batch indices: {missing[:8]}"
+            )
+        return logp
 
     @staticmethod
     def _traj_to_xyyaw(traj: torch.Tensor) -> np.ndarray:
@@ -732,6 +1182,7 @@ class SparseDriveV2Policy(Agent):
             out = self._forward_policy(batched_dev)
 
         score_logits = out["candidate_scores"].to(dtype=torch.float32)
+        candidate_identity = self._candidate_identity_from_outputs(out)
         selected_mode_indices = self._select_mode_batch(
             score_logits,
             mode_idx=int(mode_idx),
@@ -743,6 +1194,9 @@ class SparseDriveV2Policy(Agent):
 
         all_scores = score_logits.detach().cpu()
         all_trajs = out["candidate_trajectories"].detach().cpu()
+        all_global_indices = candidate_identity["candidate_global_indices"].detach().cpu()
+        all_path_indices = candidate_identity["candidate_path_indices"].detach().cpu()
+        all_vel_indices = candidate_identity["candidate_vel_indices"].detach().cpu()
         selected_mode_indices_cpu = selected_mode_indices.detach().cpu()
         selected_trajs = all_trajs[torch.arange(all_trajs.shape[0]), selected_mode_indices_cpu]
         traj_xyyaw_batch = self._traj_batch_to_xyyaw(selected_trajs)
@@ -756,9 +1210,14 @@ class SparseDriveV2Policy(Agent):
             logp = selected_logps[idx]
             traj_xyyaw = traj_xyyaw_batch[idx]
             replay = self._detach_replay_features(features)
+            selected_global_idx = int(all_global_indices[idx, selected_mode_idx].item())
+            selected_path_idx = int(all_path_indices[idx, selected_mode_idx].item())
+            selected_vel_idx = int(all_vel_indices[idx, selected_mode_idx].item())
             replay.update(
                 {
-                    "mode_idx": int(selected_mode_idx),
+                    "selected_path_idx": int(selected_path_idx),
+                    "selected_vel_idx": int(selected_vel_idx),
+                    "global_mode_idx": int(selected_global_idx),
                     "traj_xyyaw": traj_xyyaw.detach().cpu().clone(),
                     "candidate_scores": scores.detach().cpu().clone(),
                     "execute_mode": self._execute_mode,
@@ -792,6 +1251,9 @@ class SparseDriveV2Policy(Agent):
                 "this usually means old-format shards are mixed into the current buffer. "
                 f"Bad replay indices: {bad_indices[:8]}"
             )
+        if len(replays) > 1:
+            parts = [self.logp_from_replay_batch([replay], eta=1.0).view(1) for replay in replays]
+            return torch.cat(parts, dim=0)
 
         camera_keys = list(replays[0]["camera_feature"].keys())
         batched_camera = {
@@ -808,13 +1270,44 @@ class SparseDriveV2Policy(Agent):
         model.eval()
         out = self._forward_policy(batched_dev)
         score_logits = out["candidate_scores"].to(dtype=torch.float32)
-        mode_indices = torch.as_tensor(
-            [int(rep.get("mode_idx", 0)) for rep in replays],
-            dtype=torch.long,
-            device=score_logits.device,
+        candidate_identity = self._candidate_identity_from_outputs(out)
+        target_global_indices = self._global_mode_indices_from_replay(replays, device=score_logits.device)
+        logp, present = self._logp_for_global_modes_or_missing(
+            score_logits=score_logits,
+            candidate_global_indices=candidate_identity["candidate_global_indices"],
+            target_global_indices=target_global_indices,
         )
-        logp_all = torch.log_softmax(score_logits, dim=1)
-        return logp_all[torch.arange(score_logits.shape[0], device=score_logits.device), mode_indices]
+        if bool(present.all().item()):
+            return logp
+
+        missing = (~present).nonzero(as_tuple=False).view(-1)
+        if len(replays) == 1:
+            return self._forced_logp_from_replay_batch(replays)
+
+        for missing_idx_tensor in missing:
+            missing_idx = int(missing_idx_tensor.item())
+            logp[missing_idx] = self.logp_from_replay_batch([replays[missing_idx]], eta=1.0).view(())
+        return logp
+
+    def _forced_logp_from_replay_batch(self, replays: Sequence[Dict[str, Any]]) -> torch.Tensor:
+        batched_dev = self._batched_replay_features(replays)
+        target_global_indices = self._global_mode_indices_from_replay(replays, device=self.device)
+        out = self._forward_policy_with_forced_global_indices(batched_dev, target_global_indices)
+        score_logits = out["candidate_scores"].to(dtype=torch.float32)
+        candidate_identity = self._candidate_identity_from_outputs(out)
+        target_global_indices = target_global_indices.to(device=score_logits.device)
+        logp, present = self._logp_for_global_modes_or_missing(
+            score_logits=score_logits,
+            candidate_global_indices=candidate_identity["candidate_global_indices"],
+            target_global_indices=target_global_indices,
+        )
+        if bool(present.all().item()):
+            return logp
+        missing = (~present).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+        raise RuntimeError(
+            "SparseDriveV2 replay global_mode_idx was not present after forced scoring; "
+            f"missing batch indices: {missing[:8]}"
+        )
 
 #GRPO部分：输入已经 forward 出来的结果，然后挑候选。
     def _select_counterfactual_candidates_from_policy_outputs(
@@ -872,8 +1365,20 @@ class SparseDriveV2Policy(Agent):
             "mode_indices": selected_indices.to(dtype=torch.long),
             "score_logits": selected_score_logits,
         }
-        
-#调用上层函数
+
+    @staticmethod
+    def _concat_counterfactual_candidate_batches(
+        parts: Sequence[Dict[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        if len(parts) == 0:
+            return {}
+        keys = list(parts[0].keys())
+        return {
+            key: torch.cat([part[key] for part in parts], dim=0)
+            for key in keys
+        }
+
+    #调用上层函数
     def sample_counterfactual_trajectories_from_replay_batch(
         self,
         replays: Sequence[Dict[str, Any]],
@@ -889,12 +1394,24 @@ class SparseDriveV2Policy(Agent):
                 "score_logits": torch.empty((0, 0), device=self.device, dtype=torch.float32),
             }
 
+        if len(replays) > 1:
+            parts = [
+                self.sample_counterfactual_trajectories_from_replay_batch(
+                    [replay],
+                    num_candidates=int(num_candidates),
+                    candidate_select=str(candidate_select),
+                )
+                for replay in replays
+            ]
+            return self._concat_counterfactual_candidate_batches(parts)
+
         batched_dev = self._batched_replay_features(replays)
         model = self._unwrap_model(self._model)
         model.eval()
         out = self._forward_policy_on_model(model, batched_dev)
         score_logits = out["candidate_scores"].to(dtype=torch.float32)
         candidate_trajs = out["candidate_trajectories"]
+        candidate_identity = self._candidate_identity_from_outputs(out)
         return self._select_counterfactual_candidates_from_policy_outputs(
             score_logits=score_logits,
             candidate_trajs=candidate_trajs,
@@ -923,25 +1440,57 @@ class SparseDriveV2Policy(Agent):
                 "counterfactual": empty_candidates,
             }
 
+        if len(replays) > 1:
+            parts = [
+                self.replay_policy_outputs_from_replay_batch(
+                    [replay],
+                    eta=1.0,
+                    num_candidates=int(num_candidates),
+                    candidate_select=str(candidate_select),
+                )
+                for replay in replays
+            ]
+            return {
+                "new_logp": torch.cat([part["new_logp"].view(-1) for part in parts], dim=0),
+                "counterfactual": self._concat_counterfactual_candidate_batches(
+                    [part["counterfactual"] for part in parts]
+                ),
+            }
+
         batched_dev = self._batched_replay_features(replays)
         model = self._unwrap_model(self._model)
         model.eval()
         out = self._forward_policy_on_model(model, batched_dev)
         score_logits = out["candidate_scores"].to(dtype=torch.float32)
         candidate_trajs = out["candidate_trajectories"]
+        candidate_identity = self._candidate_identity_from_outputs(out)
         if candidate_trajs.ndim != 4:
             raise RuntimeError(
                 "SparseDriveV2 replay policy outputs require candidate trajectories with shape "
                 f"(batch, modes, horizon, dims); got {tuple(candidate_trajs.shape)}"
             )
 
-        mode_indices = torch.as_tensor(
-            [int(rep.get("mode_idx", 0)) for rep in replays],
-            dtype=torch.long,
-            device=score_logits.device,
+        target_global_indices = self._global_mode_indices_from_replay(replays, device=score_logits.device)
+        new_logp, present = self._logp_for_global_modes_or_missing(
+            score_logits=score_logits,
+            candidate_global_indices=candidate_identity["candidate_global_indices"],
+            target_global_indices=target_global_indices,
         )
+        if not bool(present.all().item()):
+            missing = (~present).nonzero(as_tuple=False).view(-1)
+            if len(replays) == 1:
+                new_logp = self._forced_logp_from_replay_batch(replays)
+            else:
+                for missing_idx_tensor in missing:
+                    missing_idx = int(missing_idx_tensor.item())
+                    single_outputs = self.replay_policy_outputs_from_replay_batch(
+                        [replays[missing_idx]],
+                        eta=1.0,
+                        num_candidates=int(num_candidates),
+                        candidate_select=str(candidate_select),
+                    )
+                    new_logp[missing_idx] = single_outputs["new_logp"].view(())
         logp_all = torch.log_softmax(score_logits, dim=1)
-        new_logp = logp_all[torch.arange(score_logits.shape[0], device=score_logits.device), mode_indices]
         counterfactual = self._select_counterfactual_candidates_from_policy_outputs(
             score_logits=score_logits,
             candidate_trajs=candidate_trajs,
@@ -1203,6 +1752,9 @@ class SparseDriveV2Policy(Agent):
             return False
         if not torch.is_tensor(status_feature):
             return False
+        for key in ("global_mode_idx", "selected_path_idx", "selected_vel_idx"):
+            if key not in replay:
+                return False
         return len(camera_feature) > 0
 
     def logp_from_replay(self, replay: Dict[str, Any], *, eta: float = 1.0) -> torch.Tensor:

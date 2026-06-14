@@ -237,10 +237,8 @@ env:
 train:
   wandb:
     enabled: false
-    project: ReconDiff
+    project: reconSparse
     group: diag_collision100
-    log_minibatch_metrics: true
-    log_legacy_raw_metrics: true
   algo: reinforcepp
   eta: 1.0
   mode_idx: -1

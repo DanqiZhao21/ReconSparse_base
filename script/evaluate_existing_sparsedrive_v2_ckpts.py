@@ -16,11 +16,11 @@ cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 /root/miniconda3/envs/recondreamerNew-rl/bin/python -u script/evaluate_existing_sparsedrive_v2_ckpts.py \
-  --ckpts /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
+  --ckpts /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/20260612_collision_GRPO_latest.ckpt \
   --repeat-evals 2 \
   --max-scenes 88 \
   --slots 0:0 1:1 2:2 3:3 4:4 5:5 6:6 7:7 \
-  --run-name sparsedrive_v2_manual_eval
+  --run-name sparsedrive_v2_manual_eval_0612
 
 Multiple ckpts in one evaluation batch:
 

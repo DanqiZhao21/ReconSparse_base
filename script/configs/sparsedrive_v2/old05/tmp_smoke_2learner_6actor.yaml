@@ -86,7 +86,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: grpo_only_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO
   algo: grpo_only
   eta: 1.0

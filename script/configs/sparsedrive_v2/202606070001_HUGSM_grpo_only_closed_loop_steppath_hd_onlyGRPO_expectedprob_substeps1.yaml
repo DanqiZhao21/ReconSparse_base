@@ -228,7 +228,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_OnlyGRPO_ExpectedProb_Substeps1
   algo: grpo_only
   eta: 1.0

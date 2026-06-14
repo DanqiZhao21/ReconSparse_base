@@ -107,7 +107,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_CloseCloseloop_OpenGRPOCraft_FullPara
   algo: reinforcepp
   eta: 1.0

@@ -106,7 +106,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_GRPOOnly_NoClosedLoopReward
   algo: grpo_only
   eta: 1.0

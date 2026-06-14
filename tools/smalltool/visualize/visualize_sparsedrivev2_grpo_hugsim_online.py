@@ -11,10 +11,14 @@ CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_
   --top-k 5 \
   --mode-select sample
   
-CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_grpo_hugsim_online.py \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606021200_HUGSM_reinforcepp_closed_loop_reward-progress_hd_GRPOCraft_substeps1.yaml \
-  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
-  --scenario-path /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0411-medium-00.yaml \
+  
+  /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0062-medium-00.yaml
+  /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0411-medium-00.yaml
+  
+CUDA_VISIBLE_DEVICES=2 python tools/smalltool/visualize/visualize_sparsedrivev2_grpo_hugsim_online.py \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606130003_HUGSM_reinforcepp_closed_loop_steppath_hd_collision_only_extreme_GRPOPdm_auxRiskDecel_substeps1.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/20260610_164918_3_ColisionOnly_NoCraft_ReinforcePP_NoGRPO_ver01_latest.ckpt \
+  --scenario-path /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0062-medium-00.yaml \
   --max-steps 42 \
   --num-candidates 64 \
   --top-k 3 \
@@ -52,6 +56,8 @@ from tools.smalltool.visualize.visualize_sparsedrivev2_grpo_craft_online import 
     _obs_for_policy,
     _overlay_debug_text,
     build_candidate_score_payload,
+    extract_candidate_score_details,
+    format_pdm_score_percent,
     overlay_top_right_inset,
     render_bev_debug_image,
     write_score_payload,
@@ -346,7 +352,63 @@ def _localize_recon_global_poly(
     return (rel @ np.asarray(world_to_ego_rot, dtype=np.float64).T).astype(np.float32)
 
 
-def build_hugsim_grpo_object_context(info: Mapping[str, Any]) -> dict[str, Any]:
+def _plan_for_hugsim_object(token: str, index: int, scenario_plan_list: Sequence[Any] | None) -> Any | None:
+    plans = list(scenario_plan_list or [])
+    if index < len(plans):
+        return plans[index]
+    match = re.search(r"(\d+)$", str(token))
+    if match is None:
+        return None
+    plan_idx = int(match.group(1))
+    return plans[plan_idx] if plan_idx < len(plans) else None
+
+
+def _constant_planner_future_from_object(
+    *,
+    raw: Mapping[str, Any],
+    local_poly: np.ndarray,
+    plan: Any,
+    ego_xy: np.ndarray,
+    world_to_ego_rot: np.ndarray,
+    ego_yaw: float,
+    future_horizon: int,
+    future_dt_s: float,
+) -> tuple[list[list[float]], list[float], list[float]] | None:
+    plan_items = list(plan) if isinstance(plan, (list, tuple)) else []
+    if len(plan_items) < 7 or str(plan_items[6]) != "ConstantPlanner":
+        return None
+    try:
+        speed = float(plan_items[4])
+    except Exception:
+        speed = float(raw.get("speed_mps", 0.0))
+    yaw_world = float(raw.get("yaw_rad", plan_items[3] if len(plan_items) > 3 else 0.0))
+    center_local = np.mean(local_poly[:, :2], axis=0).astype(np.float64)
+    center_world = np.asarray(ego_xy, dtype=np.float64).reshape(2) + center_local @ np.asarray(world_to_ego_rot, dtype=np.float64)
+    a = float(center_world[0])
+    b = float(center_world[1])
+    dt = max(1.0e-6, float(future_dt_s))
+    future_xy_world: list[list[float]] = []
+    future_yaw_local: list[float] = []
+    future_mask: list[float] = []
+    for _ in range(1, max(1, int(future_horizon))):
+        a = a - speed * math.sin(yaw_world) * dt
+        b = b + speed * math.cos(yaw_world) * dt
+        future_xy_world.append([float(a), float(b)])
+        future_yaw_local.append(float(math.atan2(math.sin(yaw_world - float(ego_yaw)), math.cos(yaw_world - float(ego_yaw)))))
+        future_mask.append(1.0)
+    if not future_xy_world:
+        return None
+    future_local = (np.asarray(future_xy_world, dtype=np.float64) - ego_xy.reshape(1, 2)) @ world_to_ego_rot.T
+    return future_local.astype(np.float32).tolist(), future_yaw_local, future_mask
+
+
+def build_hugsim_grpo_object_context(
+    info: Mapping[str, Any],
+    *,
+    scenario_plan_list: Sequence[Any] | None = None,
+    future_horizon: int = 8,
+    future_dt_s: float = 0.5,
+) -> dict[str, Any]:
     """Build scorer-local object overrides from HUGSIM aligned Recon-global context."""
     ego_poly = info.get("hugsim_ego_box_recon_global_poly", None)
     try:
@@ -403,6 +465,56 @@ def build_hugsim_grpo_object_context(info: Mapping[str, Any]) -> dict[str, Any]:
                 "velocity_xy": velocity_local.tolist(),
                 "speed_mps": float(raw.get("speed_mps", np.linalg.norm(velocity_local))),
             }
+            has_explicit_future = False
+            for future_key in ("future_xy", "future_centers_xy", "future_trajectory_xy", "future_traj_xy"):
+                if future_key not in raw:
+                    continue
+                try:
+                    future_world = np.asarray(raw.get(future_key), dtype=np.float64)
+                except Exception:
+                    future_world = np.zeros((0, 2), dtype=np.float64)
+                if future_world.ndim == 2 and future_world.shape[0] > 0 and future_world.shape[1] >= 2:
+                    future_local = (future_world[:, :2] - ego_xy.reshape(1, 2)) @ world_to_ego_rot.T
+                    obj["future_xy"] = future_local.astype(np.float32).tolist()
+                    has_explicit_future = True
+                break
+            for yaw_key in ("future_yaw", "future_yaw_rad", "future_headings_rad", "future_heading_rad"):
+                if yaw_key in raw:
+                    future_yaw_world = np.asarray(raw.get(yaw_key), dtype=np.float32).reshape(-1)
+                    future_yaw_local = np.arctan2(
+                        np.sin(future_yaw_world - float(ego_yaw)),
+                        np.cos(future_yaw_world - float(ego_yaw)),
+                    ).astype(np.float32)
+                    obj["future_yaw"] = future_yaw_local.tolist()
+                    break
+            for mask_key in ("future_mask", "future_masks", "future_valid", "future_valid_mask"):
+                if mask_key in raw:
+                    obj["future_mask"] = np.asarray(raw.get(mask_key), dtype=np.float32).reshape(-1).tolist()
+                    break
+            if "future_dt_s" in raw:
+                obj["future_dt_s"] = float(raw.get("future_dt_s", 0.5))
+            elif "future_dt" in raw:
+                obj["future_dt_s"] = float(raw.get("future_dt", 0.5))
+            elif "dt_s" in raw:
+                obj["future_dt_s"] = float(raw.get("dt_s", 0.5))
+            if (
+                not has_explicit_future
+                and source == "hugsim_inserted"
+                and scenario_plan_list is not None
+            ):
+                rollout = _constant_planner_future_from_object(
+                    raw=raw,
+                    local_poly=local_poly,
+                    plan=_plan_for_hugsim_object(token, idx, scenario_plan_list),
+                    ego_xy=ego_xy,
+                    world_to_ego_rot=world_to_ego_rot,
+                    ego_yaw=ego_yaw,
+                    future_horizon=future_horizon,
+                    future_dt_s=future_dt_s,
+                )
+                if rollout is not None:
+                    obj["future_xy"], obj["future_yaw"], obj["future_mask"] = rollout
+                    obj["future_dt_s"] = float(future_dt_s)
             out.append(obj)
         return out
 
@@ -492,7 +604,7 @@ def render_candidate_grid_image(
         row = idx // cols
         col = idx % cols
         detail = dict(sample_detail)
-        detail["sample_token"] = f"cand={idx} rank={rank_by_idx.get(idx, -1)} score={float(score_arr[idx]):.3f}"
+        detail["sample_token"] = f"cand={idx} rank={rank_by_idx.get(idx, -1)} score={format_pdm_score_percent(float(score_arr[idx]))}"
         one_traj = traj[idx : idx + 1]
         one_score = np.asarray([score_arr[idx]], dtype=np.float32)
         tile = render_bev_debug_image(
@@ -506,11 +618,16 @@ def render_candidate_grid_image(
         x0 = col * panel
         y0 = row * panel
         canvas[y0 : y0 + panel, x0 : x0 + panel] = tile
-        title = f"#{idx} r{rank_by_idx.get(idx, -1)} s={float(score_arr[idx]):.2f}"
+        title = f"#{idx} r{rank_by_idx.get(idx, -1)} s={format_pdm_score_percent(float(score_arr[idx]))}"
         cv2.rectangle(canvas, (x0, y0), (x0 + panel - 1, y0 + 25), (255, 255, 255), -1)
         cv2.putText(canvas, title, (x0 + 7, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30, 30, 30), 1, cv2.LINE_AA)
 
-    footer = f"GRPO mean={summary['mean']:.3f} std={summary['std']:.3f} min={summary['min']:.3f} max={summary['max']:.3f}"
+    footer = (
+        f"GRPO mean={format_pdm_score_percent(summary['mean'])} "
+        f"std={format_pdm_score_percent(summary['std'])} "
+        f"min={format_pdm_score_percent(summary['min'])} "
+        f"max={format_pdm_score_percent(summary['max'])}"
+    )
     cv2.rectangle(canvas, (0, max(0, canvas.shape[0] - 30)), (canvas.shape[1] - 1, canvas.shape[0] - 1), (255, 255, 255), -1)
     cv2.putText(canvas, footer, (10, canvas.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (20, 20, 20), 1, cv2.LINE_AA)
     return canvas
@@ -635,7 +752,7 @@ def run_online_hugsim_scene(
     max_steps: int | None = None,
     num_candidates: int | None = None,
     top_k: int = 5,
-    bev_size: int = 960,
+    bev_size: int = 1600,
     grid_panel_size: int = 360,
     grid_columns: int = 4,
     candidate_select: str | None = None,
@@ -663,6 +780,11 @@ def run_online_hugsim_scene(
     n_candidates = int(num_candidates if num_candidates is not None else grpo_cfg.get("num_candidates", 8))
     cand_select = str(candidate_select if candidate_select is not None else grpo_cfg.get("candidate_select", "topk"))
     policy_mode_select = str(mode_select if mode_select is not None else train_cfg.get("policy_mode_select", "sample"))
+    try:
+        scenario_payload = _load_yaml(selection.scenario_path)
+    except Exception:
+        scenario_payload = {}
+    scenario_plan_list = list(scenario_payload.get("plan_list", []) or [])
 
     manifest = build_run_manifest_payload(
         config=config,
@@ -716,7 +838,12 @@ def run_online_hugsim_scene(
                 mode_idx=-1,
                 mode_select=policy_mode_select,
             )
-            grpo_object_context = build_hugsim_grpo_object_context(current_info)
+            grpo_object_context = build_hugsim_grpo_object_context(
+                current_info,
+                scenario_plan_list=scenario_plan_list,
+                future_horizon=8,
+                future_dt_s=0.5,
+            )
             if bool(grpo_object_context.get("available", False)):
                 replay["scene_objects_override"] = list(grpo_object_context.get("scene_objects", []))
                 replay["ea_agent_states_override"] = list(grpo_object_context.get("ea_agent_states", []))
@@ -755,6 +882,12 @@ def run_online_hugsim_scene(
                 candidate_scores = np.asarray(score_tensor, dtype=np.float32)[0]
 
             sample_detail = _build_bev_sample_detail(policy, replay, traj_xyyaw)
+            selected_mode = _selected_mode_index(replay, np.asarray([mode_indices[0] if mode_indices.size else -1]))
+            selected_candidate_idx = None
+            if selected_mode is not None and mode_indices.size:
+                matches = np.where(mode_indices == int(selected_mode))[0]
+                if int(matches.shape[0]) > 0:
+                    selected_candidate_idx = int(matches[0])
             bev_img = render_bev_debug_image(
                 sample_detail=sample_detail,
                 traj_xyyaw=traj_xyyaw,
@@ -762,6 +895,8 @@ def run_online_hugsim_scene(
                 top_k=int(top_k),
                 width=int(bev_size),
                 height=int(bev_size),
+                selected_index=selected_candidate_idx,
+                max_display_candidates=max(4, min(10, int(top_k) + 3)),
             )
             imageio.imwrite(paths.bev_dir / f"step_{step:06d}_bev.png", bev_img)
             candidate_grid_img = render_candidate_grid_image(
@@ -788,6 +923,13 @@ def run_online_hugsim_scene(
                 score_logits=score_logits,
                 mode_indices=mode_indices,
                 top_k=int(top_k),
+                candidate_details=extract_candidate_score_details(
+                    policy,
+                    replay,
+                    traj_xyyaw,
+                    candidate_scores,
+                    sample_detail=sample_detail,
+                ),
             )
             score_path = write_score_payload(paths.scores_dir, candidate_payload)
             score_paths.append(str(score_path))
@@ -801,7 +943,6 @@ def run_online_hugsim_scene(
             done = bool(terminated or truncated)
             next_frame_idx = int(reward_info.get("now_frame", reward_info.get("frame_idx", frame_idx)))
 
-            selected_mode = _selected_mode_index(replay, np.asarray([mode_indices[0] if mode_indices.size else -1]))
             logp_float = float(logp.detach().cpu().item()) if torch.is_tensor(logp) else float(logp)
             step_payload = build_hugsim_step_payload(
                 step=int(step),
@@ -905,7 +1046,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-candidates", type=int, default=None)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--bev-size", type=int, default=960)
+    parser.add_argument("--bev-size", type=int, default=1600)
     parser.add_argument("--grid-panel-size", type=int, default=360)
     parser.add_argument("--grid-columns", type=int, default=4)
     parser.add_argument("--candidate-select", type=str, default=None, choices=["topk", "all"])

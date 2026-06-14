@@ -86,7 +86,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: reinforcepp_closed_loop_sparsedrive_v2_craft_closeCorrection_openGrpo
   algo: reinforcepp
   eta: 1.0

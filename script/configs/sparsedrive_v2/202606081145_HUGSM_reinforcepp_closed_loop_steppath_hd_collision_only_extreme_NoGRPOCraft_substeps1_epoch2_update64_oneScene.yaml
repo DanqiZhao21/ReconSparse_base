@@ -234,7 +234,8 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
+    entity: 2564380679-
     group: HUGSIM_RewardCollisionOnlyExtreme_NoGRPOCraft_Substeps1
   algo: reinforcepp
   eta: 1.0
@@ -259,7 +260,7 @@ train:
     - 5
     - 6
     - 7
-    actors_per_gpu: 12
+    actors_per_gpu: 4
     auto_max_inflight_per_actor: false
     max_inflight_per_actor: 3
     pause_actor_on_learner_gpu: true
@@ -279,6 +280,9 @@ train:
     restart_failed_actors: true
     max_actor_restarts: 2
     max_updates: 64
+    debug_retain_versions: 5
+    debug_retain_ckpts: true
+    debug_retain_shards: true
   minibatch_size: 32
   gamma: 0.99
   ddp:

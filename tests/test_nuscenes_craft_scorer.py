@@ -293,3 +293,39 @@ def test_craft_carl_scorer_ignores_default_map_heading_when_centerlines_missing(
     )
 
     assert np.allclose(scorer._last_terms["efficiency"], np.ones((1, 3), dtype=np.float32))
+
+
+def test_craft_carl_scorer_uses_replay_dynamic_object_future_for_collision(tmp_path: Path) -> None:
+    from framework.algorithms.nuscenes_craft_scorer import NuScenesCraftScorer
+
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+    scorer = NuScenesCraftScorer(token2vad_path=token2vad_path, scene_cache_root=tmp_path / "scene_cache")
+
+    traj_xyyaw = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+    traj_xyyaw[0, 0, :, 0] = torch.tensor([1.0, 2.0, 3.0])
+    replay = {
+        "sample_token": "tok-a",
+        "scene_objects_override": [
+            {
+                "token": "future-car",
+                "category": "vehicle.car",
+                "center_xy": [20.0, 0.0],
+                "yaw_rad": 0.0,
+                "velocity_xy": [0.0, 0.0],
+                "length_m": 4.0,
+                "width_m": 1.0,
+                "future_xy": [[1.0, 0.0], [20.0, 0.0], [20.0, 0.0]],
+                "future_yaw": [0.0, 0.0, 0.0],
+                "future_dt_s": 0.5,
+            }
+        ],
+    }
+
+    scorer.score([replay], traj_xyyaw)
+
+    collision_cost = scorer._last_terms["collision_cost"]
+    assert np.allclose(
+        collision_cost,
+        np.asarray([[CRAFT_CARL_FORWARD_SIM_DEFAULTS["term_collision"], 0.0, 0.0]], dtype=np.float32),
+    )

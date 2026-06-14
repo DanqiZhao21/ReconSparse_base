@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 from framework.io.buffer import BufferPaths, ensure_buffer_layout, read_int, write_int
+from framework.io.debug_retention import copy_latest_to_history, should_retain_version
 from framework.lightning.actor_learner_datamodule import ActorLearnerUpdateDataModule
 from framework.lightning.actor_learner_module import ActorLearnerLightningModule
 from framework.lightning.config import (
@@ -46,6 +47,19 @@ def _restore_rank_checkpoint_if_available(*, agent: Any, paths: BufferPaths, ran
             stage_fn(f"[learner rank={int(rank)}] {message}")
 
     return _restore_learner_checkpoint_if_available(agent=agent, paths=paths, stage_fn=rank_stage)
+
+
+def _retain_initial_checkpoint_if_configured(*, paths: BufferPaths, learner_config: Any, stage_fn: Any) -> None:
+    retain_versions = int(getattr(learner_config, "debug_retain_versions", 0) or 0)
+    if not bool(getattr(learner_config, "debug_retain_ckpts", False)):
+        return
+    if not should_retain_version(version=1, retain_versions=int(retain_versions)):
+        return
+    try:
+        history_path = copy_latest_to_history(paths, version=1)
+        stage_fn(f"[learner] debug retained initial checkpoint ver=1 path={history_path}")
+    except Exception as exc:
+        stage_fn(f"[learner] debug initial checkpoint retention failed: {exc}")
 
 
 def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
@@ -119,6 +133,11 @@ def learner_main(cfg: Dict[str, Any], *, learner_rank: int = 0) -> None:
             write_int(paths.version_file, 1)
             try:
                 agent.save_checkpoint(paths.latest_ckpt)
+                _retain_initial_checkpoint_if_configured(
+                    paths=paths,
+                    learner_config=learner_config,
+                    stage_fn=stage,
+                )
             except Exception as exc:
                 stage(f"[learner] initial save failed: {exc}")
     if ddp_enabled:

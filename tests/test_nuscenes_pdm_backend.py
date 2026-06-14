@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pickle
+import types
 
 import numpy as np
 import pytest
@@ -27,6 +28,12 @@ def _write_token2vad(path: Path) -> None:
     }
     with path.open("wb") as handle:
         pickle.dump(payload, handle)
+
+
+def _fake_policy_model_with_traj_vocab(traj_vocab: torch.Tensor) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model._trajectory_head = types.SimpleNamespace(traj_vocab=torch.nn.Parameter(traj_vocab, requires_grad=False))
+    return model
 
 
 def test_apply_trainable_prefixes_can_freeze_backbone_while_training_other_modules() -> None:
@@ -108,11 +115,32 @@ def test_policy_pdm_score_hook_accepts_numpy_backend_scores(monkeypatch) -> None
     assert tuple(scores.shape) == (1, 2)
 
 
+def test_nuscenes_pdm_backend_accepts_shared_visualization_scorer_kwargs(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+        ea_gate_enabled=False,
+        driving_direction_gate_enabled=False,
+        center_dev_max_m=2.0,
+        heading_dev_max_deg=90.0,
+        off_global_route_threshold_m=3.0,
+        carl={"dp_min": 0.0},
+    )
+
+    assert scorer._delegate.scene_cache_root == tmp_path / "scene_cache"
+
+
 def test_sparsedrivev2_replay_sampling_forwards_observations_as_one_batch(monkeypatch) -> None:
     policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
     policy._device = torch.device("cpu")
     policy._execute_mode = "first_step"
-    policy._model = torch.nn.Linear(1, 1)
+    traj_vocab = torch.arange(8 * 10 * 3 * 3, dtype=torch.float32).reshape(8, 10, 3, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
     forward_batch_sizes = []
 
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
@@ -132,9 +160,7 @@ def test_sparsedrivev2_replay_sampling_forwards_observations_as_one_batch(monkey
         forward_batch_sizes.append(int(features_dev["status_feature"].shape[0]))
         batch_size = int(features_dev["status_feature"].shape[0])
         scores = torch.arange(batch_size * 2, dtype=torch.float32).reshape(batch_size, 2)
-        trajs = torch.zeros((batch_size, 2, 3, 3), dtype=torch.float32)
-        trajs[:, :, 0, 0] = torch.arange(batch_size, dtype=torch.float32).view(batch_size, 1)
-        trajs[:, 1, 0, 1] = 10.0
+        trajs = torch.stack([traj_vocab[4, 2], traj_vocab[7, 5]], dim=0)[None].expand(batch_size, -1, -1, -1).clone()
         return {
             "candidate_scores": scores,
             "candidate_trajectories": trajs,
@@ -152,15 +178,18 @@ def test_sparsedrivev2_replay_sampling_forwards_observations_as_one_batch(monkey
     assert len(actions) == 3
     assert len(logps) == 3
     assert len(replays) == 3
-    assert [int(rep["mode_idx"]) for rep in replays] == [1, 1, 1]
+    assert all("mode_idx" not in rep for rep in replays)
+    assert [int(rep["selected_path_idx"]) for rep in replays] == [7, 7, 7]
+    assert [int(rep["selected_vel_idx"]) for rep in replays] == [5, 5, 5]
+    assert [int(rep["global_mode_idx"]) for rep in replays] == [75, 75, 75]
     assert [tuple(rep["status_feature"].shape) for rep in replays] == [(1, 8), (1, 8), (1, 8)]
 
 
-def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypatch) -> None:
+def test_sparsedrivev2_logp_from_replay_uses_global_mode_identity(monkeypatch) -> None:
     policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
     policy._device = torch.device("cpu")
-    policy._model = torch.nn.Linear(1, 1)
-    forward_calls = 0
+    traj_vocab = torch.arange(4 * 10 * 4 * 3, dtype=torch.float32).reshape(4, 10, 4, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
 
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
@@ -171,24 +200,226 @@ def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypa
                 "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
             },
             "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
-            "mode_idx": idx % 3,
+            "selected_path_idx": idx + 1,
+            "selected_vel_idx": idx + 2,
+            "global_mode_idx": [20, 11][idx],
         }
         for idx in range(2)
     ]
 
-    def fake_forward_policy_on_model(model, features_dev):
-        del model
-        nonlocal forward_calls
-        forward_calls += 1
-        batch_size = int(features_dev["status_feature"].shape[0])
-        scores = torch.tensor(
+    def fake_forward_policy_on_model(model, features_dev, targets=None):
+        del model, targets
+        sample_indices = features_dev["status_feature"][:, 0].to(dtype=torch.long)
+        all_scores = torch.tensor(
             [[0.1, 0.4, 0.2], [0.9, 0.3, 0.7]],
             dtype=torch.float32,
-        )[:batch_size]
-        trajs = torch.arange(batch_size * 3 * 4 * 3, dtype=torch.float32).reshape(batch_size, 3, 4, 3)
+        )
+        all_trajs = torch.stack(
+            [
+                torch.stack([traj_vocab[9 // 10, 9 % 10], traj_vocab[20 // 10, 20 % 10], traj_vocab[31 // 10, 31 % 10]], dim=0),
+                torch.stack([traj_vocab[11 // 10, 11 % 10], traj_vocab[22 // 10, 22 % 10], traj_vocab[33 // 10, 33 % 10]], dim=0),
+            ],
+            dim=0,
+        )
         return {
-            "candidate_scores": scores,
-            "candidate_trajectories": trajs,
+            "candidate_scores": all_scores[sample_indices],
+            "candidate_trajectories": all_trajs[sample_indices],
+        }
+
+    monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
+
+    expected = torch.stack(
+        [
+            torch.log_softmax(torch.tensor([0.1, 0.4, 0.2]), dim=0)[1],
+            torch.log_softmax(torch.tensor([0.9, 0.3, 0.7]), dim=0)[0],
+        ]
+    )
+    assert torch.allclose(policy.logp_from_replay_batch(replays), expected)
+
+
+def test_sparsedrivev2_logp_from_replay_requires_selected_global_mode_in_candidates(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    traj_vocab = torch.arange(3 * 10 * 4 * 3, dtype=torch.float32).reshape(3, 10, 4, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    replays = [
+        {
+            "camera_feature": {
+                "imgs": torch.zeros((1, 2, 3, 4, 5), dtype=torch.float32),
+                "lidar2img": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            },
+            "status_feature": torch.zeros((1, 8), dtype=torch.float32),
+            "selected_path_idx": 2,
+            "selected_vel_idx": 3,
+            "global_mode_idx": 23,
+        }
+    ]
+
+    def fake_forward_policy_on_model(model, features_dev, targets=None):
+        del model, features_dev, targets
+        return {
+            "candidate_scores": torch.tensor([[0.1, 0.6]], dtype=torch.float32),
+            "candidate_trajectories": torch.stack([traj_vocab[1, 0], traj_vocab[1, 1]], dim=0).unsqueeze(0),
+        }
+
+    monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
+
+    with pytest.raises(RuntimeError, match="global_mode_idx was not present"):
+        policy.logp_from_replay_batch(replays)
+
+
+def test_sparsedrivev2_logp_from_replay_forces_selected_global_mode_into_candidates(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    traj_vocab = torch.arange(3 * 10 * 4 * 3, dtype=torch.float32).reshape(3, 10, 4, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
+    seen_forced: list[list[int]] = []
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    replays = [
+        {
+            "camera_feature": {
+                "imgs": torch.zeros((1, 2, 3, 4, 5), dtype=torch.float32),
+                "lidar2img": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            },
+            "status_feature": torch.zeros((1, 8), dtype=torch.float32),
+            "selected_path_idx": 2,
+            "selected_vel_idx": 3,
+            "global_mode_idx": 23,
+        }
+    ]
+
+    def fake_forward_policy_on_model(model, features_dev, targets=None):
+        del model, features_dev
+        if targets is None:
+            return {
+                "candidate_scores": torch.tensor([[0.1, 0.6]], dtype=torch.float32),
+                "candidate_trajectories": torch.stack([traj_vocab[1, 0], traj_vocab[1, 1]], dim=0).unsqueeze(0),
+            }
+        forced = targets["forced_global_indices"].detach().cpu().tolist()
+        seen_forced.append([int(v) for v in forced])
+        return {
+            "candidate_scores": torch.tensor([[0.1, 0.6, 0.2]], dtype=torch.float32),
+            "candidate_trajectories": torch.stack(
+                [traj_vocab[1, 0], traj_vocab[1, 1], traj_vocab[2, 3]],
+                dim=0,
+            ).unsqueeze(0),
+        }
+
+    monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
+
+    expected = torch.log_softmax(torch.tensor([0.1, 0.6, 0.2]), dim=0)[2]
+
+    assert torch.allclose(policy.logp_from_replay_batch(replays), expected.view(1))
+    assert seen_forced == [[23]]
+
+
+def test_sparsedrivev2_logp_from_replay_recomputes_each_sample_independently(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    traj_vocab = torch.arange(4 * 10 * 4 * 3, dtype=torch.float32).reshape(4, 10, 4, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
+    forward_batch_sizes: list[int] = []
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    replays = [
+        {
+            "camera_feature": {
+                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
+                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
+            },
+            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
+            "selected_path_idx": idx + 1,
+            "selected_vel_idx": idx + 2,
+            "global_mode_idx": [20, 11][idx],
+        }
+        for idx in range(2)
+    ]
+
+    def fake_forward_policy_on_model(model, features_dev, targets=None):
+        del model, targets
+        batch_size = int(features_dev["status_feature"].shape[0])
+        forward_batch_sizes.append(batch_size)
+        if batch_size == 2:
+            return {
+                "candidate_scores": torch.tensor([[0.1, 0.4], [0.9, 0.3]], dtype=torch.float32),
+                "candidate_trajectories": torch.stack(
+                    [
+                        torch.stack([traj_vocab[0, 9], traj_vocab[3, 1]], dim=0),
+                        torch.stack([traj_vocab[1, 1], traj_vocab[2, 2]], dim=0),
+                    ],
+                    dim=0,
+                ),
+            }
+
+        sample_idx = int(features_dev["status_feature"][0, 0].item())
+        if sample_idx == 0:
+            scores = torch.tensor([[0.1, 0.4]], dtype=torch.float32)
+            trajs = torch.stack([traj_vocab[0, 9], traj_vocab[2, 0]], dim=0).unsqueeze(0)
+        else:
+            scores = torch.tensor([[0.9, 0.3]], dtype=torch.float32)
+            trajs = torch.stack([traj_vocab[1, 1], traj_vocab[2, 2]], dim=0).unsqueeze(0)
+        return {"candidate_scores": scores, "candidate_trajectories": trajs}
+
+    monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
+
+    expected = torch.stack(
+        [
+            torch.log_softmax(torch.tensor([0.1, 0.4]), dim=0)[1],
+            torch.log_softmax(torch.tensor([0.9, 0.3]), dim=0)[0],
+        ]
+    )
+
+    assert torch.allclose(policy.logp_from_replay_batch(replays), expected)
+    assert forward_batch_sizes == [1, 1]
+
+
+def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    traj_vocab = torch.arange(4 * 10 * 4 * 3, dtype=torch.float32).reshape(4, 10, 4, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
+    forward_batch_sizes: list[int] = []
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    replays = [
+        {
+            "camera_feature": {
+                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
+                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
+            },
+            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
+            "selected_path_idx": idx + 1,
+            "selected_vel_idx": idx + 2,
+            "global_mode_idx": [20, 11][idx],
+        }
+        for idx in range(2)
+    ]
+
+    def fake_forward_policy_on_model(model, features_dev, targets=None):
+        del model, targets
+        forward_batch_sizes.append(int(features_dev["status_feature"].shape[0]))
+        sample_indices = features_dev["status_feature"][:, 0].to(dtype=torch.long)
+        all_scores = torch.tensor(
+            [[0.1, 0.4, 0.2], [0.9, 0.3, 0.7]],
+            dtype=torch.float32,
+        )
+        all_trajs = torch.stack(
+            [
+                torch.stack([traj_vocab[9 // 10, 9 % 10], traj_vocab[20 // 10, 20 % 10], traj_vocab[31 // 10, 31 % 10]], dim=0),
+                torch.stack([traj_vocab[11 // 10, 11 % 10], traj_vocab[22 // 10, 22 % 10], traj_vocab[33 // 10, 33 % 10]], dim=0),
+            ],
+            dim=0,
+        )
+        return {
+            "candidate_scores": all_scores[sample_indices],
+            "candidate_trajectories": all_trajs[sample_indices],
         }
 
     monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
@@ -199,9 +430,9 @@ def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypa
         candidate_select="topk",
     )
 
-    assert forward_calls == 1
+    assert forward_batch_sizes == [1, 1]
 
-    forward_calls = 0
+    forward_batch_sizes.clear()
     expected_logp = policy.logp_from_replay_batch(replays)
     expected_candidates = policy.sample_counterfactual_trajectories_from_replay_batch(
         replays,
@@ -209,11 +440,59 @@ def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypa
         candidate_select="topk",
     )
 
-    assert forward_calls == 2
+    assert forward_batch_sizes == [1, 1, 1, 1]
     assert torch.allclose(fused["new_logp"], expected_logp)
     assert torch.allclose(fused["counterfactual"]["log_probs"], expected_candidates["log_probs"])
     assert torch.equal(fused["counterfactual"]["mode_indices"], expected_candidates["mode_indices"])
     assert torch.allclose(fused["counterfactual"]["traj_xyyaw"], expected_candidates["traj_xyyaw"])
+
+
+def test_sparsedrivev2_counterfactual_candidates_recompute_each_sample_independently(monkeypatch) -> None:
+    policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
+    policy._device = torch.device("cpu")
+    traj_vocab = torch.arange(4 * 10 * 4 * 3, dtype=torch.float32).reshape(4, 10, 4, 3)
+    policy._model = _fake_policy_model_with_traj_vocab(traj_vocab)
+    forward_batch_sizes: list[int] = []
+
+    monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
+
+    replays = [
+        {
+            "camera_feature": {
+                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
+                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
+            },
+            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
+            "selected_path_idx": idx + 1,
+            "selected_vel_idx": idx + 2,
+            "global_mode_idx": [20, 11][idx],
+        }
+        for idx in range(2)
+    ]
+
+    def fake_forward_policy_on_model(model, features_dev, targets=None):
+        del model, targets
+        forward_batch_sizes.append(int(features_dev["status_feature"].shape[0]))
+        sample_idx = int(features_dev["status_feature"][0, 0].item())
+        if sample_idx == 0:
+            scores = torch.tensor([[0.1, 0.4, 0.2]], dtype=torch.float32)
+            trajs = torch.stack([traj_vocab[0, 9], traj_vocab[2, 0], traj_vocab[3, 1]], dim=0).unsqueeze(0)
+        else:
+            scores = torch.tensor([[0.9, 0.3, 0.7]], dtype=torch.float32)
+            trajs = torch.stack([traj_vocab[1, 1], traj_vocab[2, 2], traj_vocab[3, 3]], dim=0).unsqueeze(0)
+        return {"candidate_scores": scores, "candidate_trajectories": trajs}
+
+    monkeypatch.setattr(policy, "_forward_policy_on_model", fake_forward_policy_on_model)
+
+    candidates = policy.sample_counterfactual_trajectories_from_replay_batch(
+        replays,
+        num_candidates=2,
+        candidate_select="topk",
+    )
+
+    assert forward_batch_sizes == [1, 1]
+    assert candidates["log_probs"].shape == (2, 2)
+    assert torch.equal(candidates["mode_indices"], torch.tensor([[1, 2], [0, 2]], dtype=torch.long))
 
 
 def test_nuscenes_pdm_backend_returns_batch_candidate_scores(tmp_path: Path) -> None:
@@ -642,6 +921,249 @@ def test_nuscenes_pdm_backend_builds_sample_occupancy_context_once_per_sample(mo
     assert len(ctx0.occupancy_map) == 2
     hits = ctx0.occupancy_map.intersects(ctx0.object_polygons[0])
     assert "obj-0" in hits
+
+
+def test_nuscenes_pdm_backend_builds_future_tracks_from_scene_cache_tokens(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    scene_dir = tmp_path / "scene_cache" / "007"
+    scene_dir.mkdir(parents=True)
+    env_cache = {
+        "meta": {},
+        "0": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[11.0, 20.5], [11.0, 19.5], [9.0, 19.5], [9.0, 20.5]],
+                }
+            ],
+        },
+        "5": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[12.0, 20.5], [12.0, 19.5], [10.0, 19.5], [10.0, 20.5]],
+                }
+            ],
+        },
+        "10": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[13.0, 20.5], [13.0, 19.5], [11.0, 19.5], [11.0, 20.5]],
+                }
+            ],
+        },
+    }
+    import json
+
+    (scene_dir / "env_cache.json").write_text(json.dumps(env_cache), encoding="utf-8")
+
+    from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
+
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path, scene_cache_root=tmp_path / "scene_cache")
+    snapshot = scorer._lookup_scene_snapshot({"scene_id": 7, "frame_idx": 0})
+    assert isinstance(snapshot, dict)
+
+    objects = scorer._collect_scene_cache_dynamic_objects_with_future(
+        replay={"scene_id": 7, "frame_idx": 0},
+        snapshot=snapshot,
+        patch_radius=20.0,
+        future_horizon=3,
+        future_step_frames=5,
+        future_dt_s=0.5,
+    )
+
+    assert len(objects) == 1
+    assert objects[0]["token"] == "veh-a"
+    assert np.asarray(objects[0]["center_xy"], dtype=np.float32).tolist() == pytest.approx([0.0, 0.0])
+    assert np.allclose(
+        np.asarray(objects[0]["future_xy"], dtype=np.float32),
+        np.asarray([[1.0, 0.0], [2.0, 0.0]], dtype=np.float32),
+    )
+    assert np.asarray(objects[0]["future_mask"], dtype=np.float32).tolist() == pytest.approx([1.0, 1.0])
+    assert objects[0]["future_dt_s"] == pytest.approx(0.5)
+
+
+def test_nuscenes_pdm_backend_builds_future_tracks_from_scene_cache_nearest_when_tokens_change(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    scene_dir = tmp_path / "scene_cache" / "007"
+    scene_dir.mkdir(parents=True)
+    env_cache = {
+        "meta": {},
+        "0": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a-0",
+                    "category": "vehicle.car",
+                    "poly": [[11.0, 20.5], [11.0, 19.5], [9.0, 19.5], [9.0, 20.5]],
+                }
+            ],
+        },
+        "5": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a-1",
+                    "category": "vehicle.car",
+                    "poly": [[12.0, 20.5], [12.0, 19.5], [10.0, 19.5], [10.0, 20.5]],
+                },
+                {
+                    "token": "far-car",
+                    "category": "vehicle.car",
+                    "poly": [[30.0, 20.5], [30.0, 19.5], [28.0, 19.5], [28.0, 20.5]],
+                },
+            ],
+        },
+        "10": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a-2",
+                    "category": "vehicle.car",
+                    "poly": [[13.0, 20.5], [13.0, 19.5], [11.0, 19.5], [11.0, 20.5]],
+                }
+            ],
+        },
+    }
+    import json
+
+    (scene_dir / "env_cache.json").write_text(json.dumps(env_cache), encoding="utf-8")
+
+    from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
+
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path, scene_cache_root=tmp_path / "scene_cache")
+    snapshot = scorer._lookup_scene_snapshot({"scene_id": 7, "frame_idx": 0})
+    assert isinstance(snapshot, dict)
+
+    objects = scorer._collect_scene_cache_dynamic_objects_with_future(
+        replay={"scene_id": 7, "frame_idx": 0},
+        snapshot=snapshot,
+        patch_radius=20.0,
+        future_horizon=3,
+        future_step_frames=5,
+        future_dt_s=0.5,
+    )
+
+    assert len(objects) == 1
+    assert np.allclose(
+        np.asarray(objects[0]["future_xy"], dtype=np.float32),
+        np.asarray([[1.0, 0.0], [2.0, 0.0]], dtype=np.float32),
+    )
+
+
+def test_nuscenes_pdm_backend_static_context_uses_scene_cache_future_tracks(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    scene_dir = tmp_path / "scene_cache" / "007"
+    scene_dir.mkdir(parents=True)
+    env_cache = {
+        "meta": {},
+        "0": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[11.0, 20.5], [11.0, 19.5], [9.0, 19.5], [9.0, 20.5]],
+                }
+            ],
+        },
+        "5": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[12.0, 20.5], [12.0, 19.5], [10.0, 19.5], [10.0, 20.5]],
+                }
+            ],
+        },
+    }
+    import json
+
+    (scene_dir / "env_cache.json").write_text(json.dumps(env_cache), encoding="utf-8")
+
+    from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
+
+    scorer = NuScenesScorerUtils(token2vad_path=token2vad_path, scene_cache_root=tmp_path / "scene_cache")
+    context = scorer._build_static_sample_context(
+        {"sample_token": "tok-a", "scene_id": 7, "frame_idx": 0},
+        patch_radius=20.0,
+    )
+
+    assert [obj["token"] for obj in context["scene_objects"]] == ["veh-a"]
+    assert np.allclose(
+        np.asarray(context["scene_objects"][0]["future_xy"], dtype=np.float32),
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+    )
+    assert np.allclose(
+        np.asarray(context["ttc_agent_states"][0]["future_xy"], dtype=np.float32),
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+    )
+
+
+def test_nuscenes_pdm_backend_ea_gate_falls_back_to_scene_cache_future_tracks(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    scene_dir = tmp_path / "scene_cache" / "007"
+    scene_dir.mkdir(parents=True)
+    env_cache = {
+        "meta": {},
+        "0": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[11.0, 20.5], [11.0, 19.5], [9.0, 19.5], [9.0, 20.5]],
+                }
+            ],
+        },
+        "5": {
+            "ego_pose": {"x": 10.0, "y": 20.0, "yaw": 0.0},
+            "dynamic_objects": [
+                {
+                    "token": "veh-a",
+                    "category": "vehicle.car",
+                    "poly": [[12.0, 20.5], [12.0, 19.5], [10.0, 19.5], [10.0, 20.5]],
+                }
+            ],
+        },
+    }
+    import json
+
+    (scene_dir / "env_cache.json").write_text(json.dumps(env_cache), encoding="utf-8")
+
+    from framework.algorithms.nuscenes_scorer_utils import NuScenesScorerUtils
+
+    scorer = NuScenesScorerUtils(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+        ea_gate_enabled=True,
+    )
+    context = scorer._build_static_sample_context(
+        {"sample_token": "tok-a", "scene_id": 7, "frame_idx": 0},
+        patch_radius=20.0,
+    )
+
+    assert [obj["token"] for obj in context["ea_agent_states"]] == ["veh-a"]
+    assert np.allclose(
+        np.asarray(context["ea_agent_states"][0]["future_xy"], dtype=np.float32),
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+    )
 
 
 def test_nuscenes_pdm_backend_builds_batched_candidate_polygon_arrays(tmp_path: Path) -> None:
@@ -1511,5 +2033,54 @@ def test_nuscenes_pdm_backend_no_collision_aligns_future_agents_to_candidate_ste
         dt_s=0.5,
     )
 
+    assert metrics["no_collision"].shape == (1,)
+    assert metrics["no_collision"][0] == pytest.approx(0.0)
+
+
+def test_nuscenes_pdm_backend_replay_dynamic_objects_use_future_xy_for_collision(tmp_path: Path) -> None:
+    token2vad_path = tmp_path / "token2vad.pkl"
+    _write_token2vad(token2vad_path)
+
+    from framework.algorithms.nuscenes_pdm_scorer import NuScenesPDMScorer
+
+    scorer = NuScenesPDMScorer(
+        token2vad_path=token2vad_path,
+        scene_cache_root=tmp_path / "scene_cache",
+    )
+    traj_xyyaw = torch.tensor(
+        [
+            [
+                [[6.0, 0.0, 0.0], [8.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    replay = {
+        "sample_token": "tok-a",
+        "scene_objects_override": [
+            {
+                "token": "dyn-a",
+                "category": "vehicle.car",
+                "center_xy": [20.0, 0.0],
+                "yaw_rad": 0.0,
+                "velocity_xy": [0.0, 0.0],
+                "length_m": 4.0,
+                "width_m": 1.0,
+                "future_xy": [[6.0, 0.0], [20.0, 0.0], [20.0, 0.0]],
+                "future_yaw": [0.0, 0.0, 0.0],
+                "future_dt_s": 0.5,
+            }
+        ],
+    }
+
+    geometry = scorer._build_candidate_geometry_batch(traj_xyyaw)
+    sample_context = scorer._build_sample_context(replay, patch_radius=20.0)
+    metrics = scorer._batch_collision_ttc_metrics(
+        sample_context=sample_context,
+        candidate_geometry={key: value[0] for key, value in geometry.items()},
+        dt_s=0.5,
+    )
+
+    assert "future_xy" in sample_context.ttc_agent_states[0]
     assert metrics["no_collision"].shape == (1,)
     assert metrics["no_collision"][0] == pytest.approx(0.0)

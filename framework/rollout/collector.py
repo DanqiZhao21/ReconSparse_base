@@ -1,13 +1,71 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 
 from framework.rollout.timing import build_rollout_timing, extract_env_timing
 from framework.utils.obs import obs_to_tensor
+
+
+def _check_replay_logp_consistency(
+    *,
+    agent: Any,
+    logps: Sequence[torch.Tensor],
+    replays: Sequence[Dict[str, Any]],
+    eta: float,
+    tolerance: float,
+    context: str,
+    fail_on_error: bool = False,
+    log_fn: Callable[[str], None] | None = None,
+) -> Dict[str, float]:
+    if len(logps) == 0:
+        return {
+            "count": 0.0,
+            "max_abs_error": 0.0,
+            "mean_abs_error": 0.0,
+            "mismatch_count": 0.0,
+            "pass": 1.0,
+        }
+    if len(logps) != len(replays):
+        raise ValueError(f"replay logp self-check length mismatch: logps={len(logps)} replays={len(replays)}")
+    recompute_fn = getattr(agent, "logp_from_replay_batch", None)
+    if not callable(recompute_fn):
+        raise RuntimeError("replay logp self-check requires agent.logp_from_replay_batch")
+
+    stored = torch.stack([logp.detach().to(device="cpu", dtype=torch.float32).view(()) for logp in logps], dim=0)
+    with torch.inference_mode():
+        recomputed = recompute_fn(list(replays), eta=float(eta))
+    recomputed_t = recomputed.detach().to(device="cpu", dtype=torch.float32).view(-1)
+    if int(recomputed_t.numel()) != int(stored.numel()):
+        raise ValueError(
+            "replay logp self-check recomputed shape mismatch: "
+            f"stored={tuple(stored.shape)} recomputed={tuple(recomputed_t.shape)}"
+        )
+
+    abs_error = (recomputed_t - stored).abs()
+    mismatch = abs_error > float(tolerance)
+    summary = {
+        "count": float(stored.numel()),
+        "max_abs_error": float(abs_error.max().item()) if int(abs_error.numel()) else 0.0,
+        "mean_abs_error": float(abs_error.mean().item()) if int(abs_error.numel()) else 0.0,
+        "mismatch_count": float(mismatch.sum().item()) if int(mismatch.numel()) else 0.0,
+        "pass": 1.0 if not bool(mismatch.any().item()) else 0.0,
+    }
+    status = "PASS" if summary["pass"] else "FAIL"
+    message = (
+        f"[actor-replay-logp-check] {status} context={context} count={int(summary['count'])} "
+        f"max_abs_error={summary['max_abs_error']:.6g} "
+        f"mean_abs_error={summary['mean_abs_error']:.6g} "
+        f"mismatch_count={int(summary['mismatch_count'])} tolerance={float(tolerance):.6g}"
+    )
+    if callable(log_fn):
+        log_fn(message)
+    if bool(fail_on_error) and not bool(summary["pass"]):
+        raise RuntimeError(message.replace("[actor-replay-logp-check] FAIL", "replay logp self-check failed"))
+    return summary
 
 
 def _reward_summary_defaults() -> Dict[str, float]:
@@ -203,6 +261,10 @@ def collect_single_env_shard(
     return_info: bool = False,
     heartbeat_fn: Any | None = None,
     end_shard_on_done: bool = False,
+    debug_replay_logp_check: bool = False,
+    debug_replay_logp_tolerance: float = 1.0e-5,
+    debug_replay_logp_fail_on_error: bool = False,
+    debug_replay_logp_log_fn: Callable[[str], None] | None = None,
 ) -> tuple[Dict[str, Any], Any]:
     obs_buf: List[torch.Tensor] = []
     old_logp_buf: List[torch.Tensor] = []
@@ -237,6 +299,17 @@ def collect_single_env_shard(
         _emit_heartbeat(heartbeat_fn, "act_start", step_count, force=True)
         action0, logp, replay = agent.act(obs_decision, eta=eta, mode_idx=mode_idx, mode_select=mode_select)
         _emit_heartbeat(heartbeat_fn, "act_done", step_count, force=True)
+        if bool(debug_replay_logp_check):
+            _check_replay_logp_consistency(
+                agent=agent,
+                logps=[logp],
+                replays=[replay],
+                eta=float(eta),
+                tolerance=float(debug_replay_logp_tolerance),
+                context=f"actor{actor_id}/env0/step{step_count}",
+                fail_on_error=bool(debug_replay_logp_fail_on_error),
+                log_fn=debug_replay_logp_log_fn,
+            )
         step_timing["act_s"] = float(time.perf_counter() - t0)
         _inject_gt_reference_from_info(replay, current_info)
         _inject_front_obstacle_context_from_info(replay, current_info)
@@ -346,6 +419,10 @@ def collect_vector_env_shards(
     info_list: List[Any] | None = None,
     return_info: bool = False,
     heartbeat_fn: Any | None = None,
+    debug_replay_logp_check: bool = False,
+    debug_replay_logp_tolerance: float = 1.0e-5,
+    debug_replay_logp_fail_on_error: bool = False,
+    debug_replay_logp_log_fn: Callable[[str], None] | None = None,
 ) -> tuple[List[Dict[str, Any]], List[Any]]:
     obs_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
     old_logp_bufs: List[List[torch.Tensor]] = [[] for _ in range(int(num_envs_per_actor))]
@@ -385,6 +462,17 @@ def collect_vector_env_shards(
             mode_idx=mode_idx,
             mode_select=mode_select,
         )
+        if bool(debug_replay_logp_check):
+            _check_replay_logp_consistency(
+                agent=agent,
+                logps=logps,
+                replays=replays,
+                eta=float(eta),
+                tolerance=float(debug_replay_logp_tolerance),
+                context=f"actor{actor_id}/vector/step{step_count}",
+                fail_on_error=bool(debug_replay_logp_fail_on_error),
+                log_fn=debug_replay_logp_log_fn,
+            )
         act_s = float(time.perf_counter() - act_t0) / float(max(1, int(num_envs_per_actor)))
         for i, replay in enumerate(replays):
             _inject_gt_reference_from_info(replay, current_info_list[i] if i < len(current_info_list) else None)

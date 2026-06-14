@@ -783,6 +783,160 @@ class NuScenesScorerUtils:
             "yaw_rad": yaw_local,
         }
 
+    @classmethod
+    def _scene_cache_object_to_snapshot_local(cls, obj: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        corners_raw = obj.get("corners_xy", obj.get("poly", None))
+        try:
+            corners_world = np.asarray(corners_raw, dtype=np.float32)
+        except Exception:
+            return None
+        if corners_world.ndim != 2 or corners_world.shape[0] < 3 or corners_world.shape[1] < 2:
+            return None
+        corners_local = cls._global_xy_to_snapshot_local(corners_world[:, :2], snapshot)
+        if corners_local.shape[0] < 3:
+            return None
+        center_local = np.mean(corners_local[:, :2], axis=0).astype(np.float32)
+        yaw, length, width = cls._poly_heading_length_width(corners_local[:, :2])
+        velocity = np.asarray(obj.get("velocity_xy", obj.get("velocity", [0.0, 0.0])), dtype=np.float32).reshape(-1)
+        if velocity.size < 2:
+            velocity = np.zeros((2,), dtype=np.float32)
+        velocity_local = cls._rotate_world_vec_to_snapshot_local(velocity[:2], snapshot)
+        return {
+            "category": str(obj.get("category", "vehicle.car")),
+            "center_xy": center_local,
+            "velocity_xy": velocity_local.astype(np.float32),
+            "length_m": float(abs(obj.get("length_m", length))),
+            "width_m": float(abs(obj.get("width_m", width))),
+            "yaw_rad": float(obj.get("yaw_rad", yaw)),
+            "speed_mps": float(obj.get("speed_mps", np.linalg.norm(velocity_local))),
+            "corners_xy": corners_local[:, :2].astype(np.float32),
+            "token": str(obj.get("token", obj.get("id", ""))),
+            "source": str(obj.get("source", "scene_cache")),
+        }
+
+    @classmethod
+    def _scene_cache_object_center_yaw_world(cls, obj: dict[str, Any]) -> tuple[np.ndarray, float] | None:
+        corners_raw = obj.get("corners_xy", obj.get("poly", None))
+        try:
+            corners = np.asarray(corners_raw, dtype=np.float32)
+        except Exception:
+            return None
+        if corners.ndim != 2 or corners.shape[0] < 3 or corners.shape[1] < 2:
+            return None
+        center = np.mean(corners[:, :2], axis=0).astype(np.float32)
+        yaw, _, _ = cls._poly_heading_length_width(corners[:, :2])
+        return center, float(obj.get("yaw_rad", yaw))
+
+    @classmethod
+    def _match_scene_cache_future_object(
+        cls,
+        *,
+        future_objects: Sequence[Any],
+        token: str,
+        category: str,
+        previous_center_world: np.ndarray,
+        max_match_distance_m: float,
+    ) -> dict[str, Any] | None:
+        candidates = [dict(item) for item in future_objects or [] if isinstance(item, dict)]
+        for future_obj in candidates:
+            if str(future_obj.get("token", future_obj.get("id", ""))) == token:
+                return future_obj
+
+        category_norm = str(category).split(".")[0].strip().lower()
+        best: dict[str, Any] | None = None
+        best_dist = float("inf")
+        prev = np.asarray(previous_center_world, dtype=np.float32).reshape(-1)[:2]
+        for future_obj in candidates:
+            future_category_norm = str(future_obj.get("category", "")).split(".")[0].strip().lower()
+            if category_norm and future_category_norm and future_category_norm != category_norm:
+                continue
+            sampled = cls._scene_cache_object_center_yaw_world(future_obj)
+            if sampled is None:
+                continue
+            center_world, _ = sampled
+            dist = float(np.linalg.norm(np.asarray(center_world, dtype=np.float32).reshape(-1)[:2] - prev))
+            if dist < best_dist:
+                best = future_obj
+                best_dist = dist
+        return best if best is not None and best_dist <= float(max_match_distance_m) else None
+
+    def _collect_scene_cache_dynamic_objects_with_future(
+        self,
+        *,
+        replay: dict[str, Any],
+        snapshot: dict[str, Any],
+        patch_radius: float,
+        future_horizon: int = 8,
+        future_step_frames: int | None = None,
+        future_dt_s: float = 0.5,
+    ) -> list[dict[str, Any]]:
+        current_objects = [dict(item) for item in snapshot.get("dynamic_objects", []) or [] if isinstance(item, dict)]
+        if not current_objects:
+            return []
+        scene_id = replay.get("scene_id", None)
+        frame_idx = replay.get("frame_idx", None)
+        if scene_id is None or frame_idx is None:
+            return []
+        try:
+            scene_cache = self._load_scene_env_cache(int(scene_id))
+            current_frame_idx = int(frame_idx)
+        except Exception:
+            return []
+
+        sorted_frames = sorted(int(key) for key in scene_cache.keys())
+        if future_step_frames is None:
+            deltas = [frame - current_frame_idx for frame in sorted_frames if frame > current_frame_idx]
+            future_step_frames = int(deltas[0]) if deltas else 1
+        step_frames = max(1, int(future_step_frames))
+        current_snapshot = snapshot
+        out: list[dict[str, Any]] = []
+        for idx, raw_obj in enumerate(current_objects):
+            token = str(raw_obj.get("token", raw_obj.get("id", f"scene_cache_obj_{idx}")))
+            local_obj = self._scene_cache_object_to_snapshot_local(raw_obj, current_snapshot)
+            if local_obj is None:
+                continue
+            center = np.asarray(local_obj.get("center_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)
+            if center.size < 2 or float(np.linalg.norm(center[:2])) > float(patch_radius) * 1.8:
+                continue
+            future_xy: list[np.ndarray] = []
+            future_yaw: list[float] = []
+            future_mask: list[float] = []
+            current_world = self._scene_cache_object_center_yaw_world(raw_obj)
+            previous_center_world = current_world[0] if current_world is not None else None
+            max_match_distance_m = max(3.0, step_frames * 0.8)
+            for step_idx in range(1, max(1, int(future_horizon))):
+                future_frame_idx = current_frame_idx + step_idx * step_frames
+                future_snapshot = scene_cache.get(future_frame_idx, None)
+                if not isinstance(future_snapshot, dict):
+                    break
+                if previous_center_world is None:
+                    break
+                future_match = self._match_scene_cache_future_object(
+                    future_objects=future_snapshot.get("dynamic_objects", []) or [],
+                    token=token,
+                    category=str(raw_obj.get("category", local_obj.get("category", ""))),
+                    previous_center_world=previous_center_world,
+                    max_match_distance_m=max_match_distance_m,
+                )
+                if future_match is None:
+                    break
+                sampled = self._scene_cache_object_center_yaw_world(dict(future_match))
+                if sampled is None:
+                    break
+                center_world, yaw_world = sampled
+                previous_center_world = center_world
+                future_xy.append(self._global_xy_to_snapshot_local(center_world.reshape(1, 2), current_snapshot).reshape(2))
+                ego_yaw = float(dict(current_snapshot.get("ego_pose", {})).get("yaw", 0.0))
+                future_yaw.append(float(np.arctan2(np.sin(yaw_world - ego_yaw), np.cos(yaw_world - ego_yaw))))
+                future_mask.append(1.0)
+            if future_xy:
+                local_obj["future_xy"] = np.stack(future_xy, axis=0).astype(np.float32)
+                local_obj["future_yaw"] = np.asarray(future_yaw, dtype=np.float32)
+                local_obj["future_mask"] = np.asarray(future_mask, dtype=np.float32)
+                local_obj["future_dt_s"] = float(future_dt_s)
+            out.append(local_obj)
+        return out
+
     def _collect_ea_agent_states(
         self,
         replay: dict[str, Any],
@@ -866,7 +1020,7 @@ class NuScenesScorerUtils:
         return self.sample_context_cache_root / self._sample_context_cache_filename(sample_token, cache_variant=cache_variant)
 
     def _sample_context_cache_variant(self) -> str:
-        return f"box-lw-v2-ea-{int(bool(self.ea_gate_enabled))}"
+        return f"box-lw-v3-scene-future-ea-{int(bool(self.ea_gate_enabled))}"
 
     def _load_persisted_static_sample_context(self, sample_token: str) -> dict[str, Any] | None:
         path = self._sample_context_cache_path(sample_token, cache_variant=self._sample_context_cache_variant())
@@ -1098,6 +1252,38 @@ class NuScenesScorerUtils:
                 "token": str(raw.get("token", raw.get("id", f"override_obj_{idx}"))),
                 "source": str(raw.get("source", "replay_override")),
             }
+            for future_key in (
+                "future_xy",
+                "future_centers_xy",
+                "future_trajectory_xy",
+                "future_traj_xy",
+            ):
+                if future_key not in raw:
+                    continue
+                future_xy = cls._sanitize_local_traj_xy(
+                    cls._normalize_agent_future_traj(raw.get(future_key)),
+                    valid_mask_any=raw.get(
+                        "future_mask",
+                        raw.get("future_masks", raw.get("future_valid", raw.get("future_valid_mask", None))),
+                    ),
+                    min_trailing_zero_pad=2,
+                )
+                if int(future_xy.shape[0]) > 0:
+                    obj["future_xy"] = future_xy.astype(np.float32, copy=False)
+                break
+            for yaw_key in ("future_yaw", "future_yaw_rad", "future_headings_rad", "future_heading_rad"):
+                if yaw_key not in raw:
+                    continue
+                future_yaw = np.asarray(raw.get(yaw_key), dtype=np.float32).reshape(-1)
+                if int(future_yaw.shape[0]) > 0:
+                    obj["future_yaw"] = future_yaw.astype(np.float32, copy=False)
+                break
+            if "future_dt_s" in raw:
+                obj["future_dt_s"] = float(raw.get("future_dt_s", 0.5))
+            elif "future_dt" in raw:
+                obj["future_dt_s"] = float(raw.get("future_dt", 0.5))
+            elif "dt_s" in raw:
+                obj["future_dt_s"] = float(raw.get("dt_s", 0.5))
             out.append(obj)
         return out
 
@@ -1185,12 +1371,27 @@ class NuScenesScorerUtils:
             else self._lookup_map_layers(row, patch_radius=float(patch_radius))
         )
         patch_radius_resolved = float(map_context.get("patch_radius", patch_radius))
-        scene_objects = self._collect_scene_objects(row, patch_radius=patch_radius_resolved)
+        scene_snapshot = self._lookup_scene_snapshot(replay)
+        scene_objects = (
+            self._collect_scene_cache_dynamic_objects_with_future(
+                replay=replay,
+                snapshot=scene_snapshot,
+                patch_radius=patch_radius_resolved,
+                future_horizon=8,
+                future_dt_s=float(replay.get("future_dt_s", replay.get("dt_s", 0.5))),
+            )
+            if isinstance(scene_snapshot, dict)
+            else []
+        )
+        if not scene_objects:
+            scene_objects = self._collect_scene_objects(row, patch_radius=patch_radius_resolved)
         ea_agent_states = self._collect_ea_agent_states(
             replay,
             patch_radius=patch_radius_resolved,
             row=row,
         )
+        if self.ea_gate_enabled and not ea_agent_states:
+            ea_agent_states = [dict(item) for item in scene_objects]
 
         payload = {
             "row": row,
@@ -1202,6 +1403,7 @@ class NuScenesScorerUtils:
             "map_context": map_context,
             "scene_objects": scene_objects,
             "ea_agent_states": ea_agent_states,
+            "ttc_agent_states": [dict(item) for item in scene_objects],
         }
         self._sample_static_context_cache[cache_key] = payload
         if gt_sample_token_str == sample_token_str:

@@ -228,9 +228,8 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_SAC_RewardCollisionTerminalOnlyExtreme_Substeps1_lr3e-7_entropy0p03
-    log_minibatch_metrics: true
   algo: sac
   eta: 1.0
   mode_idx: -1

@@ -319,7 +319,7 @@ def test_replay_feature_ppo_batch_accepts_shard_without_obs(tmp_path: Path) -> N
     assert loaded.batch["obs_batch"].shape == (0, 18, 64, 64)
 
 
-def test_reinforcepp_batch_keeps_raw_returns_as_advantage(tmp_path: Path) -> None:
+def test_reinforcepp_batch_normalizes_returns_as_advantage(tmp_path: Path) -> None:
     shard_path = tmp_path / "shard.pt"
     _write_shard(
         shard_path,
@@ -344,10 +344,57 @@ def test_reinforcepp_batch_keeps_raw_returns_as_advantage(tmp_path: Path) -> Non
     )
 
     assert torch.allclose(loaded.batch["ret"], torch.tensor([1.0, 0.0]))
-    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, -1.0]))
 
 
-def test_ppo_batch_keeps_raw_gae_as_advantage(tmp_path: Path) -> None:
+def test_reinforcepp_batch_summarizes_shard_outcomes(tmp_path: Path) -> None:
+    shard_specs = [
+        ("full_horizon", 2, 2, {}),
+        ("failure", 1, 2, {"terminal_failure_count": 1.0}),
+        ("env_done", 1, 2, {"terminal_env_done_count": 1.0}),
+        ("partial", 1, 2, {}),
+    ]
+    selected = []
+    for idx, (_name, num_steps, horizon, reward_summary) in enumerate(shard_specs):
+        shard_path = tmp_path / f"shard_{idx}.pt"
+        _write_shard(
+            shard_path,
+            {
+                "old_logp": torch.zeros(num_steps),
+                "reward": torch.ones(num_steps),
+                "done": torch.zeros(num_steps),
+                "replay": [{"step": step} for step in range(num_steps)],
+                "meta": {
+                    "num_steps": num_steps,
+                    "horizon": horizon,
+                    "reward_summary": {"step_count": float(num_steps), **reward_summary},
+                },
+            },
+        )
+        selected.append(str(shard_path))
+
+    loaded = build_training_batch(
+        selected=selected,
+        agent=object(),
+        algo_key="reinforcepp",
+        device=torch.device("cpu"),
+        gamma=0.5,
+        gae_lambda=0.95,
+        value_net=None,
+        ddp_enabled=False,
+        dist_module=None,
+    )
+
+    assert loaded.shard_outcomes == {
+        "full_horizon_count": 1.0,
+        "env_done_count": 1.0,
+        "timeout_count": 0.0,
+        "forced_failure_count": 1.0,
+        "partial_nonterminal_count": 1.0,
+    }
+
+
+def test_ppo_batch_normalizes_gae_as_advantage(tmp_path: Path) -> None:
     shard_path = tmp_path / "shard.pt"
     _write_shard(
         shard_path,
@@ -376,7 +423,7 @@ def test_ppo_batch_keeps_raw_gae_as_advantage(tmp_path: Path) -> None:
     )
 
     assert torch.allclose(loaded.batch["ret"], torch.tensor([1.0, 0.0]))
-    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, -1.0]))
 
 
 def test_ppo_fallback_batch_requires_obs(tmp_path: Path) -> None:

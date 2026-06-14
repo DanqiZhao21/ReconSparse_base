@@ -93,7 +93,7 @@ def test_actor_learner_config_defaults_partial_async_updates_when_timeout_is_con
     assert cfg.allow_partial_updates_after_timeout is True
 
 
-def test_actor_learner_config_reads_wandb_logging_cleanup_flags() -> None:
+def test_actor_learner_config_ignores_removed_wandb_logging_flags() -> None:
     class _Algo:
         eta = 1.0
         clip_eps = 0.2
@@ -116,5 +116,30 @@ def test_actor_learner_config_reads_wandb_logging_cleanup_flags() -> None:
         algo_meta={"algo_key": "ppo", "eta": 1.0, "clip_eps": 0.2},
     )
 
-    assert cfg.wandb_log_minibatch_metrics is True
-    assert cfg.wandb_log_legacy_raw_metrics is True
+    assert not hasattr(cfg, "wandb_log_minibatch_metrics")
+    assert not hasattr(cfg, "wandb_log_legacy_raw_metrics")
+
+
+def test_actor_learner_config_reads_debug_retention_options() -> None:
+    class _Algo:
+        eta = 1.0
+        clip_eps = 0.2
+        minibatch_size = 4
+
+    cfg = actor_learner_lightning_config_from_algorithm(
+        _Algo(),
+        train_cfg={"gamma": 0.99},
+        actor_learner_cfg={
+            "mode": "async",
+            "num_actors": 1,
+            "shards_per_update": 1,
+            "debug_retain_versions": 5,
+            "debug_retain_ckpts": True,
+            "debug_retain_shards": True,
+        },
+        algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2},
+    )
+
+    assert cfg.debug_retain_versions == 5
+    assert cfg.debug_retain_ckpts is True
+    assert cfg.debug_retain_shards is True

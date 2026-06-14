@@ -71,8 +71,9 @@ class ActorLearnerLightningConfig:
     accumulate_grad_batches: int = 1
     gradient_clip_val: float = 0.0
     max_updates: int = 0
-    wandb_log_minibatch_metrics: bool = False
-    wandb_log_legacy_raw_metrics: bool = False
+    debug_retain_versions: int = 0
+    debug_retain_ckpts: bool = False
+    debug_retain_shards: bool = False
 
 
 def optimizer_config_from_algorithm(algo: Any, train_cfg: Dict[str, Any]) -> LearnerOptimizerConfig:
@@ -154,9 +155,6 @@ def actor_learner_lightning_config_from_algorithm(
         sac_cfg = {}
     raw_max_shard_version_lag = actor_learner_cfg.get("max_shard_version_lag", 2)
     raw_max_updates = actor_learner_cfg.get("max_updates", train_cfg.get("updates", 50))
-    wandb_cfg = train_cfg.get("wandb", {}) or {}
-    if not isinstance(wandb_cfg, dict):
-        wandb_cfg = {}
     shard_collect_timeout_s = float(actor_learner_cfg.get("shard_collect_timeout_s", 0.0) or 0.0)
     raw_actor_heartbeat_timeout_s = actor_learner_cfg.get("actor_heartbeat_timeout_s", None)
     actor_heartbeat_timeout_s = (
@@ -170,6 +168,9 @@ def actor_learner_lightning_config_from_algorithm(
             "allow_partial_updates_after_timeout",
             bool(mode.startswith("async") and float(shard_collect_timeout_s) > 0.0),
         )
+    )
+    debug_retain_versions = int(
+        actor_learner_cfg.get("debug_retain_versions", actor_learner_cfg.get("debug_retain_updates", 0)) or 0
     )
     inner_epochs = int(
         getattr(
@@ -245,8 +246,13 @@ def actor_learner_lightning_config_from_algorithm(
         ),
         gradient_clip_val=float(getattr(algo, "max_grad_norm", train_cfg.get("max_grad_norm", 0.0))),
         max_updates=int(raw_max_updates or 0),
-        wandb_log_minibatch_metrics=bool(wandb_cfg.get("log_minibatch_metrics", False)),
-        wandb_log_legacy_raw_metrics=bool(wandb_cfg.get("log_legacy_raw_metrics", False)),
+        debug_retain_versions=max(0, int(debug_retain_versions)),
+        debug_retain_ckpts=bool(
+            actor_learner_cfg.get("debug_retain_ckpts", bool(int(debug_retain_versions) > 0))
+        ),
+        debug_retain_shards=bool(
+            actor_learner_cfg.get("debug_retain_shards", bool(int(debug_retain_versions) > 0))
+        ),
     )
 
 

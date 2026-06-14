@@ -679,16 +679,4 @@ class RLReconEnv:
             step_idx=int(self._step_idx),
             done=bool(done),
         )
-        log_data = dict(reward_result.info)
-        try:
-            logging_cfg = {}
-            if isinstance(self.reward_cfg, dict):
-                logging_cfg = self.reward_cfg.get("logging", {}) or {}
-            wandb_cfg = logging_cfg.get("wandb", {}) or {}
-            if bool(wandb_cfg.get("enable", False)):
-                import wandb
-                prefix = str(wandb_cfg.get("prefix", "rl"))
-                wandb.log({f"{prefix}/" + k: v for k, v in log_data.items()})
-        except Exception:
-            pass
         return float(reward_result.reward), reward_result.info

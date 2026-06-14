@@ -228,7 +228,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_RewardCollisionOnlyExtreme_NoGRPOCraft_Substeps1
   algo: reinforcepp
   eta: 1.0

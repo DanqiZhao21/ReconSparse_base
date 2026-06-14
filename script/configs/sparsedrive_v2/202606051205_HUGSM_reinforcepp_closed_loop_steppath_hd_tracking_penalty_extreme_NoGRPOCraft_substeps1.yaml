@@ -228,7 +228,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_RewardTrackingPenaltyExtreme_NoGRPOCraft_Substeps1
   algo: reinforcepp
   eta: 1.0
@@ -236,7 +236,7 @@ train:
   policy_mode_select: sample
   policy_execute_mode: first_step
   max_grad_norm: 0.5
-  policy_lr: 3.0e-06
+  policy_lr: 5.0e-06
   clip_eps: 0.2
   actor_learner:
     mode: async
@@ -253,7 +253,7 @@ train:
     - 5
     - 6
     - 7
-    actors_per_gpu: 4
+    actors_per_gpu: 12
     auto_max_inflight_per_actor: false
     max_inflight_per_actor: 3
     pause_actor_on_learner_gpu: true
@@ -272,11 +272,11 @@ train:
     allow_partial_updates_after_timeout: true
     restart_failed_actors: true
     max_actor_restarts: 2
-    max_updates: 32
-  minibatch_size: 4
+    max_updates: 64
+  minibatch_size: 32
   gamma: 0.99
   ddp:
-    grad_accum_steps: 8
+    grad_accum_steps: 1
   grpo:
     enable: false
     config_path: null

@@ -86,7 +86,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: CloseNo_OpenGRPOCraft_MetricsPara
   algo: grpo_only
   eta: 1.0

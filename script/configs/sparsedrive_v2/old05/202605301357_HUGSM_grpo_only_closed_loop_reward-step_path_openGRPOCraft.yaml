@@ -259,7 +259,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: HUGSIM_StepPath_GRPOOnly_OpenGRPOCraft
   algo: grpo_only
   eta: 1.0

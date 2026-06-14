@@ -10,11 +10,6 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-try:
-    import wandb  # type: ignore
-except Exception:
-    wandb = None  # type: ignore
-
 from framework.rewardmodel.config import ObservationRewardModelConfig, RewardLossConfig
 from framework.rewardmodel.data.cached_dataset import CachedRewardModelDataset, reward_model_collate
 from framework.rewardmodel.models.reward_model import ObservationTrajectoryRewardModel
@@ -42,41 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-width", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--wandb-enable", action="store_true")
-    parser.add_argument("--wandb-project", default="ReconDreamer-RL-rewardmodel")
-    parser.add_argument("--wandb-entity", default=None)
-    parser.add_argument("--wandb-group", default="baseline")
-    parser.add_argument("--wandb-name", default=None)
-    parser.add_argument("--wandb-mode", default=None, choices=("online", "offline", "disabled"))
     return parser.parse_args()
-
-
-def _init_wandb(args: argparse.Namespace, cfg: ObservationRewardModelConfig, dataset_size: int) -> bool:
-    if not bool(args.wandb_enable):
-        return False
-    if wandb is None:
-        print("[rewardmodel][wandb] wandb is not available; continuing without logging")
-        return False
-    init_kwargs = {
-        "project": str(args.wandb_project),
-        "group": str(args.wandb_group),
-        "name": args.wandb_name,
-        "entity": args.wandb_entity,
-        "config": {
-            **vars(args),
-            "dataset_size": int(dataset_size),
-            "model_config": cfg.to_dict(),
-        },
-    }
-    if args.wandb_mode:
-        init_kwargs["mode"] = str(args.wandb_mode)
-    init_kwargs = {key: value for key, value in init_kwargs.items() if value is not None}
-    try:
-        wandb.init(**init_kwargs)
-        return True
-    except Exception as exc:
-        print(f"[rewardmodel][wandb] init failed: {exc}; continuing without logging")
-        return False
 
 
 def _distributed_context() -> tuple[bool, int, int, int]:
@@ -136,7 +97,6 @@ def train(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
     )
     loss_cfg = RewardLossConfig()
-    wandb_enabled = _init_wandb(args, cfg, len(dataset)) if rank == 0 else False
 
     model.train()
     global_step = 0
@@ -164,23 +124,10 @@ def train(args: argparse.Namespace) -> None:
             total_loss += loss_value
             count += 1
             global_step += 1
-            if wandb_enabled:
-                wandb.log(
-                    {
-                        "train/loss": loss_value,
-                        "train/epoch": int(epoch + 1),
-                        "train/global_step": int(global_step),
-                        "train/batch_size": int(batch["observations"].shape[0]),
-                        "train/world_size": int(world_size),
-                    },
-                    step=global_step,
-                )
         local_mean_loss = total_loss / float(max(1, count))
         mean_loss = _reduce_mean(local_mean_loss, device=device, distributed=distributed)
         if rank == 0:
             print(f"[rewardmodel] epoch={epoch + 1}/{int(args.epochs)} loss={mean_loss:.6f}")
-        if wandb_enabled:
-            wandb.log({"train/epoch_loss": mean_loss, "train/epoch": int(epoch + 1)}, step=global_step)
 
     if rank == 0:
         output = Path(args.output)
@@ -188,9 +135,6 @@ def train(args: argparse.Namespace) -> None:
         state_dict = model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict()
         torch.save({"model_config": cfg.to_dict(), "state_dict": state_dict}, output)
         print(f"[rewardmodel] saved checkpoint: {output}")
-        if wandb_enabled:
-            wandb.log({"artifact/checkpoint_saved": 1, "train/final_loss": mean_loss}, step=global_step)
-            wandb.finish()
     if distributed:
         dist.destroy_process_group()
 

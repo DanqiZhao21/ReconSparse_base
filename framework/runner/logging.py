@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 import torch
@@ -152,6 +153,9 @@ def wandb_init_if_enabled(
         init_kwargs["mode"] = str(mode)
     if run_id is not None:
         init_kwargs["id"] = str(run_id)
+    else:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        init_kwargs["id"] = f"{role}_{stamp}_{uuid.uuid4().hex[:8]}"
     if resume is not None:
         init_kwargs["resume"] = str(resume)
     if wb_dir is not None:
@@ -161,6 +165,10 @@ def wandb_init_if_enabled(
 
     try:
         wandb.init(**init_kwargs)
+        run = getattr(wandb, "run", None)
+        run_url = getattr(run, "url", None)
+        if run_url is not None and str(run_url).strip() != "":
+            stage(f"[wandb] run url={run_url}")
         wandb.define_metric("progress/update")
         for key in [
             "progress/weights_version",
@@ -177,51 +185,6 @@ def wandb_init_if_enabled(
             "batch",
         ]:
             wandb.define_metric(f"{namespace}/*", step_metric="progress/update")
-        wandb.define_metric("debug/train_seen_samples")
-        wandb.define_metric("debug/minibatch/*", step_metric="debug/train_seen_samples")
-
-        if bool(wb_cfg.get("log_legacy_raw_metrics", False)):
-            wandb.define_metric("update")
-            wandb.define_metric("global_step")
-            wandb.define_metric("global_sample_step")
-            wandb.define_metric("global_train_seen_sample_step")
-            wandb.define_metric("train_update/*", step_metric="update")
-            wandb.define_metric("train_seen_samples/*", step_metric="global_train_seen_sample_step")
-            for key in [
-                "loss_pi",
-                "loss_v",
-                "approx_kl",
-                "approx_kl_max",
-                "ratio_mean",
-                "adv_mean",
-                "clip_frac",
-                "value_clip_frac",
-                "explained_variance",
-                "collect_time_s",
-                "train_time_s",
-                "update_time_s",
-                "reward_mean",
-                "positive_reward_mean",
-                "gated_positive_reward_mean",
-                "cost_reward_mean",
-                "safety_gate_rate",
-                "collision_gate_rate",
-                "severe_tracking_lateral_gate_rate",
-                "severe_tracking_yaw_gate_rate",
-                "terminal_failure_rate",
-                "terminal_timeout_rate",
-                "terminal_env_done_rate",
-                "reward_sum",
-                "done_rate",
-                "ret_mean",
-                "ret_std",
-                "adv_std",
-                "samples",
-                "shards",
-                "weights_version",
-                "num_minibatches",
-            ]:
-                wandb.define_metric(key, summary="last")
         return True
     except Exception as exc:
         stage(f"[wandb] init failed: {exc}")

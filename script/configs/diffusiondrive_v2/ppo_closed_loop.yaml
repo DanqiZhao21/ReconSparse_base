@@ -69,7 +69,7 @@ train:
   # Weights & Biases logging (handled in script/train_actor_learner_v2.py learner rank0)
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     # entity: 2564380679
     group: ppo_closed_loop
     # name: optional; default is learner_YYYYmmdd_HHMMSS

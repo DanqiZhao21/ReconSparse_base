@@ -138,6 +138,13 @@ class NuScenesPDMScorer:
                 f"Unsupported NuScenesPDMScorer score_mode={self.score_mode!r}; "
                 "expected 'full' or 'drivable_area_only'"
             )
+        for ignored_key in (
+            "center_dev_max_m",
+            "heading_dev_max_deg",
+            "off_global_route_threshold_m",
+            "carl",
+        ):
+            kwargs.pop(ignored_key, None)
         self._delegate = NuScenesScorerUtils(
             token2vad_path=self.token2vad_path,
             **kwargs,
@@ -146,7 +153,7 @@ class NuScenesPDMScorer:
         self._derived_context_cache_root = self._delegate.scene_cache_root / "_sample_pdm_context"
 
     def _derived_context_cache_variant(self) -> str:
-        return f"pdm-v5-box-lw-ea{int(bool(self._delegate.ea_gate_enabled))}"
+        return f"pdm-v6-dynamic-future-box-lw-ea{int(bool(self._delegate.ea_gate_enabled))}"
 
     def _derived_context_cache_path(self, sample_token: str) -> Path:
         return self._derived_context_cache_root / self._delegate._sample_context_cache_filename(
@@ -1186,9 +1193,11 @@ class NuScenesPDMScorer:
             if bool(self._delegate.driving_direction_gate_enabled)
             else np.ones((num_candidates,), dtype=np.float32)
         )
-        drivable_area = map_metrics["drivable_area"] if drivable_polygons else np.ones((num_candidates,), dtype=np.float32)
-        if self.score_mode == "drivable_area_only":
-            return drivable_area.astype(np.float32, copy=False)
+        
+        
+        # drivable_area = map_metrics["drivable_area"] if drivable_polygons else np.ones((num_candidates,), dtype=np.float32)
+        # if self.score_mode == "drivable_area_only":
+        #     return drivable_area.astype(np.float32, copy=False)
 
         collision_ttc = self._batch_collision_ttc_metrics(
             sample_context=sample_context,
@@ -1203,22 +1212,39 @@ class NuScenesPDMScorer:
             dt_s=float(dt_s),
         )
 
+        # weighted_score = (
+        #     drivable_area * float(self._delegate.dac_weight)
+        #     + progress_ratio * float(self._delegate.progress_weight)
+        #     + ttc * float(self._delegate.ttc_weight)
+        #     + lane_keeping * float(self._delegate.lane_keeping_weight)
+        #     + history_comfort * float(self._delegate.history_comfort_weight)
+        # ) / max(
+        #     1.0,
+        #     float(self._delegate.dac_weight)
+        #     + float(self._delegate.progress_weight)
+        #     + float(self._delegate.ttc_weight)
+        #     + float(self._delegate.lane_keeping_weight)
+        #     + float(self._delegate.history_comfort_weight),
+        # )
+        # drivable_gate = drivable_area if bool(self._delegate.dac_gate_enabled) else np.ones_like(drivable_area)
+        # multiplicative_product = (no_collision * drivable_gate * driving_direction).astype(np.float32, copy=False)
+
+        #只有progress ttc comfortable三个指标;取消了dac以及lane keeping
         weighted_score = (
-            drivable_area * float(self._delegate.dac_weight)
-            + progress_ratio * float(self._delegate.progress_weight)
+            # drivable_area * float(self._delegate.dac_weight)
+            progress_ratio * float(self._delegate.progress_weight)
             + ttc * float(self._delegate.ttc_weight)
-            + lane_keeping * float(self._delegate.lane_keeping_weight)
+            # + lane_keeping * float(self._delegate.lane_keeping_weight)
             + history_comfort * float(self._delegate.history_comfort_weight)
         ) / max(
             1.0,
-            float(self._delegate.dac_weight)
-            + float(self._delegate.progress_weight)
+            # float(self._delegate.dac_weight)
+            float(self._delegate.progress_weight)
             + float(self._delegate.ttc_weight)
-            + float(self._delegate.lane_keeping_weight)
+            # + float(self._delegate.lane_keeping_weight)
             + float(self._delegate.history_comfort_weight),
         )
-        drivable_gate = drivable_area if bool(self._delegate.dac_gate_enabled) else np.ones_like(drivable_area)
-        multiplicative_product = (no_collision * drivable_gate * driving_direction).astype(np.float32, copy=False)
+        multiplicative_product = (no_collision  * driving_direction).astype(np.float32, copy=False)
         if self._delegate.ea_gate_enabled:
             multiplicative_product = (
                 multiplicative_product * np.asarray(ea_gate["gate"], dtype=np.float32)

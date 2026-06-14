@@ -237,10 +237,8 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: 20260608_reward_diag_rewarddiag_step_dense_rpp
-    log_minibatch_metrics: true
-    log_legacy_raw_metrics: true
   algo: reinforcepp
   eta: 1.0
   mode_idx: -1

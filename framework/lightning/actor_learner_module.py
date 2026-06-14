@@ -4,6 +4,11 @@ import os
 import time
 from typing import Any, Dict
 
+from framework.io.debug_retention import (
+    archive_selected_shards_for_debug,
+    copy_latest_to_history,
+    should_retain_version,
+)
 from framework.io.buffer import move_to_consumed, prune_consumed, read_int, write_int
 from framework.lightning.trajectory_module import TrajectoryLightningModule
 
@@ -33,7 +38,6 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
         self.rank = int(rank)
         self.wandb_enabled = bool(wandb_enabled)
         self.global_sample_step = 0
-        self.global_train_seen_sample_step = 0
         self._update_train_t0 = 0.0
         self._latest_epoch_had_data = False
 
@@ -87,6 +91,32 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             try:
                 self.agent.save_checkpoint(self.paths.latest_ckpt)
                 write_int(self.paths.version_file, new_v)
+                retain_versions = int(getattr(self.learner_config, "debug_retain_versions", 0) or 0)
+                if bool(getattr(self.learner_config, "debug_retain_ckpts", False)) and should_retain_version(
+                    version=int(new_v),
+                    retain_versions=int(retain_versions),
+                ):
+                    try:
+                        history_path = copy_latest_to_history(self.paths, version=int(new_v))
+                        self.stage_fn(f"[learner] debug retained checkpoint ver={int(new_v)} path={history_path}")
+                    except Exception as exc:
+                        self.stage_fn(f"[learner] debug checkpoint retention failed: {exc}")
+                if (
+                    bool(getattr(self.learner_config, "debug_retain_shards", False))
+                    and len(selected) > 0
+                    and should_retain_version(version=int(new_v), retain_versions=int(retain_versions))
+                ):
+                    try:
+                        manifest_path = archive_selected_shards_for_debug(
+                            self.paths,
+                            selected=selected,
+                            update_index=int(self._update_index()),
+                            cur_version=int(cur_v),
+                            new_version=int(new_v),
+                        )
+                        self.stage_fn(f"[learner] debug retained shards manifest={manifest_path}")
+                    except Exception as exc:
+                        self.stage_fn(f"[learner] debug shard retention failed: {exc}")
                 for fp in selected:
                     move_to_consumed(self.paths, fp)
                 prune_consumed(self.paths, keep_basenames={os.path.basename(fp) for fp in selected})
@@ -108,15 +138,24 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             done_sum = float(getattr(loaded, "done_sum", 0.0)) if loaded is not None else 0.0
             done_count = int(getattr(loaded, "done_count", 0)) if loaded is not None else 0
             reward_summary = dict(getattr(loaded, "reward_summary", {}) or {}) if loaded is not None else {}
+            shard_outcomes = dict(getattr(loaded, "shard_outcomes", {}) or {}) if loaded is not None else {}
             reward_mean = float(reward_sum) / float(max(1, reward_count))
             done_rate = float(done_sum) / float(max(1, done_count))
             reward_summary_steps = float(max(1.0, float(reward_summary.get("step_count", 0.0))))
-            terminal_episode_count = float(
-                float(reward_summary.get("terminal_failure_count", 0.0))
-                + float(reward_summary.get("terminal_timeout_count", 0.0))
-                + float(reward_summary.get("terminal_env_done_count", 0.0))
-            )
-            terminal_episode_den = float(max(1.0, terminal_episode_count))
+            shard_den = float(max(1, len(selected)))
+            full_horizon_count = float(shard_outcomes.get("full_horizon_count", 0.0) or 0.0)
+            env_done_count = float(shard_outcomes.get("env_done_count", 0.0) or 0.0)
+            timeout_count = float(shard_outcomes.get("timeout_count", 0.0) or 0.0)
+            forced_failure_count = float(shard_outcomes.get("forced_failure_count", 0.0) or 0.0)
+            partial_nonterminal_count = float(shard_outcomes.get("partial_nonterminal_count", 0.0) or 0.0)
+            shard_outcome_view = {
+                "normal_end_rate": float(full_horizon_count + env_done_count + timeout_count) / shard_den,
+                "forced_failure_rate": float(forced_failure_count) / shard_den,
+                "full_horizon_rate": float(full_horizon_count) / shard_den,
+                "env_done_rate": float(env_done_count) / shard_den,
+                "timeout_rate": float(timeout_count) / shard_den,
+                "partial_nonterminal_rate": float(partial_nonterminal_count) / shard_den,
+            }
             reward_summary_view = {
                 "positive_reward_mean": float(reward_summary.get("positive_reward_sum", 0.0)) / reward_summary_steps,
                 "gated_positive_reward_mean": float(reward_summary.get("gated_positive_reward_sum", 0.0)) / reward_summary_steps,
@@ -125,9 +164,6 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                 "collision_gate_rate": float(reward_summary.get("collision_gate_count", 0.0)) / reward_summary_steps,
                 "severe_tracking_lateral_gate_rate": float(reward_summary.get("severe_tracking_lateral_gate_count", 0.0)) / reward_summary_steps,
                 "severe_tracking_yaw_gate_rate": float(reward_summary.get("severe_tracking_yaw_gate_count", 0.0)) / reward_summary_steps,
-                "terminal_failure_rate": float(reward_summary.get("terminal_failure_count", 0.0)) / terminal_episode_den,
-                "terminal_timeout_rate": float(reward_summary.get("terminal_timeout_count", 0.0)) / terminal_episode_den,
-                "terminal_env_done_rate": float(reward_summary.get("terminal_env_done_count", 0.0)) / terminal_episode_den,
             }
             ret = datamodule.current_loaded.batch["ret"]
             adv = datamodule.current_loaded.batch["adv"]
@@ -141,6 +177,10 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
             self.stage_fn(
                 f"[learner] reward_summary update={int(self._update_index())} "
                 f"summary={reward_summary_view}"
+            )
+            self.stage_fn(
+                f"[learner] shard_outcomes update={int(self._update_index())} "
+                f"summary={shard_outcome_view}"
             )
             self.stage_fn(
                 f"[learner] step_timing update={int(self._update_index())} parts={timing_parts}"
@@ -182,9 +222,12 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                     "reward_gate/severe_tracking_yaw_rate": float(
                         reward_summary_view["severe_tracking_yaw_gate_rate"]
                     ),
-                    "terminal/failure_rate": float(reward_summary_view["terminal_failure_rate"]),
-                    "terminal/timeout_rate": float(reward_summary_view["terminal_timeout_rate"]),
-                    "terminal/env_done_rate": float(reward_summary_view["terminal_env_done_rate"]),
+                    "shard/normal_end_rate": float(shard_outcome_view["normal_end_rate"]),
+                    "shard/forced_failure_rate": float(shard_outcome_view["forced_failure_rate"]),
+                    "shard/full_horizon_rate": float(shard_outcome_view["full_horizon_rate"]),
+                    "shard/env_done_rate": float(shard_outcome_view["env_done_rate"]),
+                    "shard/timeout_rate": float(shard_outcome_view["timeout_rate"]),
+                    "shard/partial_nonterminal_rate": float(shard_outcome_view["partial_nonterminal_rate"]),
                     "batch/ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
                     "batch/ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
                     "batch/adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,
@@ -194,67 +237,9 @@ class ActorLearnerLightningModule(TrajectoryLightningModule):
                         payload[f"optim/{key}"] = float(value)
                     except Exception:
                         continue
-                if bool(getattr(self.learner_config, "wandb_log_legacy_raw_metrics", False)):
-                    legacy_payload = {
-                        "update": int(self._update_index()),
-                        "global_step": int(global_sample_step),
-                        "global_sample_step": int(global_sample_step),
-                        "global_train_seen_sample_step": int(self.global_train_seen_sample_step),
-                        "weights_version": int(new_v),
-                        "shards": int(len(selected)),
-                        "samples": int(n),
-                        "collect_time_s": float(payload["time/collect_s"]),
-                        "load_shards_time_s": float(payload["time/load_shards_s"]),
-                        "train_time_s": float(payload["time/train_s"]),
-                        "update_time_s": float(payload["time/update_s"]),
-                        "save_broadcast_time_s": float(payload["time/save_broadcast_s"]),
-                        "reward_sum": float(payload["reward/sum"]),
-                        "reward_mean": float(payload["reward/mean"]),
-                        "done_rate": float(payload["data/done_rate"]),
-                        "positive_reward_mean": float(payload["reward/positive_mean"]),
-                        "gated_positive_reward_mean": float(payload["reward/gated_positive_mean"]),
-                        "cost_reward_mean": float(payload["reward/cost_mean"]),
-                        "safety_gate_rate": float(payload["reward_gate/safety_rate"]),
-                        "collision_gate_rate": float(payload["reward_gate/collision_rate"]),
-                        "severe_tracking_lateral_gate_rate": float(
-                            payload["reward_gate/severe_tracking_lateral_rate"]
-                        ),
-                        "severe_tracking_yaw_gate_rate": float(payload["reward_gate/severe_tracking_yaw_rate"]),
-                        "terminal_failure_rate": float(payload["terminal/failure_rate"]),
-                        "terminal_timeout_rate": float(payload["terminal/timeout_rate"]),
-                        "terminal_env_done_rate": float(payload["terminal/env_done_rate"]),
-                        "ret_mean": float(payload["batch/ret_mean"]),
-                        "ret_std": float(payload["batch/ret_std"]),
-                        "adv_std": float(payload["batch/adv_std"]),
-                    }
-                    for key, value in metrics.items():
-                        try:
-                            legacy_payload[str(key)] = float(value)
-                        except Exception:
-                            continue
-                    update_view = {
-                        "reward_sum": float(legacy_payload["reward_sum"]),
-                        "reward_mean": float(legacy_payload["reward_mean"]),
-                        "done_rate": float(legacy_payload["done_rate"]),
-                        "ret_mean": float(legacy_payload["ret_mean"]),
-                        "ret_std": float(legacy_payload["ret_std"]),
-                        "adv_std": float(legacy_payload["adv_std"]),
-                        "samples": float(n),
-                        "shards": float(len(selected)),
-                        "weights_version": float(new_v),
-                        "collect_time_s": float(legacy_payload["collect_time_s"]),
-                        "load_shards_time_s": float(legacy_payload["load_shards_time_s"]),
-                        "train_time_s": float(legacy_payload["train_time_s"]),
-                        "update_time_s": float(legacy_payload["update_time_s"]),
-                        "save_broadcast_time_s": float(legacy_payload["save_broadcast_time_s"]),
-                    }
-                    update_view.update({key: float(value) for key, value in metrics.items()})
-                    for key, value in update_view.items():
-                        legacy_payload[f"train_update/{key}"] = float(value)
-                    payload.update(legacy_payload)
                 try:
                     self.global_sample_step += int(n)
-                    wandb.log(payload)
+                    wandb.log(payload, step=int(payload["progress/update"]), commit=True)
                 except Exception as exc:
                     self.stage_fn(f"[wandb] log failed: {exc}")
 

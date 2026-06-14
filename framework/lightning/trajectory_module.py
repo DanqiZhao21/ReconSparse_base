@@ -22,11 +22,6 @@ from framework.lightning.config import ActorLearnerLightningConfig
 from framework.lightning_compat import L
 from framework.runner.logging import _exception_is_cuda_oom, log_cuda_memory_snapshot
 
-try:
-    import wandb  # type: ignore
-except Exception:
-    wandb = None  # type: ignore
-
 
 def _trainable_parameters(module: Any) -> list[torch.nn.Parameter]:
     if module is None or not hasattr(module, "parameters"):
@@ -396,71 +391,6 @@ class TrajectoryLightningModule(L.LightningModule):
         )
         self._grpo_debug_dump_count += 1
 
-    def _maybe_log_train_seen_samples(
-        self,
-        *,
-        metrics: Dict[str, torch.Tensor],
-        adv: torch.Tensor,
-        ret: torch.Tensor,
-        batch_size: int,
-    ) -> None:
-        if not bool(getattr(self, "wandb_enabled", False)) or wandb is None:
-            return
-        if not bool(getattr(self.learner_config, "wandb_log_minibatch_metrics", False)):
-            return
-
-        seen_step = int(getattr(self, "global_train_seen_sample_step", 0)) + int(max(1, int(batch_size)))
-        setattr(self, "global_train_seen_sample_step", int(seen_step))
-
-        payload: Dict[str, float | int] = {
-            "debug/train_seen_samples": int(seen_step),
-            "debug/minibatch/ret_mean": float(ret.detach().mean().item()) if int(ret.numel()) > 0 else 0.0,
-            "debug/minibatch/ret_std": float(ret.detach().std(unbiased=False).item()) if int(ret.numel()) > 0 else 0.0,
-            "debug/minibatch/adv_std": float(adv.detach().std(unbiased=False).item()) if int(adv.numel()) > 0 else 0.0,
-            "debug/minibatch/seen_batch_size": int(batch_size),
-        }
-        update_fn = getattr(self, "_update_index", None)
-        if callable(update_fn):
-            try:
-                payload["progress/update"] = int(update_fn())
-            except Exception:
-                pass
-        trainer = None
-        try:
-            trainer = getattr(self, "trainer", None)
-        except RuntimeError:
-            trainer = None
-        if trainer is not None:
-            try:
-                payload["debug/lightning_global_step"] = int(getattr(trainer, "global_step"))
-            except Exception:
-                pass
-
-        for key, value in metrics.items():
-            try:
-                payload[f"debug/minibatch/{key}"] = float(value.detach().cpu().item())
-            except Exception:
-                continue
-        if bool(getattr(self.learner_config, "wandb_log_legacy_raw_metrics", False)):
-            payload["global_train_seen_sample_step"] = int(seen_step)
-            payload["ret_mean"] = float(payload["debug/minibatch/ret_mean"])
-            payload["ret_std"] = float(payload["debug/minibatch/ret_std"])
-            payload["adv_std"] = float(payload["debug/minibatch/adv_std"])
-            payload["seen_batch_size"] = int(batch_size)
-            for key, value in metrics.items():
-                try:
-                    payload[f"train_seen_samples/{key}"] = float(value.detach().cpu().item())
-                except Exception:
-                    continue
-            payload["train_seen_samples/ret_mean"] = float(payload["debug/minibatch/ret_mean"])
-            payload["train_seen_samples/ret_std"] = float(payload["debug/minibatch/ret_std"])
-            payload["train_seen_samples/adv_std"] = float(payload["debug/minibatch/adv_std"])
-            payload["train_seen_samples/seen_batch_size"] = float(batch_size)
-        try:
-            wandb.log(payload)
-        except Exception:
-            pass
-
     def _reset_update_metric_aggregates(self) -> None:
         self._update_metric_weight = 0.0
         self._update_metric_steps = 0
@@ -710,12 +640,6 @@ class TrajectoryLightningModule(L.LightningModule):
             t0 = time.perf_counter()
             self.latest_metrics = {key: float(val.detach().cpu().item()) for key, val in metrics.items()}
             self._record_update_metrics(metrics, batch_size=int(adv.shape[0]))
-            self._maybe_log_train_seen_samples(
-                metrics=metrics,
-                adv=adv,
-                ret=ret,
-                batch_size=int(adv.shape[0]),
-            )
             for key, value in metrics.items():
                 self.log(
                     f"train/{key}",

@@ -86,7 +86,7 @@ env:
 train:
   wandb:
     enabled: true
-    project: ReconDiff
+    project: reconSparse
     group: ppo_closed_loop_sparsedrive_v2_craft_closePPODense_NoGRPO
   algo: ppo
   eta: 1.0

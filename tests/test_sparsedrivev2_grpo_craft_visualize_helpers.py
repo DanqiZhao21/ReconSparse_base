@@ -8,7 +8,11 @@ import pytest
 
 from tools.smalltool.visualize.visualize_sparsedrivev2_grpo_craft_online import (
     build_candidate_score_payload,
+    candidate_details_from_term_matrices,
     candidate_visual_styles,
+    bev_render_scale,
+    format_pdm_score_percent,
+    select_bev_candidate_indices,
     overlay_top_right_inset,
     render_bev_debug_image,
 )
@@ -36,6 +40,23 @@ def test_candidate_visual_style_orders_high_score_first_and_fades_low_scores() -
     assert styles[0]["linewidth"] > styles[2]["linewidth"]
 
 
+def test_format_pdm_score_percent_displays_raw_score_as_100_point_scale() -> None:
+    assert format_pdm_score_percent(0.83456) == "83.46"
+    assert format_pdm_score_percent(1.0) == "100.00"
+    assert format_pdm_score_percent(0.0) == "0.00"
+
+
+def test_select_bev_candidate_indices_keeps_top_selected_and_low_representatives() -> None:
+    scores = np.asarray([0.1, 0.9, -0.8, 0.4, -0.2, 0.7, -0.5, 0.0], dtype=np.float32)
+
+    indices = select_bev_candidate_indices(scores=scores, top_k=2, selected_index=6, max_candidates=5)
+
+    assert indices[:2] == [1, 5]
+    assert 6 in indices
+    assert 2 in indices
+    assert len(indices) <= 5
+
+
 def test_build_candidate_score_payload_writes_all_candidates_and_top_k(tmp_path: Path) -> None:
     traj_xyyaw = np.asarray(
         [
@@ -59,6 +80,13 @@ def test_build_candidate_score_payload_writes_all_candidates_and_top_k(tmp_path:
         score_logits=logits,
         mode_indices=mode_indices,
         top_k=2,
+        candidate_details={
+            2: {
+                "score_terms": {"progress": 0.8, "collision_cost": -10.0},
+                "weighted_metrics": {"progress": 0.4},
+                "multiplicative_metrics": {"no_collision": 0.0},
+            }
+        },
     )
 
     assert payload["scene"] == 7
@@ -69,12 +97,30 @@ def test_build_candidate_score_payload_writes_all_candidates_and_top_k(tmp_path:
     assert payload["candidates"][0]["score_logit"] == pytest.approx(2.0)
     assert payload["candidates"][0]["mode_index"] == 12
     assert payload["candidates"][0]["traj_xyyaw"][-1] == pytest.approx([3.0, -0.3, -0.1])
+    assert payload["candidates"][0]["score_breakdown"]["score_terms"]["progress"] == pytest.approx(0.8)
+    assert payload["candidates"][0]["score_breakdown"]["multiplicative_metrics"]["no_collision"] == pytest.approx(0.0)
 
     out_path = tmp_path / "score.json"
     out_path.write_text(json.dumps(payload), encoding="utf-8")
     loaded = json.loads(out_path.read_text(encoding="utf-8"))
     assert loaded["candidates"][1]["visual"]["is_top_k"] is True
     assert loaded["candidates"][2]["visual"]["is_top_k"] is False
+
+
+def test_candidate_details_from_term_matrices_summarizes_craft_terms() -> None:
+    details = candidate_details_from_term_matrices(
+        {
+            "collision_cost": np.asarray([[10.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+            "progress_reward": np.asarray([1.5, 2.5], dtype=np.float32),
+        },
+        candidate_scores=np.asarray([-8.0, -2.0], dtype=np.float32),
+    )
+
+    assert details[0]["score_terms"]["collision_cost_sum"] == pytest.approx(10.0)
+    assert details[0]["score_terms"]["collision_cost_mean"] == pytest.approx(5.0)
+    assert details[0]["score_terms"]["progress_reward"] == pytest.approx(1.5)
+    assert details[0]["step_terms"]["collision_cost"] == pytest.approx([10.0, 0.0])
+    assert details[1]["final_score"] == pytest.approx(-2.0)
 
 
 def test_overlay_top_right_inset_places_resized_inset_without_resizing_frame() -> None:
@@ -89,7 +135,7 @@ def test_overlay_top_right_inset_places_resized_inset_without_resizing_frame() -
     assert out[95, 5].sum() == 0
 
 
-def test_render_bev_debug_image_draws_context_and_all_candidates() -> None:
+def test_render_bev_debug_image_draws_context_and_limited_candidates() -> None:
     sample_detail = {
         "sample_token": "tok",
         "gt_xy": [[1.0, 0.0], [2.0, 0.0]],
@@ -131,6 +177,17 @@ def test_render_bev_debug_image_draws_context_and_all_candidates() -> None:
     assert int(img.max()) > int(img.min())
 
 
+def test_bev_render_scale_increases_text_and_line_sizes_for_large_outputs() -> None:
+    small = bev_render_scale(width=420, height=420)
+    large = bev_render_scale(width=1600, height=1600)
+
+    assert large["scale"] > small["scale"]
+    assert large["font_scale"] <= 0.75
+    assert large["legend_width_px"] <= 360
+    assert large["trajectory_line_px"] > small["trajectory_line_px"]
+    assert large["legend_width_px"] >= small["legend_width_px"]
+
+
 def test_render_bev_places_positive_y_on_screen_left_for_agents() -> None:
     sample_detail = {
         "sample_token": "tok",
@@ -155,11 +212,13 @@ def test_render_bev_places_positive_y_on_screen_left_for_agents() -> None:
         height=200,
     )
 
-    agent_mask = (img[:, :, 0] > 180) & (img[:, :, 1] < 130) & (img[:, :, 2] < 120)
-    ys, xs = np.where(agent_mask)
+    bg = np.asarray([245, 243, 238], dtype=np.int16)
+    diff = np.abs(img.astype(np.int16) - bg.reshape(1, 1, 3)).sum(axis=2)
+    agent_roi = diff[65:90, 65:95]
+    ys, xs = np.where(agent_roi > 50)
 
     assert xs.size > 0
-    assert float(xs.mean()) < 100.0
+    assert float((xs + 65).mean()) < 100.0
 
 
 def test_nuscenes_scorer_collect_scene_objects_uses_navsim_box_length_width_order(tmp_path: Path) -> None:
@@ -310,6 +369,61 @@ def test_hugsim_grpo_object_context_rotates_recon_global_velocity_to_local() -> 
     assert obj["center_xy"] == pytest.approx([7.0, 0.0])
     assert obj["velocity_xy"] == pytest.approx([3.0, 0.0])
     assert obj["speed_mps"] == pytest.approx(3.0)
+
+
+def test_hugsim_grpo_object_context_rotates_future_xy_to_local() -> None:
+    context = build_hugsim_grpo_object_context(
+        {
+            "hugsim_ego_box_recon_global_poly": [[-1.0, 2.0], [1.0, 2.0], [1.0, -2.0], [-1.0, -2.0]],
+            "hugsim_obj_boxes_recon_global": [],
+            "recon_cache_dynamic_objects": [
+                {
+                    "source": "recon_cache",
+                    "token": "cache_obj_0",
+                    "category": "vehicle.car",
+                    "poly": [[-1.0, 8.0], [1.0, 8.0], [1.0, 6.0], [-1.0, 6.0]],
+                    "future_xy": [[0.0, 9.0], [0.0, 11.0]],
+                    "future_yaw": [0.0, 0.0],
+                    "future_dt_s": 0.5,
+                }
+            ],
+        }
+    )
+
+    obj = context["scene_objects"][0]
+    assert np.allclose(np.asarray(obj["future_xy"], dtype=np.float32), np.asarray([[9.0, 0.0], [11.0, 0.0]], dtype=np.float32))
+    assert obj["future_yaw"] == pytest.approx([-np.pi * 0.5, -np.pi * 0.5])
+    assert obj["future_dt_s"] == pytest.approx(0.5)
+
+
+def test_hugsim_grpo_object_context_rolls_out_constant_planner_future() -> None:
+    context = build_hugsim_grpo_object_context(
+        {
+            "hugsim_ego_box_recon_global_poly": [[2.0, 1.0], [2.0, -1.0], [-2.0, -1.0], [-2.0, 1.0]],
+            "hugsim_obj_boxes_recon_global": [
+                {
+                    "source": "hugsim_inserted",
+                    "token": "hugsim_obj_0",
+                    "category": "vehicle.car",
+                    "poly": [[8.0, 1.0], [8.0, -1.0], [6.0, -1.0], [6.0, 1.0]],
+                }
+            ],
+        },
+        scenario_plan_list=[
+            [0.0, 0.0, 0.0, 0.0, 2.0, "car.obj", "ConstantPlanner", {}],
+        ],
+        future_horizon=4,
+        future_dt_s=0.5,
+    )
+
+    obj = context["scene_objects"][0]
+    assert np.allclose(
+        np.asarray(obj["future_xy"], dtype=np.float32),
+        np.asarray([[7.0, 1.0], [7.0, 2.0], [7.0, 3.0]], dtype=np.float32),
+    )
+    assert obj["future_yaw"] == pytest.approx([0.0, 0.0, 0.0])
+    assert obj["future_mask"] == pytest.approx([1.0, 1.0, 1.0])
+    assert obj["future_dt_s"] == pytest.approx(0.5)
 
 
 def test_build_hugsim_visualization_manifest_payload_records_scorer_backend(tmp_path: Path) -> None:

@@ -15,6 +15,51 @@ class LoadedShardBatch:
     done_sum: float
     done_count: int
     reward_summary: Dict[str, float]
+    shard_outcomes: Dict[str, float]
+
+
+def _shard_outcome_defaults() -> Dict[str, float]:
+    return {
+        "full_horizon_count": 0.0,
+        "env_done_count": 0.0,
+        "timeout_count": 0.0,
+        "forced_failure_count": 0.0,
+        "partial_nonterminal_count": 0.0,
+    }
+
+
+def _accumulate_shard_outcome(
+    outcomes: Dict[str, float],
+    *,
+    meta: Dict[str, Any],
+    reward_summary: Dict[str, Any],
+    num_steps: int,
+) -> None:
+    failure_count = float(reward_summary.get("terminal_failure_count", 0.0) or 0.0)
+    timeout_count = float(reward_summary.get("terminal_timeout_count", 0.0) or 0.0)
+    env_done_count = float(reward_summary.get("terminal_env_done_count", 0.0) or 0.0)
+    if failure_count > 0.0:
+        outcomes["forced_failure_count"] += 1.0
+        return
+    if timeout_count > 0.0:
+        outcomes["timeout_count"] += 1.0
+        return
+    if env_done_count > 0.0:
+        outcomes["env_done_count"] += 1.0
+        return
+
+    try:
+        horizon = int(meta.get("horizon", int(num_steps)))
+    except Exception:
+        horizon = int(num_steps)
+    try:
+        meta_num_steps = int(meta.get("num_steps", int(num_steps)))
+    except Exception:
+        meta_num_steps = int(num_steps)
+    if meta_num_steps >= max(1, int(horizon)):
+        outcomes["full_horizon_count"] += 1.0
+    else:
+        outcomes["partial_nonterminal_count"] += 1.0
 
 #给PPO分支使用
 def compute_gae(
@@ -128,6 +173,7 @@ def build_training_batch(
     done_sum = 0.0
     done_count = 0
     reward_summary_totals: Dict[str, float] = {}
+    shard_outcomes = _shard_outcome_defaults()
 
     is_ppo_family = str(algo_key).startswith("ppo")
     value_module = getattr(value_net, "module", value_net)
@@ -175,6 +221,19 @@ def build_training_batch(
                             reward_summary_totals[str(key)] = reward_summary_totals.get(str(key), 0.0) + float(value)
                         except Exception:
                             continue
+                    _accumulate_shard_outcome(
+                        shard_outcomes,
+                        meta=meta_i if isinstance(meta_i, dict) else {},
+                        reward_summary=reward_summary_i,
+                        num_steps=int(rewards_i.numel()),
+                    )
+                else:
+                    _accumulate_shard_outcome(
+                        shard_outcomes,
+                        meta=meta_i if isinstance(meta_i, dict) else {},
+                        reward_summary={},
+                        num_steps=int(rewards_i.numel()),
+                    )
 
                 done_last = float(shard.get("done_last", float(dones_i[-1].item() if dones_i.numel() else 1.0)))
                 terminated_last = float(
@@ -256,6 +315,19 @@ def build_training_batch(
                             reward_summary_totals[str(key)] = reward_summary_totals.get(str(key), 0.0) + float(value)
                         except Exception:
                             continue
+                    _accumulate_shard_outcome(
+                        shard_outcomes,
+                        meta=meta_i if isinstance(meta_i, dict) else {},
+                        reward_summary=reward_summary_i,
+                        num_steps=int(rewards_i.numel()),
+                    )
+                else:
+                    _accumulate_shard_outcome(
+                        shard_outcomes,
+                        meta=meta_i if isinstance(meta_i, dict) else {},
+                        reward_summary={},
+                        num_steps=int(rewards_i.numel()),
+                    )
 
                 ret_i = compute_returns(rewards=rewards_i, dones=dones_i, gamma=float(gamma))
                 adv_i = ret_i # no baseline
@@ -270,6 +342,13 @@ def build_training_batch(
     old_value = torch.cat(old_value_all, dim=0) if len(old_value_all) else torch.empty((0,), device=device)
     adv = torch.cat(adv_all, dim=0) if len(adv_all) else torch.empty((0,), device=device)#将所有分片的 Tensor 拼接成一个超大 Batch
     ret = torch.cat(ret_all, dim=0) if len(ret_all) else torch.empty((0,), device=device)
+    adv = normalize_advantages(
+        adv,
+        ddp_enabled=bool(ddp_enabled),
+        dist_module=dist_module,
+        device=device,
+        eps=float(norm_eps),
+    )
     n = int(adv.shape[0])
 
     if is_ppo_family:
@@ -300,6 +379,7 @@ def build_training_batch(
         done_sum=float(done_sum),
         done_count=int(done_count),
         reward_summary=dict(reward_summary_totals),
+        shard_outcomes=dict(shard_outcomes),
     )
 
 
