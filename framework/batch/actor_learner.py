@@ -160,6 +160,7 @@ def build_training_batch(
     ddp_enabled: bool,
     dist_module: Any,
     norm_eps: float = 1e-8,
+    normalize_advantage: bool = True,
 ) -> LoadedShardBatch:
     obs_all: List[torch.Tensor] = []
     old_logp_all: List[torch.Tensor] = []
@@ -342,13 +343,14 @@ def build_training_batch(
     old_value = torch.cat(old_value_all, dim=0) if len(old_value_all) else torch.empty((0,), device=device)
     adv = torch.cat(adv_all, dim=0) if len(adv_all) else torch.empty((0,), device=device)#将所有分片的 Tensor 拼接成一个超大 Batch
     ret = torch.cat(ret_all, dim=0) if len(ret_all) else torch.empty((0,), device=device)
-    adv = normalize_advantages(
-        adv,
-        ddp_enabled=bool(ddp_enabled),
-        dist_module=dist_module,
-        device=device,
-        eps=float(norm_eps),
-    )
+    if bool(normalize_advantage):
+        adv = normalize_advantages(
+            adv,
+            ddp_enabled=bool(ddp_enabled),
+            dist_module=dist_module,
+            device=device,
+            eps=float(norm_eps),
+        )
     n = int(adv.shape[0])
 
     if is_ppo_family:

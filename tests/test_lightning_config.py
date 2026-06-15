@@ -93,6 +93,27 @@ def test_actor_learner_config_defaults_partial_async_updates_when_timeout_is_con
     assert cfg.allow_partial_updates_after_timeout is True
 
 
+def test_actor_learner_config_reads_reinforcepp_advantage_normalization_flag() -> None:
+    class _Algo:
+        eta = 1.0
+        clip_eps = 0.2
+        minibatch_size = 4
+
+    cfg = actor_learner_lightning_config_from_algorithm(
+        _Algo(),
+        train_cfg={
+            "gamma": 0.99,
+            "reinforcepp": {
+                "normalize_advantage": False,
+            },
+        },
+        actor_learner_cfg={},
+        algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2},
+    )
+
+    assert cfg.normalize_advantage is False
+
+
 def test_actor_learner_config_ignores_removed_wandb_logging_flags() -> None:
     class _Algo:
         eta = 1.0

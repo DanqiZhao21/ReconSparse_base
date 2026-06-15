@@ -345,6 +345,26 @@ def test_async_collection_can_wait_for_sample_target_with_variable_shards(
     assert len(selected) == 4
 
 
+def test_select_shards_requires_sample_target_even_after_shard_target(tmp_path: Path) -> None:
+    from framework.io.shard_policy import select_shards_for_update
+
+    shard_paths = []
+    for idx in range(4):
+        shard_path = tmp_path / f"actor{idx}_e0_v34_t{6000 + idx}_short.pt"
+        _write_sized_shard(shard_path, 2)
+        shard_paths.append(str(shard_path))
+
+    selected = select_shards_for_update(
+        shard_paths,
+        mode="async",
+        num_actors=4,
+        shards_per_update=4,
+        samples_per_update=10,
+    )
+
+    assert selected == []
+
+
 def test_resolve_sample_token_uses_scene_and_frame_assets() -> None:
     token = resolve_sample_token(scene_id=146, frame_idx=0)
 

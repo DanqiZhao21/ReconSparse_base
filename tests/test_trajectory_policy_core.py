@@ -39,6 +39,47 @@ def test_grpo_expected_prob_objective_uses_candidate_logits() -> None:
     assert torch.allclose(loss.loss, expected)
 
 
+def test_grpo_clipped_ratio_objective_uses_old_candidate_log_probs() -> None:
+    new_log_probs = torch.log_softmax(torch.tensor([[1.2, 0.2, -0.4]], dtype=torch.float32), dim=1)
+    old_log_probs = torch.log_softmax(torch.tensor([[0.7, 0.4, -0.2]], dtype=torch.float32), dim=1)
+    scores = torch.tensor([[3.0, 1.0, 2.0]], dtype=torch.float32)
+
+    loss = compute_grpo_objective(
+        candidate_log_probs=new_log_probs,
+        old_candidate_log_probs=old_log_probs,
+        candidate_scores=scores,
+        objective="clipped_ratio",
+        clip_eps=0.2,
+    )
+
+    advantages = (scores - scores.mean(dim=1, keepdim=True)) / (
+        scores.std(dim=1, keepdim=True, unbiased=False) + 1e-6
+    )
+    log_ratio = new_log_probs - old_log_probs
+    ratio = torch.exp(log_ratio)
+    unclipped = ratio * advantages
+    clipped = torch.clamp(ratio, 0.8, 1.2) * advantages
+    expected = -torch.min(unclipped, clipped).mean()
+    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+
+    assert torch.allclose(loss.loss, expected)
+    assert torch.allclose(loss.approx_kl, approx_kl)
+    assert torch.allclose(loss.ratio_mean, ratio.mean())
+    assert torch.allclose(loss.clip_frac, ((ratio - 1.0).abs() > 0.2).float().mean())
+
+
+def test_grpo_clipped_ratio_requires_old_candidate_log_probs() -> None:
+    log_probs = torch.log_softmax(torch.tensor([[1.0, 0.0, -1.0]], dtype=torch.float32), dim=1)
+    scores = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="old_candidate_log_probs"):
+        compute_grpo_objective(
+            candidate_log_probs=log_probs,
+            candidate_scores=scores,
+            objective="clipped_ratio",
+        )
+
+
 def test_grpo_objective_rejects_legacy_craft_alias() -> None:
     log_probs = torch.log_softmax(torch.tensor([[1.0, 0.0, -1.0]], dtype=torch.float32), dim=1)
     scores = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)

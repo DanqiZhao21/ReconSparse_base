@@ -60,6 +60,9 @@ def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
         trainable_prefixes = agent_cfg.get("trainable_prefixes", [])
         frozen_prefixes = agent_cfg.get("frozen_prefixes", [])
         nuscenes_scorer_config = dict(agent_cfg.get("nuscenes_scorer", {}) or {})
+        grpo_cfg = train_cfg.get("grpo", {}) or {}
+        if not isinstance(grpo_cfg, dict):
+            grpo_cfg = {}
         for key in ("scene_cache_root", "agent_state_cache_root", "ea_project_src", "nuscenes_dataroot"):
             if key in nuscenes_scorer_config and nuscenes_scorer_config[key] is not None:
                 nuscenes_scorer_config[key] = str(resolve_repo_path(str(nuscenes_scorer_config[key])))
@@ -71,6 +74,7 @@ def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
             trainable_prefixes=trainable_prefixes,
             frozen_prefixes=frozen_prefixes,
             nuscenes_scorer_config=nuscenes_scorer_config,
+            grpo_num_candidates=(int(grpo_cfg.get("num_candidates", 0) or 0) if bool(grpo_cfg.get("enable", False)) else 0),
         )
     from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy
 

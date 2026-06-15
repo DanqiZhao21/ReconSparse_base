@@ -152,8 +152,6 @@ def select_shards_for_update(
             sample_count += int(shard_sample_count(fp))
             if sample_count >= int(sample_target):
                 return selected
-            if len(selected) >= need:
-                return selected
         return []
 
     if len(files) < need:

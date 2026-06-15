@@ -347,6 +347,35 @@ def test_reinforcepp_batch_normalizes_returns_as_advantage(tmp_path: Path) -> No
     assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, -1.0]))
 
 
+def test_reinforcepp_batch_can_keep_raw_returns_as_advantage(tmp_path: Path) -> None:
+    shard_path = tmp_path / "shard.pt"
+    _write_shard(
+        shard_path,
+        {
+            "old_logp": torch.zeros(2),
+            "reward": torch.tensor([1.0, 0.0], dtype=torch.float32),
+            "done": torch.tensor([0.0, 1.0], dtype=torch.float32),
+            "replay": [{"step": 0}, {"step": 1}],
+        },
+    )
+
+    loaded = build_training_batch(
+        selected=[str(shard_path)],
+        agent=object(),
+        algo_key="reinforcepp",
+        device=torch.device("cpu"),
+        gamma=0.5,
+        gae_lambda=0.95,
+        value_net=None,
+        ddp_enabled=False,
+        dist_module=None,
+        normalize_advantage=False,
+    )
+
+    assert torch.allclose(loaded.batch["ret"], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(loaded.batch["adv"], torch.tensor([1.0, 0.0]))
+
+
 def test_reinforcepp_batch_summarizes_shard_outcomes(tmp_path: Path) -> None:
     shard_specs = [
         ("full_horizon", 2, 2, {}),

@@ -18,8 +18,8 @@ python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   
 python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   --hugsim-scene scene-0411-medium-00 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606021200_HUGSM_reinforcepp_closed_loop_reward-progress_hd_GRPOCraft_substeps1.yaml \
-  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606151203_HUGSM_reinforcepp_closed_loop_steppath_hd_CollisionOnly_advnorm_NoGRPOCraft_substeps1.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/outputs/actor_learner/20260615_075943_HUGSIM_CollisionOnly_AdvNorm_Scene0411NoGRPOCraft_Substeps1/weights/latest.ckpt
   
 """
 

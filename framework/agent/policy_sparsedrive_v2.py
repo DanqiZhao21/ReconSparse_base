@@ -142,6 +142,7 @@ class SparseDriveV2Policy(Agent):
         trainable_prefixes: Sequence[str] | None = None,
         frozen_prefixes: Sequence[str] | None = None,
         nuscenes_scorer_config: Dict[str, Any] | None = None,
+        grpo_num_candidates: int = 0,
     ) -> None:
         try:
             SparseDriveConfig, SparseDriveModel = _force_import_sparsedrive_v2_modules()
@@ -161,6 +162,7 @@ class SparseDriveV2Policy(Agent):
         self._trainable_prefixes = _normalize_trainable_prefixes(trainable_prefixes)
         self._frozen_prefixes = _normalize_trainable_prefixes(frozen_prefixes)
         self._nuscenes_scorer_config = dict(nuscenes_scorer_config or {})
+        self._grpo_num_candidates = max(0, int(grpo_num_candidates or 0))
 
         self._cfg = self._SparseDriveConfig()
         self._cfg.bkb_path = os.path.join(_SPARSEDRIVE_V2_ROOT, "ckpt", "resnet34.bin")
@@ -1224,6 +1226,21 @@ class SparseDriveV2Policy(Agent):
                     "feature_missing_fields": list(features.get("feature_missing_fields", [])),
                 }
             )
+            if self._grpo_num_candidates > 0:
+                strict_candidates = self._select_strict_grpo_old_policy_candidates(
+                    score_logits=score_logits[idx : idx + 1],
+                    candidate_trajs=out["candidate_trajectories"][idx : idx + 1],
+                    candidate_global_indices=all_global_indices[idx : idx + 1].to(device=score_logits.device),
+                    num_candidates=int(self._grpo_num_candidates),
+                )
+                replay.update(
+                    {
+                        "grpo_candidate_mode_indices": strict_candidates["mode_indices"][0].detach().cpu().clone(),
+                        "grpo_candidate_old_log_probs": strict_candidates["old_log_probs"][0].detach().cpu().clone(),
+                        "grpo_candidate_traj_xyyaw": strict_candidates["traj_xyyaw"][0].detach().cpu().clone(),
+                        "grpo_candidate_old_score_logits": strict_candidates["score_logits"][0].detach().cpu().clone(),
+                    }
+                )
             self._update_replay_with_observation_metadata(replay, observations[idx])
             actions.append(self._build_env_action(traj_xyyaw))
             logps.append(logp)
@@ -1367,6 +1384,263 @@ class SparseDriveV2Policy(Agent):
         }
 
     @staticmethod
+    def _select_strict_grpo_old_policy_candidates(
+        *,
+        score_logits: torch.Tensor,
+        candidate_trajs: torch.Tensor,
+        candidate_global_indices: torch.Tensor,
+        num_candidates: int,
+    ) -> Dict[str, torch.Tensor]:
+        if score_logits.ndim != 2:
+            raise RuntimeError(f"score_logits must be 2D (batch,candidates), got {tuple(score_logits.shape)}")
+        if candidate_trajs.ndim != 4:
+            raise RuntimeError(f"candidate_trajs must be 4D (batch,candidates,horizon,dims), got {tuple(candidate_trajs.shape)}")
+        if tuple(candidate_global_indices.shape) != tuple(score_logits.shape):
+            raise RuntimeError(
+                "candidate_global_indices must match score_logits shape; "
+                f"indices={tuple(candidate_global_indices.shape)} logits={tuple(score_logits.shape)}"
+            )
+        k = max(1, min(int(num_candidates), int(score_logits.shape[1])))
+        probs = torch.softmax(score_logits, dim=1)
+        local_indices = torch.multinomial(probs, num_samples=k, replacement=False)
+        gather_idx_scores = local_indices
+        gather_idx_traj = local_indices.unsqueeze(-1).unsqueeze(-1).expand(
+            -1,
+            -1,
+            int(candidate_trajs.shape[2]),
+            int(candidate_trajs.shape[3]),
+        )
+        selected_trajs = torch.gather(candidate_trajs, dim=1, index=gather_idx_traj)
+        selected_logits = torch.gather(score_logits, dim=1, index=gather_idx_scores)
+        selected_global_indices = torch.gather(
+            candidate_global_indices.to(device=score_logits.device, dtype=torch.long),
+            dim=1,
+            index=gather_idx_scores,
+        )
+        old_log_probs = torch.gather(torch.log_softmax(score_logits, dim=1), dim=1, index=gather_idx_scores)
+        selected_trajs_flat = selected_trajs.reshape(-1, selected_trajs.shape[2], selected_trajs.shape[3])
+        traj_xyyaw = SparseDriveV2Policy._traj_batch_to_xyyaw(selected_trajs_flat).reshape(
+            selected_trajs.shape[0],
+            selected_trajs.shape[1],
+            selected_trajs.shape[2],
+            3,
+        )
+        return {
+            "traj_xyyaw": traj_xyyaw.detach(),
+            "old_log_probs": old_log_probs,
+            "mode_indices": selected_global_indices,
+            "local_indices": local_indices.to(dtype=torch.long),
+            "score_logits": selected_logits,
+        }
+
+    @staticmethod
+    def _stored_grpo_candidate_mode_indices_from_replay(
+        replays: Sequence[Dict[str, Any]],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        values: List[torch.Tensor] = []
+        expected_k: int | None = None
+        for idx, replay in enumerate(replays):
+            raw = replay.get("grpo_candidate_mode_indices", None)
+            if raw is None:
+                raise RuntimeError(f"Strict GRPO replay missing grpo_candidate_mode_indices at index {idx}")
+            tensor = torch.as_tensor(raw, dtype=torch.long, device=device).view(-1)
+            if expected_k is None:
+                expected_k = int(tensor.numel())
+            elif int(tensor.numel()) != expected_k:
+                raise RuntimeError(
+                    "Strict GRPO candidate count mismatch across replay entries: "
+                    f"expected={expected_k} got={int(tensor.numel())} index={idx}"
+                )
+            values.append(tensor)
+        return torch.stack(values, dim=0) if values else torch.empty((0, 0), dtype=torch.long, device=device)
+
+    @staticmethod
+    def _stored_grpo_candidate_old_log_probs_from_replay(
+        replays: Sequence[Dict[str, Any]],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        values: List[torch.Tensor] = []
+        expected_k: int | None = None
+        for idx, replay in enumerate(replays):
+            raw = replay.get("grpo_candidate_old_log_probs", None)
+            if raw is None:
+                raise RuntimeError(f"Strict GRPO replay missing grpo_candidate_old_log_probs at index {idx}")
+            tensor = torch.as_tensor(raw, dtype=torch.float32, device=device).view(-1)
+            if expected_k is None:
+                expected_k = int(tensor.numel())
+            elif int(tensor.numel()) != expected_k:
+                raise RuntimeError(
+                    "Strict GRPO old logp count mismatch across replay entries: "
+                    f"expected={expected_k} got={int(tensor.numel())} index={idx}"
+                )
+            values.append(tensor)
+        return torch.stack(values, dim=0) if values else torch.empty((0, 0), dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _stored_grpo_candidate_traj_xyyaw_from_replay(
+        replays: Sequence[Dict[str, Any]],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        values: List[torch.Tensor] = []
+        expected_shape: tuple[int, ...] | None = None
+        for idx, replay in enumerate(replays):
+            raw = replay.get("grpo_candidate_traj_xyyaw", None)
+            if raw is None:
+                raise RuntimeError(f"Strict GRPO replay missing grpo_candidate_traj_xyyaw at index {idx}")
+            tensor = torch.as_tensor(raw, dtype=torch.float32, device=device)
+            if tensor.ndim != 3 or int(tensor.shape[-1]) < 3:
+                raise RuntimeError(
+                    "Strict GRPO replay grpo_candidate_traj_xyyaw must have shape (candidates,horizon,3+); "
+                    f"got {tuple(tensor.shape)} at index {idx}"
+                )
+            tensor = tensor[..., :3]
+            if expected_shape is None:
+                expected_shape = tuple(int(v) for v in tensor.shape)
+            elif tuple(int(v) for v in tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    "Strict GRPO candidate trajectory shape mismatch across replay entries: "
+                    f"expected={expected_shape} got={tuple(tensor.shape)} index={idx}"
+                )
+            values.append(tensor)
+        return torch.stack(values, dim=0) if values else torch.empty((0, 0, 0, 3), dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _new_log_probs_for_stored_grpo_candidates_from_outputs(
+        *,
+        score_logits: torch.Tensor,
+        candidate_global_indices: torch.Tensor,
+        replays: Sequence[Dict[str, Any]],
+    ) -> torch.Tensor:
+        target_indices = SparseDriveV2Policy._stored_grpo_candidate_mode_indices_from_replay(
+            replays,
+            device=score_logits.device,
+        )
+        if int(target_indices.shape[0]) != int(score_logits.shape[0]):
+            raise RuntimeError(
+                "Strict GRPO target batch mismatch: "
+                f"targets={tuple(target_indices.shape)} logits={tuple(score_logits.shape)}"
+            )
+        logp_all = torch.log_softmax(score_logits, dim=1)
+        rows: List[torch.Tensor] = []
+        for batch_idx in range(int(score_logits.shape[0])):
+            matches = candidate_global_indices[batch_idx].to(device=score_logits.device, dtype=torch.long).view(1, -1) == target_indices[
+                batch_idx
+            ].view(-1, 1)
+            present = matches.any(dim=1)
+            if not bool(present.all().item()):
+                missing = target_indices[batch_idx][~present].detach().cpu().tolist()
+                raise RuntimeError(
+                    "Strict GRPO stored candidate indices are absent from current candidate set; "
+                    f"batch={batch_idx} missing={missing[:8]}"
+                )
+            local_indices = matches.to(dtype=torch.long).argmax(dim=1)
+            rows.append(logp_all[batch_idx].gather(0, local_indices))
+        return torch.stack(rows, dim=0) if rows else torch.empty((0, 0), device=score_logits.device, dtype=torch.float32)
+
+    @staticmethod
+    def _score_logits_for_stored_grpo_candidates_from_outputs(
+        *,
+        score_logits: torch.Tensor,
+        candidate_global_indices: torch.Tensor,
+        replays: Sequence[Dict[str, Any]],
+    ) -> torch.Tensor:
+        target_indices = SparseDriveV2Policy._stored_grpo_candidate_mode_indices_from_replay(
+            replays,
+            device=score_logits.device,
+        )
+        if int(target_indices.shape[0]) != int(score_logits.shape[0]):
+            raise RuntimeError(
+                "Strict GRPO target batch mismatch: "
+                f"targets={tuple(target_indices.shape)} logits={tuple(score_logits.shape)}"
+            )
+        rows: List[torch.Tensor] = []
+        for batch_idx in range(int(score_logits.shape[0])):
+            matches = candidate_global_indices[batch_idx].to(device=score_logits.device, dtype=torch.long).view(1, -1) == target_indices[
+                batch_idx
+            ].view(-1, 1)
+            present = matches.any(dim=1)
+            if not bool(present.all().item()):
+                missing = target_indices[batch_idx][~present].detach().cpu().tolist()
+                raise RuntimeError(
+                    "Strict GRPO stored candidate indices are absent from current candidate set; "
+                    f"batch={batch_idx} missing={missing[:8]}"
+                )
+            local_indices = matches.to(dtype=torch.long).argmax(dim=1)
+            rows.append(score_logits[batch_idx].gather(0, local_indices))
+        return torch.stack(rows, dim=0) if rows else torch.empty((0, 0), device=score_logits.device, dtype=torch.float32)
+
+    def _forced_grpo_logp_and_logit_for_global_index(
+        self,
+        replay: Dict[str, Any],
+        *,
+        global_index: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        forced_replay = dict(replay)
+        forced_replay["global_mode_idx"] = int(global_index)
+        batched_dev = self._batched_replay_features([forced_replay])
+        target = torch.as_tensor([int(global_index)], dtype=torch.long, device=self.device)
+        out = self._forward_policy_with_forced_global_indices(batched_dev, target)
+        score_logits = out["candidate_scores"].to(dtype=torch.float32)
+        candidate_identity = self._candidate_identity_from_outputs(out)
+        logp, present = self._logp_for_global_modes_or_missing(
+            score_logits=score_logits,
+            candidate_global_indices=candidate_identity["candidate_global_indices"],
+            target_global_indices=target.to(device=score_logits.device),
+        )
+        if not bool(present.all().item()):
+            raise RuntimeError(f"Strict GRPO forced scoring could not recover global_mode_idx={int(global_index)}")
+        matches = candidate_identity["candidate_global_indices"].to(device=score_logits.device, dtype=torch.long) == target[
+            :, None
+        ].to(device=score_logits.device)
+        local_index = matches.to(dtype=torch.long).argmax(dim=1)
+        forced_logit = score_logits[0].gather(0, local_index.view(-1))[0]
+        return logp.view(()).to(device=device), forced_logit.to(device=device)
+
+    def _strict_grpo_log_probs_and_logits_for_stored_candidates(
+        self,
+        replay: Dict[str, Any],
+        *,
+        score_logits: torch.Tensor,
+        candidate_global_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_indices = self._stored_grpo_candidate_mode_indices_from_replay(
+            [replay],
+            device=score_logits.device,
+        ).view(-1)
+        if int(score_logits.shape[0]) != 1:
+            raise RuntimeError(
+                "Strict GRPO per-replay logp recovery expects single-sample logits; "
+                f"got {tuple(score_logits.shape)}"
+            )
+        logp_all = torch.log_softmax(score_logits, dim=1)
+        new_log_probs: List[torch.Tensor] = []
+        selected_logits: List[torch.Tensor] = []
+        global_indices = candidate_global_indices[0].to(device=score_logits.device, dtype=torch.long).view(-1)
+        for target in target_indices:
+            matches = global_indices == target.to(device=score_logits.device, dtype=torch.long)
+            if bool(matches.any().item()):
+                local_index = matches.to(dtype=torch.long).argmax(dim=0).view(())
+                new_log_probs.append(logp_all[0].gather(0, local_index.view(1))[0])
+                selected_logits.append(score_logits[0].gather(0, local_index.view(1))[0])
+                continue
+            forced_logp, forced_logit = self._forced_grpo_logp_and_logit_for_global_index(
+                replay,
+                global_index=int(target.detach().cpu().item()),
+                device=score_logits.device,
+            )
+            new_log_probs.append(forced_logp)
+            selected_logits.append(forced_logit)
+        if not new_log_probs:
+            empty = torch.empty((0,), device=score_logits.device, dtype=torch.float32)
+            return empty, empty
+        return torch.stack(new_log_probs, dim=0), torch.stack(selected_logits, dim=0)
+
+    @staticmethod
     def _concat_counterfactual_candidate_batches(
         parts: Sequence[Dict[str, torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
@@ -1491,13 +1765,39 @@ class SparseDriveV2Policy(Agent):
                     )
                     new_logp[missing_idx] = single_outputs["new_logp"].view(())
         logp_all = torch.log_softmax(score_logits, dim=1)
-        counterfactual = self._select_counterfactual_candidates_from_policy_outputs(
-            score_logits=score_logits,
-            candidate_trajs=candidate_trajs,
-            num_candidates=int(num_candidates),
-            candidate_select=str(candidate_select),
-            logp_all=logp_all,
-        )
+        if all(isinstance(replay, dict) and "grpo_candidate_mode_indices" in replay for replay in replays):
+            new_log_probs_row, score_logits_row = self._strict_grpo_log_probs_and_logits_for_stored_candidates(
+                replays[0],
+                score_logits=score_logits,
+                candidate_global_indices=candidate_identity["candidate_global_indices"],
+            )
+            old_candidate_log_probs = self._stored_grpo_candidate_old_log_probs_from_replay(
+                replays,
+                device=score_logits.device,
+            )
+            traj_xyyaw = self._stored_grpo_candidate_traj_xyyaw_from_replay(
+                replays,
+                device=score_logits.device,
+            )
+            mode_indices = self._stored_grpo_candidate_mode_indices_from_replay(
+                replays,
+                device=score_logits.device,
+            )
+            counterfactual = {
+                "traj_xyyaw": traj_xyyaw.detach(),
+                "log_probs": new_log_probs_row.view(1, -1),
+                "old_log_probs": old_candidate_log_probs,
+                "mode_indices": mode_indices,
+                "score_logits": score_logits_row.view(1, -1),
+            }
+        else:
+            counterfactual = self._select_counterfactual_candidates_from_policy_outputs(
+                score_logits=score_logits,
+                candidate_trajs=candidate_trajs,
+                num_candidates=int(num_candidates),
+                candidate_select=str(candidate_select),
+                logp_all=logp_all,
+            )
 
         return {
             "new_logp": new_logp,

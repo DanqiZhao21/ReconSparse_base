@@ -166,7 +166,7 @@ env:
         enable: false
       path:
         interp_ds_m: 0.25
-        w_progress: 0.0
+        w_progress: -1.0
         progress_forward_cap_m: 2.0
         progress_backward_cap_m: 0.5
         w_lateral: 0.0
@@ -190,8 +190,8 @@ env:
         jerk_clip: 50.0
       collision:
         mode: dense_penalty
-        w_static: 1000.0
-        w_dynamic: 1000.0
+        w_static: 50.0
+        w_dynamic: 50.0
         gate_scale: 0.0
       safety:
         enable: false
@@ -229,8 +229,8 @@ train:
   wandb:
     enabled: true
     project: reconSparse
-    group: HUGSIM_RewardCollisionOnlyExtreme_GRPOPdm_AuxRiskDecel_Substeps1
-  algo: grpo_only
+    group: HUGSIM_NegProgress_NoAdvNorm_NoGRPOCraft_Substeps1
+  algo: reinforcepp
   eta: 1.0
   mode_idx: -1
   policy_mode_select: sample
@@ -240,7 +240,7 @@ train:
   clip_eps: 0.2
   actor_learner:
     mode: async
-    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_RewardCollisionOnlyExtreme_GRPOPdm_AuxRiskDecel_Substeps1
+    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_NegProgress_NoAdvNorm_NoGRPOCraft_Substeps1
     timestamp_buffer_dir: true
     learner_gpu_id: 0
     learner_gpu_ids:
@@ -253,7 +253,7 @@ train:
     - 5
     - 6
     - 7
-    actors_per_gpu: 6
+    actors_per_gpu: 12
     auto_max_inflight_per_actor: false
     max_inflight_per_actor: 3
     pause_actor_on_learner_gpu: true
@@ -273,43 +273,34 @@ train:
     restart_failed_actors: true
     max_actor_restarts: 2
     max_updates: 64
-  minibatch_size: 8
+  minibatch_size: 32
   gamma: 0.99
   ddp:
-    grad_accum_steps: 4
+    grad_accum_steps: 1
   grpo:
-    enable: true
+    enable: false
     config_path: null
-    coef: 2.0
+    coef: 0.0
     num_candidates: 8
-    candidate_select: sample_old_policy
-    objective: clipped_ratio
+    candidate_select: topk
+    objective: expected_prob
     temperature: 1.0
     norm_eps: 1.0e-06
     use_rank_adv: false
     score_clip: null
     debug_visualize: false
-    debug_dir: outputs/visualize/HUGSIM_RewardCollisionOnlyExtreme_GRPOPdm_AuxRiskDecel_Substeps1
+    debug_dir: outputs/visualize/HUGSIM_NegProgress_NoAdvNorm_NoGRPOCraft_Substeps1
     debug_max_batches: 24
     debug_top_k: 8
   reinforcepp:
     norm_eps: 1.0e-08
     kl_coef: 0.0
     epochs: 1
-    policy_grad_weight: 0.0
+    policy_grad_weight: 1.0
     forward_kl_coef: 0.0
     reverse_kl_coef: 0.0
     distill_temperature: 1.0
-  auxiliary_objectives:
-    risk_decel:
-      enable: true
-      coef: 0.5
-      dt_s: 0.5
-      high_risk_gap_m: 10.0
-      high_risk_ttc_s: 2.5
-      lateral_m: 2.5
-      speed_margin_mps: 0.15
-      eps: 1.0e-06
+    normalize_advantage: false
 agent:
   type: sparsedrive_v2
   ckpt: SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
@@ -317,8 +308,8 @@ agent:
   frozen_prefixes:
   - _backbone
   nuscenes_scorer:
-    backend: nuscenes_pdm
-    scene_cache_root: /root/clone/ReconDreamer-RL/assets/nus/data
+    backend: craft_carl
+    scene_cache_root: /root/clone/ReconDreamer-RL/assets/nus/cache
     ea_gate_enabled: false
     driving_direction_gate_enabled: false
     center_dev_max_m: 2.0

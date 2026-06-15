@@ -85,6 +85,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
         self.actor_shard_stall_timeout_s = float(getattr(learner_config, "actor_shard_stall_timeout_s", 0.0))
         self.max_shard_version_lag = int(learner_config.max_shard_version_lag)
         self.norm_eps = float(learner_config.norm_eps)
+        self.normalize_advantage = bool(getattr(learner_config, "normalize_advantage", True))
         self.inner_epochs = max(1, int(learner_config.inner_epochs))
         self.stage_fn = stage_fn
         self.start_version = int(start_version)
@@ -318,6 +319,7 @@ class ActorLearnerUpdateDataModule(TrajectoryUpdateDataModule):
                 ddp_enabled=self._ddp_enabled,
                 dist_module=self.dist_module,
                 norm_eps=float(self.norm_eps),
+                normalize_advantage=bool(self.normalize_advantage),
             )
             self.current_load_shards_s = float(time.time() - load_t0)
             self.current_prepare_batch_s = 0.0

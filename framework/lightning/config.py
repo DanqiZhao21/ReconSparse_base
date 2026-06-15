@@ -67,6 +67,7 @@ class ActorLearnerLightningConfig:
     actor_shard_stall_timeout_s: float = 0.0
     max_shard_version_lag: int = 2
     norm_eps: float = 1e-8
+    normalize_advantage: bool = True
     inner_epochs: int = 1
     accumulate_grad_batches: int = 1
     gradient_clip_val: float = 0.0
@@ -240,6 +241,7 @@ def actor_learner_lightning_config_from_algorithm(
         actor_shard_stall_timeout_s=float(actor_learner_cfg.get("actor_shard_stall_timeout_s", 0.0) or 0.0),
         max_shard_version_lag=int(raw_max_shard_version_lag),
         norm_eps=float(algo_meta.get("rpp_norm_eps", 1e-8)),
+        normalize_advantage=bool((train_cfg.get("reinforcepp", {}) or {}).get("normalize_advantage", True)),
         inner_epochs=max(1, int(inner_epochs)),
         accumulate_grad_batches=int(
             getattr(algo, "grad_accum_steps", ((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))

@@ -145,8 +145,16 @@ class TrajectoryLightningModule(L.LightningModule):
         loss_requested = bool(grpo_enabled and grpo_coef > 0.0)
         if not loss_requested and not debug_requested and not aux_requested:
             return loss, metrics
+        objective_key = str(getattr(self.learner_config, "grpo_objective", "logprob")).strip().lower()
+        strict_ratio = objective_key in {"clipped_ratio", "ppo_ratio", "strict_grpo"}
 
         if candidates is None:
+            if strict_ratio:
+                raise RuntimeError(
+                    "Strict clipped-ratio GRPO requires actor-stored counterfactual candidates in replay. "
+                    "Expected replay entries with grpo_candidate_mode_indices, "
+                    "grpo_candidate_old_log_probs, and grpo_candidate_traj_xyyaw."
+                )
             candidate_fn = getattr(self.agent, "sample_counterfactual_trajectories_from_replay_batch", None)
             if not callable(candidate_fn):
                 if not loss_requested:
@@ -169,6 +177,9 @@ class TrajectoryLightningModule(L.LightningModule):
             if timing_parts is not None:
                 timing_parts.setdefault("grpo_sample_s", 0.0)
         candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
+        old_candidate_log_probs = candidates.get("old_log_probs", None)
+        if strict_ratio and old_candidate_log_probs is None:
+            raise RuntimeError("Strict clipped-ratio GRPO requires candidates['old_log_probs']")
         t0 = time.perf_counter()
         candidate_scores = score_counterfactual_trajectories(
             self.agent,
@@ -197,13 +208,15 @@ class TrajectoryLightningModule(L.LightningModule):
             t0 = time.perf_counter()
             grpo_loss = compute_grpo_objective(
                 candidate_log_probs=candidate_log_probs,
+                old_candidate_log_probs=old_candidate_log_probs,
                 candidate_scores=candidate_scores,
                 candidate_score_logits=candidates.get("score_logits", None),
                 score_norm_eps=float(self.learner_config.grpo_norm_eps),
                 use_rank_adv=bool(self.learner_config.grpo_use_rank_adv),
                 score_clip=self.learner_config.grpo_score_clip,
-                objective=str(getattr(self.learner_config, "grpo_objective", "logprob")),
+                objective=objective_key,
                 temperature=float(getattr(self.learner_config, "grpo_temperature", 1.0)),
+                clip_eps=float(self.learner_config.clip_eps),
             )
             objective_s = float(time.perf_counter() - t0)
             if timing_parts is not None:
@@ -217,6 +230,9 @@ class TrajectoryLightningModule(L.LightningModule):
                     "grpo_score_std": grpo_loss.score_std.detach(),
                     "grpo_score_min": grpo_loss.score_min.detach(),
                     "grpo_score_max": grpo_loss.score_max.detach(),
+                    "grpo_approx_kl": grpo_loss.approx_kl.detach(),
+                    "grpo_clip_frac": grpo_loss.clip_frac.detach(),
+                    "grpo_ratio_mean": grpo_loss.ratio_mean.detach(),
                 }
             )
 
@@ -347,6 +363,18 @@ class TrajectoryLightningModule(L.LightningModule):
             raise RuntimeError("train.algo=grpo_only requires train.grpo.enable=true and train.grpo.coef > 0")
 
         zero = torch.zeros((), device=device, dtype=torch.float32)
+        fused_candidates = None
+        fused_fn = getattr(self.agent, "replay_policy_outputs_from_replay_batch", None)
+        if callable(fused_fn):
+            t0 = time.perf_counter()
+            fused_outputs = fused_fn(
+                replay,
+                eta=float(self.learner_config.eta),
+                num_candidates=int(self.learner_config.grpo_num_candidates),
+                candidate_select=str(self.learner_config.grpo_candidate_select),
+            )
+            timing_parts["fused_policy_s"] = float(time.perf_counter() - t0)
+            fused_candidates = fused_outputs.get("counterfactual", None) if isinstance(fused_outputs, dict) else None
         loss, metrics = self._maybe_apply_grpo_loss(
             replay=replay,
             device=device,
@@ -354,6 +382,7 @@ class TrajectoryLightningModule(L.LightningModule):
             loss=zero,
             metrics={},
             timing_parts=timing_parts,
+            candidates=fused_candidates,
         )
         if "grpo_loss" not in metrics:
             raise RuntimeError("train.algo=grpo_only did not produce a GRPO loss")
