@@ -6,7 +6,7 @@ env:
   render_w: 800
   render_h: 450
   use_all_scenes: true
-  scene_sampling: sequential
+  scene_sampling: random
   start_frame:
     mode: zero
     allow_short_tail: false
@@ -168,7 +168,7 @@ env:
         enable: false
       path:
         interp_ds_m: 0.25
-        w_progress: 100.0
+        w_progress: 0.0
         progress_forward_cap_m: 2.0
         progress_backward_cap_m: 0.5
         w_lateral: 0.0
@@ -303,16 +303,6 @@ train:
     reverse_kl_coef: 0.0
     distill_temperature: 1.0
     normalize_advantage: true
-  auxiliary_objectives:
-    risk_decel:
-      enable: false
-      coef: 0.0
-      dt_s: 0.5
-      high_risk_gap_m: 10.0
-      high_risk_ttc_s: 2.5
-      lateral_m: 2.5
-      speed_margin_mps: 0.15
-      eps: 1.0e-06
 agent:
   type: sparsedrive_v2
   ckpt: SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt

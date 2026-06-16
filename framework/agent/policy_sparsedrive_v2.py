@@ -1268,10 +1268,6 @@ class SparseDriveV2Policy(Agent):
                 "this usually means old-format shards are mixed into the current buffer. "
                 f"Bad replay indices: {bad_indices[:8]}"
             )
-        if len(replays) > 1:
-            parts = [self.logp_from_replay_batch([replay], eta=1.0).view(1) for replay in replays]
-            return torch.cat(parts, dim=0)
-
         camera_keys = list(replays[0]["camera_feature"].keys())
         batched_camera = {
             key: torch.cat([rep["camera_feature"][key] for rep in replays], dim=0)
@@ -1714,23 +1710,6 @@ class SparseDriveV2Policy(Agent):
                 "counterfactual": empty_candidates,
             }
 
-        if len(replays) > 1:
-            parts = [
-                self.replay_policy_outputs_from_replay_batch(
-                    [replay],
-                    eta=1.0,
-                    num_candidates=int(num_candidates),
-                    candidate_select=str(candidate_select),
-                )
-                for replay in replays
-            ]
-            return {
-                "new_logp": torch.cat([part["new_logp"].view(-1) for part in parts], dim=0),
-                "counterfactual": self._concat_counterfactual_candidate_batches(
-                    [part["counterfactual"] for part in parts]
-                ),
-            }
-
         batched_dev = self._batched_replay_features(replays)
         model = self._unwrap_model(self._model)
         model.eval()
@@ -1766,11 +1745,16 @@ class SparseDriveV2Policy(Agent):
                     new_logp[missing_idx] = single_outputs["new_logp"].view(())
         logp_all = torch.log_softmax(score_logits, dim=1)
         if all(isinstance(replay, dict) and "grpo_candidate_mode_indices" in replay for replay in replays):
-            new_log_probs_row, score_logits_row = self._strict_grpo_log_probs_and_logits_for_stored_candidates(
-                replays[0],
-                score_logits=score_logits,
-                candidate_global_indices=candidate_identity["candidate_global_indices"],
-            )
+            recovered_rows = [
+                self._strict_grpo_log_probs_and_logits_for_stored_candidates(
+                    replay,
+                    score_logits=score_logits[batch_idx : batch_idx + 1],
+                    candidate_global_indices=candidate_identity["candidate_global_indices"][batch_idx : batch_idx + 1],
+                )
+                for batch_idx, replay in enumerate(replays)
+            ]
+            new_log_probs_row = torch.stack([row[0] for row in recovered_rows], dim=0)
+            score_logits_row = torch.stack([row[1] for row in recovered_rows], dim=0)
             old_candidate_log_probs = self._stored_grpo_candidate_old_log_probs_from_replay(
                 replays,
                 device=score_logits.device,
@@ -1785,10 +1769,10 @@ class SparseDriveV2Policy(Agent):
             )
             counterfactual = {
                 "traj_xyyaw": traj_xyyaw.detach(),
-                "log_probs": new_log_probs_row.view(1, -1),
+                "log_probs": new_log_probs_row,
                 "old_log_probs": old_candidate_log_probs,
                 "mode_indices": mode_indices,
-                "score_logits": score_logits_row.view(1, -1),
+                "score_logits": score_logits_row,
             }
         else:
             counterfactual = self._select_counterfactual_candidates_from_policy_outputs(
