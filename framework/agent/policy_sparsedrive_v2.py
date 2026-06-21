@@ -1268,6 +1268,10 @@ class SparseDriveV2Policy(Agent):
                 "this usually means old-format shards are mixed into the current buffer. "
                 f"Bad replay indices: {bad_indices[:8]}"
             )
+        if len(replays) > 1:
+            parts = [self.logp_from_replay_batch([replay], eta=1.0).view(1) for replay in replays]
+            return torch.cat(parts, dim=0)
+
         camera_keys = list(replays[0]["camera_feature"].keys())
         batched_camera = {
             key: torch.cat([rep["camera_feature"][key] for rep in replays], dim=0)
@@ -1708,6 +1712,23 @@ class SparseDriveV2Policy(Agent):
             return {
                 "new_logp": torch.empty((0,), device=self.device, dtype=torch.float32),
                 "counterfactual": empty_candidates,
+            }
+
+        if len(replays) > 1:
+            parts = [
+                self.replay_policy_outputs_from_replay_batch(
+                    [replay],
+                    eta=1.0,
+                    num_candidates=int(num_candidates),
+                    candidate_select=str(candidate_select),
+                )
+                for replay in replays
+            ]
+            return {
+                "new_logp": torch.cat([part["new_logp"].view(-1) for part in parts], dim=0),
+                "counterfactual": self._concat_counterfactual_candidate_batches(
+                    [part["counterfactual"] for part in parts]
+                ),
             }
 
         batched_dev = self._batched_replay_features(replays)

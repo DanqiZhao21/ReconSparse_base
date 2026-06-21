@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -106,10 +107,17 @@ def _safe_name(text: str) -> str:
 
 
 def build_run_tags(*, config: dict[str, Any], algo_tag: str) -> list[str]:
-    train_cfg = config.get("train", {}) or {}
-    env_cfg = config.get("env", {}) or {}
+    normalized_config = copy.deepcopy(config)
+    try:
+        from framework.runner.config_normalization import normalize_train_algorithm_cfg
+
+        normalize_train_algorithm_cfg(normalized_config)
+    except Exception:
+        normalized_config = config
+
+    train_cfg = normalized_config.get("train", {}) or {}
+    env_cfg = normalized_config.get("env", {}) or {}
     reward_cfg = env_cfg.get("reward", {}) or {}
-    agent_cfg = config.get("agent", {}) or {}
     tags: list[str] = []
 
     craft_cfg = train_cfg.get("CRAFT", {}) or {}
@@ -131,7 +139,9 @@ def build_run_tags(*, config: dict[str, Any], algo_tag: str) -> list[str]:
     grpo_enabled = bool(grpo_cfg.get("enable", False)) and float(grpo_cfg.get("coef", 1.0) or 0.0) != 0.0
     tags.append("GRPO" if grpo_enabled else "NoGRPO")
 
-    scorer_cfg = agent_cfg.get("nuscenes_scorer", {}) or {}
+    scorer_cfg = grpo_cfg.get("scorer", {}) or {}
+    if not isinstance(scorer_cfg, dict):
+        scorer_cfg = {}
     if bool(scorer_cfg.get("ea_gate_enabled", False)) or "ea" in str(algo_tag).lower():
         tags.append("EA")
 

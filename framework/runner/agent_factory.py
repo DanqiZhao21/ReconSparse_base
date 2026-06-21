@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 import torch
 
+from framework.runner.config_normalization import normalize_train_algorithm_cfg
 from framework.utils.repo_paths import resolve_ego_ads_subdir, resolve_repo_path
 
 
@@ -16,6 +17,7 @@ def _normalize_policy_execute_mode(mode: Any) -> str:
 
 
 def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
+    normalize_train_algorithm_cfg(cfg)
     train_cfg = cfg.get("train", {}) or {}
     agent_cfg = cfg.get("agent", {}) or {}
     agent_type = str(agent_cfg.get("type", "ddv2")).strip().lower().replace("-", "_")
@@ -59,10 +61,10 @@ def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
 
         trainable_prefixes = agent_cfg.get("trainable_prefixes", [])
         frozen_prefixes = agent_cfg.get("frozen_prefixes", [])
-        nuscenes_scorer_config = dict(agent_cfg.get("nuscenes_scorer", {}) or {})
         grpo_cfg = train_cfg.get("grpo", {}) or {}
         if not isinstance(grpo_cfg, dict):
             grpo_cfg = {}
+        nuscenes_scorer_config = dict(grpo_cfg.get("scorer", {}) or {})
         for key in ("scene_cache_root", "agent_state_cache_root", "ea_project_src", "nuscenes_dataroot"):
             if key in nuscenes_scorer_config and nuscenes_scorer_config[key] is not None:
                 nuscenes_scorer_config[key] = str(resolve_repo_path(str(nuscenes_scorer_config[key])))

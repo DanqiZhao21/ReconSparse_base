@@ -9,6 +9,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from framework.algorithms.ppo import PPO
 from framework.algorithms.reinforcepp import ReinforcePP
 from framework.algorithms.sac import SAC
+from framework.runner.config_normalization import closed_loop_algorithm_configs, normalize_train_algorithm_cfg
 from framework.utils.repo_paths import resolve_repo_path
 
 
@@ -79,6 +80,7 @@ def build_algorithm_bundle(
     rank: int,
     process_group: Any | None = None,
 ) -> tuple[Any, Any | None, Dict[str, Any]]:
+    normalize_train_algorithm_cfg(cfg)
     train_cfg = cfg.get("train", {}) or {}
     algo_key = str(train_cfg.get("algo", "ppo")).strip().lower()
     if algo_key in {"reinforce++", "reinforce_pp", "reinforce_clip"}:
@@ -91,14 +93,12 @@ def build_algorithm_bundle(
     clip_eps = float(train_cfg.get("clip_eps", 0.2))
     ppo_epochs = int(train_cfg.get("epochs", 2))
     vf_coef = float(train_cfg.get("vf_coef", 0.5))
-    value_clip_eps = float((train_cfg.get("ppo", {}) or {}).get("value_clip_eps", 0.0))
     eta = float(train_cfg.get("eta", 1.0))
     replay_mode_idx = int(train_cfg.get("mode_idx", -1))
     ddp_seed = int(((train_cfg.get("ddp", {}) or {}).get("seed", 0)))
     grad_accum_steps = int(((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))
-    rpp_cfg = (train_cfg.get("reinforcepp", {}) or {})
-    ppo_cfg = (train_cfg.get("ppo", {}) or {})
-    sac_cfg = (train_cfg.get("sac", {}) or {})
+    rpp_cfg, ppo_cfg, sac_cfg = closed_loop_algorithm_configs(train_cfg)
+    value_clip_eps = float(ppo_cfg.get("value_clip_eps", 0.0))
     policy_lr = _resolve_policy_lr(train_cfg, agent)
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 

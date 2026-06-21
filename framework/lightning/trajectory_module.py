@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Dict
@@ -469,7 +470,35 @@ class TrajectoryLightningModule(L.LightningModule):
         out["timed_minibatches"] = float(self._update_metric_steps)
         return out
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
+    @staticmethod
+    def _build_lr_lambda(
+        *,
+        kind: str,
+        warmup_updates: int,
+        total_updates: int,
+        min_lr_scale: float,
+    ) -> Any:
+        scheduler_kind = str(kind).strip().lower()
+        warmup = max(0, int(warmup_updates))
+        total = max(1, int(total_updates))
+        min_scale = max(0.0, min(1.0, float(min_lr_scale)))
+
+        if scheduler_kind not in {"linear_warmup_cosine_decay", "warmup_cosine", "cosine"}:
+            raise ValueError(f"Unsupported lr scheduler kind: {kind}")
+
+        def _lr_lambda(step: int) -> float:
+            step_i = max(0, int(step))
+            if warmup > 0 and step_i < warmup:
+                return float((step_i + 1) / warmup)
+            if total <= warmup:
+                return float(min_scale)
+            progress = min(1.0, max(0.0, float(step_i - warmup + 1) / float(total - warmup)))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return float(min_scale + (1.0 - min_scale) * cosine)
+
+        return _lr_lambda
+
+    def configure_optimizers(self) -> Any:
         policy_params = _trainable_parameters(self.policy_module or self.agent)
         if len(policy_params) == 0:
             raise RuntimeError("No trainable policy parameters found for learner optimizer setup")
@@ -499,7 +528,25 @@ class TrajectoryLightningModule(L.LightningModule):
                 }
             )
 
-        return torch.optim.Adam(param_groups)
+        optimizer = torch.optim.Adam(param_groups)
+        if not bool(self.learner_config.lr_scheduler_enabled):
+            return optimizer
+
+        lr_lambda = self._build_lr_lambda(
+            kind=str(self.learner_config.lr_scheduler_kind),
+            warmup_updates=int(self.learner_config.lr_warmup_updates),
+            total_updates=int(self.learner_config.lr_total_updates or self.learner_config.max_updates),
+            min_lr_scale=float(self.learner_config.lr_min_scale),
+        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         try:

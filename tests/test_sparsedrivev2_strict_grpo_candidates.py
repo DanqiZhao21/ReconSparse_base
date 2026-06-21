@@ -70,7 +70,7 @@ def test_score_logits_for_stored_grpo_candidates_gathers_by_global_index() -> No
     assert torch.equal(selected_logits, torch.tensor([[3.0, 0.0]], dtype=torch.float32))
 
 
-def test_logp_from_replay_batch_uses_one_true_batch_forward(monkeypatch) -> None:
+def test_logp_from_replay_batch_uses_single_loop_for_multiple_replays(monkeypatch) -> None:
     policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
     policy._device_override = "cpu"
     policy._model = _EvalOnlyModel()
@@ -118,11 +118,11 @@ def test_logp_from_replay_batch_uses_one_true_batch_forward(monkeypatch) -> None
         torch.tensor([[0.0, 3.0, 1.0], [2.0, -1.0, 4.0]], dtype=torch.float32),
         dim=1,
     )[torch.arange(2), torch.tensor([1, 1])]
-    assert forward_batch_sizes == [2]
+    assert forward_batch_sizes == [1, 1]
     assert torch.allclose(logp, expected)
 
 
-def test_logp_from_replay_batch_falls_back_only_for_missing_targets(monkeypatch) -> None:
+def test_logp_from_replay_batch_falls_back_single_replays(monkeypatch) -> None:
     policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
     policy._device_override = "cpu"
     policy._model = _EvalOnlyModel()
@@ -148,12 +148,12 @@ def test_logp_from_replay_batch_falls_back_only_for_missing_targets(monkeypatch)
     def fake_forward(features):
         status = features["status_feature"].view(-1).to(dtype=torch.long)
         forward_batch_sizes.append(int(status.numel()))
-        if int(status.numel()) == 2:
+        assert int(status.numel()) == 1
+        if int(status.item()) == 0:
             return {
-                "candidate_scores": torch.tensor([[0.0, 3.0, 1.0], [2.0, -1.0, 4.0]], dtype=torch.float32),
-                "candidate_global_indices": torch.tensor([[10, 11, 12], [20, 99, 22]], dtype=torch.long),
+                "candidate_scores": torch.tensor([[0.0, 3.0, 1.0]], dtype=torch.float32),
+                "candidate_global_indices": torch.tensor([[10, 11, 12]], dtype=torch.long),
             }
-        assert int(status.item()) == 1
         return {
             "candidate_scores": torch.tensor([[2.0, -1.0, 4.0]], dtype=torch.float32),
             "candidate_global_indices": torch.tensor([[20, 21, 22]], dtype=torch.long),
@@ -170,13 +170,15 @@ def test_logp_from_replay_batch_falls_back_only_for_missing_targets(monkeypatch)
 
     logp = policy.logp_from_replay_batch(replays)
 
-    expected_first = torch.log_softmax(torch.tensor([[0.0, 3.0, 1.0]], dtype=torch.float32), dim=1)[0, 1]
-    expected_second = torch.log_softmax(torch.tensor([[2.0, -1.0, 4.0]], dtype=torch.float32), dim=1)[0, 1]
-    assert forward_batch_sizes == [2, 1]
-    assert torch.allclose(logp, torch.stack([expected_first, expected_second]))
+    expected = torch.log_softmax(
+        torch.tensor([[0.0, 3.0, 1.0], [2.0, -1.0, 4.0]], dtype=torch.float32),
+        dim=1,
+    )[torch.arange(2), torch.tensor([1, 1])]
+    assert forward_batch_sizes == [1, 1]
+    assert torch.allclose(logp, expected)
 
 
-def test_replay_policy_outputs_strict_grpo_uses_batch_stored_candidates(monkeypatch) -> None:
+def test_replay_policy_outputs_strict_grpo_uses_single_loop(monkeypatch) -> None:
     policy = SparseDriveV2Policy.__new__(SparseDriveV2Policy)
     policy._device_override = "cpu"
     policy._model = _EvalOnlyModel()
@@ -237,7 +239,7 @@ def test_replay_policy_outputs_strict_grpo_uses_batch_stored_candidates(monkeypa
         torch.tensor([[0.0, 3.0, 1.0], [2.0, -1.0, 4.0]], dtype=torch.float32),
         dim=1,
     )
-    assert forward_batch_sizes == [2]
+    assert forward_batch_sizes == [1, 1]
     assert torch.allclose(outputs["new_logp"], expected_logp_all[torch.arange(2), torch.tensor([1, 1])])
-    assert torch.allclose(outputs["counterfactual"]["log_probs"], expected_logp_all[:, [1, 2]])
+    assert torch.allclose(outputs["counterfactual"]["log_probs"], torch.stack([expected_logp_all[0, [1, 2]], expected_logp_all[1, [1, 2]]]))
     assert torch.equal(outputs["counterfactual"]["score_logits"], torch.tensor([[3.0, 1.0], [-1.0, 4.0]]))

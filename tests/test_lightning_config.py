@@ -6,6 +6,7 @@ from framework.lightning.config import (
     actor_learner_lightning_config_from_algorithm,
     trainer_kwargs_from_learner_config,
 )
+from framework.lightning.trajectory_module import TrajectoryLightningModule
 
 
 def _build_learner_config() -> ActorLearnerLightningConfig:
@@ -103,8 +104,10 @@ def test_actor_learner_config_reads_reinforcepp_advantage_normalization_flag() -
         _Algo(),
         train_cfg={
             "gamma": 0.99,
-            "reinforcepp": {
-                "normalize_advantage": False,
+            "closed_loop": {
+                "reinforcepp": {
+                    "normalize_advantage": False,
+                },
             },
         },
         actor_learner_cfg={},
@@ -164,3 +167,45 @@ def test_actor_learner_config_reads_debug_retention_options() -> None:
     assert cfg.debug_retain_versions == 5
     assert cfg.debug_retain_ckpts is True
     assert cfg.debug_retain_shards is True
+
+
+def test_actor_learner_config_reads_lr_scheduler_options() -> None:
+    class _Algo:
+        eta = 1.0
+        clip_eps = 0.2
+        minibatch_size = 4
+
+    cfg = actor_learner_lightning_config_from_algorithm(
+        _Algo(),
+        train_cfg={
+            "gamma": 0.99,
+            "lr_scheduler": {
+                "enable": True,
+                "kind": "linear_warmup_cosine_decay",
+                "warmup_updates": 4,
+                "total_updates": 32,
+                "min_lr_scale": 0.1,
+            },
+        },
+        actor_learner_cfg={"mode": "async", "max_updates": 32},
+        algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2},
+    )
+
+    assert cfg.lr_scheduler_enabled is True
+    assert cfg.lr_scheduler_kind == "linear_warmup_cosine_decay"
+    assert cfg.lr_warmup_updates == 4
+    assert cfg.lr_total_updates == 32
+    assert cfg.lr_min_scale == 0.1
+
+
+def test_lr_scheduler_uses_linear_warmup_then_cosine_decay() -> None:
+    scheduler = TrajectoryLightningModule._build_lr_lambda(
+        kind="linear_warmup_cosine_decay",
+        warmup_updates=4,
+        total_updates=32,
+        min_lr_scale=0.1,
+    )
+
+    assert scheduler(0) == 0.25
+    assert scheduler(3) == 1.0
+    assert scheduler(31) == 0.1

@@ -93,14 +93,16 @@ def test_missing_shared_grpo_disables_grpo_without_legacy_backfill() -> None:
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "minibatch_size": 4,
-        "reinforcepp": {
-            "norm_eps": 1.0e-8,
-            "kl_coef": 0.0,
-            "epochs": 1,
-            "policy_grad_weight": 0.5,
-            "forward_kl_coef": 0.0,
-            "reverse_kl_coef": 0.0,
-            "distill_temperature": 1.0,
+        "closed_loop": {
+            "reinforcepp": {
+                "norm_eps": 1.0e-8,
+                "kl_coef": 0.0,
+                "epochs": 1,
+                "policy_grad_weight": 0.5,
+                "forward_kl_coef": 0.0,
+                "reverse_kl_coef": 0.0,
+                "distill_temperature": 1.0,
+            },
         },
     }
 
@@ -179,11 +181,13 @@ def test_sac_algorithm_builds_policy_only_learner_config() -> None:
             "clip_eps": 0.2,
             "minibatch_size": 8,
             "actor_learner": {"mode": "async", "num_actors": 1, "shards_per_update": 1},
-            "sac": {
-                "entropy_coef": 0.02,
-                "kl_coef": 0.03,
-                "epochs": 2,
-                "norm_eps": 1.0e-7,
+            "closed_loop": {
+                "sac": {
+                    "entropy_coef": 0.02,
+                    "kl_coef": 0.03,
+                    "epochs": 2,
+                    "norm_eps": 1.0e-7,
+                },
             },
         }
     }
@@ -258,7 +262,8 @@ def test_auxiliary_risk_decel_config_is_respected() -> None:
         ddp_seed=0,
     )
     train_cfg = {
-        "auxiliary_objectives": {
+        "auxiliary": {
+            "enable": True,
             "risk_decel": {
                 "enable": True,
                 "coef": 0.7,
@@ -303,7 +308,7 @@ def test_reinforcepp_policy_grad_weight_sets_closed_loop_loss_coef() -> None:
         ddp_seed=0,
     )
     train_cfg = {
-        "reinforcepp": {"policy_grad_weight": 0.5},
+        "closed_loop": {"reinforcepp": {"policy_grad_weight": 0.5}},
         "grpo": {"enable": True, "coef": 1.0, "num_candidates": 4},
     }
 

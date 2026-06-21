@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from framework.runner.config_normalization import closed_loop_algorithm_configs
+
 
 @dataclass(frozen=True)
 class LearnerOptimizerConfig:
@@ -72,9 +74,27 @@ class ActorLearnerLightningConfig:
     accumulate_grad_batches: int = 1
     gradient_clip_val: float = 0.0
     max_updates: int = 0
+    lr_scheduler_enabled: bool = False
+    lr_scheduler_kind: str = "constant"
+    lr_warmup_updates: int = 0
+    lr_total_updates: int = 0
+    lr_min_scale: float = 1.0
     debug_retain_versions: int = 0
     debug_retain_ckpts: bool = False
     debug_retain_shards: bool = False
+
+
+def resolve_lr_scheduler_config(train_cfg: Dict[str, Any], actor_learner_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    sched_cfg = train_cfg.get("lr_scheduler", {}) or {}
+    if not isinstance(sched_cfg, dict):
+        sched_cfg = {}
+    return {
+        "enabled": bool(sched_cfg.get("enable", False)),
+        "kind": str(sched_cfg.get("kind", "constant")),
+        "warmup_updates": int(sched_cfg.get("warmup_updates", 0) or 0),
+        "total_updates": int(sched_cfg.get("total_updates", actor_learner_cfg.get("max_updates", 0)) or 0),
+        "min_scale": float(sched_cfg.get("min_lr_scale", sched_cfg.get("min_scale", 1.0))),
+    }
 
 
 def optimizer_config_from_algorithm(algo: Any, train_cfg: Dict[str, Any]) -> LearnerOptimizerConfig:
@@ -118,14 +138,14 @@ def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_auxiliary_objectives_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    aux_cfg = train_cfg.get("auxiliary_objectives", {}) or {}
+    aux_cfg = train_cfg.get("auxiliary", {}) or {}
     if not isinstance(aux_cfg, dict):
         aux_cfg = {}
     risk_cfg = aux_cfg.get("risk_decel", {}) or {}
     if not isinstance(risk_cfg, dict):
         risk_cfg = {}
 
-    enabled = bool(risk_cfg.get("enable", False))
+    enabled = bool(aux_cfg.get("enable", False)) and bool(risk_cfg.get("enable", False))
     coef = float(risk_cfg.get("coef", 0.0))
     if not enabled:
         coef = 0.0
@@ -151,9 +171,8 @@ def actor_learner_lightning_config_from_algorithm(
     algo_kind = str(algo_meta.get("algo_key", getattr(algo, "variant", "ppo")))
     grpo_cfg = resolve_grpo_config(train_cfg)
     aux_cfg = resolve_auxiliary_objectives_config(train_cfg)
-    sac_cfg = train_cfg.get("sac", {}) or {}
-    if not isinstance(sac_cfg, dict):
-        sac_cfg = {}
+    lr_scheduler_cfg = resolve_lr_scheduler_config(train_cfg, actor_learner_cfg)
+    rpp_cfg, _ppo_cfg, sac_cfg = closed_loop_algorithm_configs(train_cfg)
     raw_max_shard_version_lag = actor_learner_cfg.get("max_shard_version_lag", 2)
     raw_max_updates = actor_learner_cfg.get("max_updates", train_cfg.get("updates", 50))
     shard_collect_timeout_s = float(actor_learner_cfg.get("shard_collect_timeout_s", 0.0) or 0.0)
@@ -191,7 +210,7 @@ def actor_learner_lightning_config_from_algorithm(
         kl_coef=float(getattr(algo, "kl_coef", 0.0)),
         sac_entropy_coef=float(getattr(algo, "entropy_coef", sac_cfg.get("entropy_coef", 0.0))),
         closed_loop_loss_coef=float(
-            (train_cfg.get("reinforcepp", {}) or {}).get(
+            rpp_cfg.get(
                 "policy_grad_weight",
                 sac_cfg.get("policy_grad_weight", 1.0),
             )
@@ -241,13 +260,18 @@ def actor_learner_lightning_config_from_algorithm(
         actor_shard_stall_timeout_s=float(actor_learner_cfg.get("actor_shard_stall_timeout_s", 0.0) or 0.0),
         max_shard_version_lag=int(raw_max_shard_version_lag),
         norm_eps=float(algo_meta.get("rpp_norm_eps", 1e-8)),
-        normalize_advantage=bool((train_cfg.get("reinforcepp", {}) or {}).get("normalize_advantage", True)),
+        normalize_advantage=bool(rpp_cfg.get("normalize_advantage", True)),
         inner_epochs=max(1, int(inner_epochs)),
         accumulate_grad_batches=int(
             getattr(algo, "grad_accum_steps", ((train_cfg.get("ddp", {}) or {}).get("grad_accum_steps", 1)))
         ),
         gradient_clip_val=float(getattr(algo, "max_grad_norm", train_cfg.get("max_grad_norm", 0.0))),
         max_updates=int(raw_max_updates or 0),
+        lr_scheduler_enabled=bool(lr_scheduler_cfg["enabled"]),
+        lr_scheduler_kind=str(lr_scheduler_cfg["kind"]),
+        lr_warmup_updates=int(lr_scheduler_cfg["warmup_updates"]),
+        lr_total_updates=int(lr_scheduler_cfg["total_updates"]),
+        lr_min_scale=float(lr_scheduler_cfg["min_scale"]),
         debug_retain_versions=max(0, int(debug_retain_versions)),
         debug_retain_ckpts=bool(
             actor_learner_cfg.get("debug_retain_ckpts", bool(int(debug_retain_versions) > 0))
@@ -294,6 +318,7 @@ __all__ = [
     "LearnerOptimizerConfig",
     "actor_learner_lightning_config_from_algorithm",
     "optimizer_config_from_algorithm",
+    "resolve_auxiliary_objectives_config",
     "resolve_grpo_config",
     "trainer_kwargs_from_learner_config",
 ]
