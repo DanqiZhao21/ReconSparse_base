@@ -12,12 +12,22 @@ actor -> rollout -> shard buffer -> learner -> checkpoint/version publish -> act
 
 ## 🧭 Overview & Architecture
 
-ReconDreamer-RL 的训练框架围绕四个核心对象展开：
+ReconDreamer-RL 的 actor-learner 训练框架可以从两层理解：运行角色和功能组件。
 
-- **Agent**：把 DiffusionDriveV2、SparseDrive、SparseDriveV2 等策略模型封装成统一 RL 接口。
-- **Environment**：把 Recon / HUGSIM 闭环仿真包装成 actor 可调用的 `reset` / `step` 接口。
+运行角色描述的是实际启动的进程：
+
+- **Orchestrator**：主控进程，负责启动和管理 learner 与多个 actor 子进程。
+- **Actor**：采样进程，持有一个 Agent 权重副本，与 Environment 交互，收集 rollout 并写入 shard。
+- **Learner**：训练进程，持有可训练的 Agent，从 Shard Buffer 读取数据，执行策略更新并发布新权重。
+
+功能组件描述的是训练链路中的职责边界：
+
+- **Agent**：把 DiffusionDriveV2、SparseDrive、SparseDriveV2 等策略模型封装成统一 RL 接口，负责动作采样、replay 保存、log-prob 重算和 checkpoint IO。
+- **Environment**：把 Recon / HUGSIM 闭环仿真包装成 actor 可调用的 `reset` / `step` 接口，并接入 reward 与终止逻辑。
 - **Shard Buffer**：actor 将采样轨迹写成 shard，learner 从文件缓冲区读取并消费。
-- **Learner**：通过 PyTorch Lightning 执行策略更新，并发布新 checkpoint 与 version。
+- **Learner Training Stack**：通过 batch 构建、LightningModule 和 policy objective 执行策略更新，并发布 `weights/latest.ckpt` 与 `weights/version.txt`。
+
+因此，actor 和 learner 都会使用 Agent，但它们不是 Agent 本身：Agent 是策略模型接口，actor 是使用 Agent 采样的运行角色，learner 是使用 Agent 训练和发布权重的运行角色。
 
 整体数据流如下：
 
@@ -176,9 +186,9 @@ Learner 侧 batch 构建层。把 shard 转换成训练 batch，负责 return、
 
 ### [`algorithms/`](algorithms/README.md)
 
-算法目标函数与规格描述层。提供 PPO、ReinforcePP、SAC-style 的配置对象和 trajectory policy objective，不直接负责启动 Trainer。
+算法目标函数、规格描述与 GRPO scorer 层。提供 PPO、ReinforcePP、SAC-style 的配置对象和 trajectory / GRPO objective，并承载 NuScenes PDM / CRAFT 等 counterfactual scorer，不直接负责启动 Trainer。
 
-关键文件：`ppo.py`、`reinforcepp.py`、`sac.py`、`trajectory_policy_core.py`。
+关键文件：`ppo.py`、`reinforcepp.py`、`sac.py`、`trajectory_policy_core.py`、`nuscenes_pdm_scorer.py`、`nuscenes_craft_scorer.py`、`nuscenes_scorer_utils.py`。
 
 ### [`lightning/`](lightning/README.md)
 

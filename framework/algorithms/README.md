@@ -1,13 +1,14 @@
 # framework/algorithms
 
-这个目录负责 **算法目标函数与算法配置描述**。它是 learner 链路里的 objective/config 层，不负责直接运行 Trainer。
+这个目录负责 **算法目标函数、算法配置描述与 GRPO counterfactual scorer**。它是 learner 链路里的 objective/config/scorer 层，不负责直接运行 Trainer。
 
 ## 目录职责
 
 - 从 batch 模块拿到已经整理好的 obs、adv、ret、old_logp、replay。
 - 调用 agent 的 replay 接口，重算当前策略下的 logp。
-- 计算 PPO 或 ReinforcePP 的目标函数、裁剪项、价值损失和统计指标。
+- 计算 PPO、ReinforcePP、SAC-style 或 GRPO 的目标函数、裁剪项、价值损失和统计指标。
 - 提供 PPO/ReinforcePP/SAC 规格对象（裁剪系数、优化超参数、梯度与采样相关参数）给 learner runtime 使用。
+- 承载 NuScenes PDM、CRAFT/CARL 等 GRPO counterfactual scorer 及其共享工具。
 
 不属于这个目录的职责：
 

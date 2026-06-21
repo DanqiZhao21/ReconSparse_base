@@ -20,17 +20,27 @@ actor -> rollout -> shard buffer -> learner -> checkpoint/version publish -> act
 - **Actor-learner training**：actor 负责 rollout 收集形成 buffer，learner 负责从 shard buffer 读取数据并更新权重。
 - **Multiple Ego-car Policy backends**：支持 SparseDriveV2 以及大部分 E2E 自动驾驶系统。
 - **Multiple RL Algorithms**：支持 PPO、ReinforcePP 、SAC 以及自行扩展新的强化学习算法。
-- **Multiple 3DGS assets **：支持 HUGSIM-ORI、Recondreamer 提供的 3DGS 场景资产进行闭环训练与评估。
+- **Multiple 3DGS assets**：支持 HUGSIM-ORI、Recondreamer 提供的 3DGS 场景资产进行闭环训练与评估。
 - **Lightning learner**：使用 PyTorch Lightning 管理 learner 训练步。
 
 ## 🧭 Architecture
 
-ReconDreamer-RL 的训练框架由四个核心对象组成：
+ReconDreamer-RL 的 actor-learner 训练框架可以从两层理解：运行角色和功能组件。
 
-- **Agent**：把具体自动驾驶策略模型封装成统一 RL 接口，负责动作采样、shard replay 保存、log-prob 重算。
+运行角色描述的是实际启动的进程：
+
+- **Orchestrator**：主控进程，负责启动和管理 learner 与多个 actor 子进程。
+- **Actor**：采样进程，持有一个 Agent 权重副本，与 Environment 交互，收集 rollout 并写入 shard。
+- **Learner**：训练进程，持有可训练的 Agent，从 Shard Buffer 读取数据，执行策略更新并发布新权重。
+
+功能组件描述的是训练链路中的职责边界：
+
+- **Agent**：把具体自动驾驶策略模型封装成统一 RL 接口，负责动作采样、shard replay 保存、log-prob 重算和 checkpoint IO。
 - **Environment**：把 3DGS 仿真环境包装成 actor 可调用的 `reset` / `step` 接口，并接入自定义 reward 环境奖励与惩罚。
 - **Shard Buffer**：actor 将采样轨迹写入文件缓冲区，learner 从中选择 shard 并构建 training batch 展开训练。
-- **Learner**：执行策略更新，保存 `weights/latest.ckpt`,同步更新 `weights/version.txt`。
+- **Learner Training Stack**：执行策略更新，保存 `weights/latest.ckpt`，同步更新 `weights/version.txt`。
+
+因此，actor 和 learner 都会使用 Agent，但它们不是 Agent 本身：Agent 是策略模型接口，actor 是使用 Agent 采样的运行角色，learner 是使用 Agent 训练和发布权重的运行角色。
 
 主链路如下：
 
@@ -53,7 +63,7 @@ script/train_actor_learner_v2.py
 
 ## 🧩 Environment & Assets
 
-`HUGSIM-ORI` 是独立仓库，不是本仓库的 Git submodule，也不应该作为 `ReconDreamer-RL` 的子目录提交。
+`HUGSIM-ORI` 是独立仓库，环境配置复杂，不应该作为 `ReconDreamer-RL` 的子目录。环境与自车算法之间通过 FIFO 进行交互。
 
 推荐保持两个仓库并列：
 
@@ -62,7 +72,7 @@ script/train_actor_learner_v2.py
 /root/clone/HUGSIM-ORI
 ```
 
-ReconDreamer-RL 默认从 `/root/clone/HUGSIM-ORI` 读取 HUGSIM 代码和配置。需要改路径时设置：
+ReconDreamer-RL 默认从 `/root/clone/HUGSIM-ORI` 读取 HUGSIM 代码和配置。需要改默认根目录时可以设置：
 
 ```bash
 export HUGSIM_ROOT=/path/to/HUGSIM-ORI
@@ -70,22 +80,64 @@ export HUGSIM_ROOT=/path/to/HUGSIM-ORI
 
 HUGSIM 自己的运行环境仍由 HUGSIM-ORI 仓库管理。当前 FIFO 后端会在 HUGSIM-ORI 目录下执行 `pixi run python ...`，本仓库只负责调度、采样、训练和评估。
 
-评估视频等output请自行创建软连接。常见本地入口包括：
+### 本地数据入口和软链接
+
+数据集、3DGS assets、评估视频和训练输出请在本机自行创建软链接，常见入口包括：
 
 - `assets/`：ReconDreamer-RL 侧数据入口，指向共享盘或数据盘的软链接。
 - `outputs/`：训练、评估和可视化输出入口，通常也是软链接。
+- `HUGSIM-ORI/configs/scenarios`：HUGSIM 场景 YAML 目录入口。
+- `HUGSIM-ORI/outputs`：HUGSIM 评估、渲染和视频输出入口。
+
+当前机器上的常见软链接示例：
+
+```bash
+ln -s /OpenDataset/HUGSIM_data/scenarios /root/clone/HUGSIM-ORI/configs/scenarios
+ln -s /OpenDataset/zhaodanqi/HUGSIM_data/outputs /root/clone/HUGSIM-ORI/outputs
+ln -s /OpenDataset/ReconDreamer-RL/outputs /root/clone/ReconDreamer-RL/outputs
+```
+
+
+
+### HUGSIM 路径配置位置
+
+软链接只是本机数据接入方式；训练时真正生效的路径来自启动命令 `--config` 指向的 YAML。入口脚本会读取：
+
+```bash
+PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
+  --role orchestrator \
+  --config script/configs/sparsedrive_v2/xxx.yaml
+```
+
+HUGSIM 相关路径主要配置在该 YAML 的 `env.hugsim` 下，例如：
+
+```yaml
+env:
+  backend: hugsim_ori
+  hugsim:
+    repo: /root/clone/HUGSIM-ORI
+    scenario_dir: /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes
+    base_path: /root/clone/HUGSIM-ORI/configs/sim/nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml
+    camera_path: /root/clone/HUGSIM-ORI/configs/sim/nuscenes_camera.yaml
+    kinematic_path: /root/clone/HUGSIM-ORI/configs/sim/kinematic.yaml
+    model_base: /OpenDataset/HUGSIM_data/scenes/nuscenes
+    output_root: outputs/hugsim_rl
+    recon_data_root: /root/clone/ReconDreamer-RL/assets/nus/data
+    nuscenes_root: /root/clone/ReconDreamer-RL/assets/nuscenes/v1.0-trainval
+    frame2token_dir: /root/clone/ReconDreamer-RL/assets/nus/information/frame2token
+```
+
+其中：
+
+- `env.hugsim.repo`：HUGSIM-ORI 仓库路径。
 - `env.hugsim.scenario_dir`：HUGSIM 场景 YAML 目录。
 - `env.hugsim.model_base`：HUGSIM / 3DGS 场景资产根目录。
 - `env.hugsim.nuscenes_root`：nuScenes 数据路径。
 - `env.hugsim.frame2token_dir`：frame 到 nuScenes token 的索引路径。
 - `env.hugsim.recon_data_root`：ReconDreamer 侧重建数据路径。
+- `env.hugsim.output_root`：HUGSIM FIFO 运行过程中的输出目录，通常放在 `outputs/` 下。
 
-常见 HUGSIM 本地数据软链接示例：
-
-```bash
-ln -s /OpenDataset/HUGSIM_data/scenarios /root/clone/HUGSIM-ORI/configs/scenarios
-ln -s /OpenDataset/zhaodanqi/HUGSIM_data/outputs /root/clone/HUGSIM-ORI/outputs
-```
+如果 YAML 中没有显式配置某些字段，代码会在 `framework/runner/env_factory.py` 和 `framework/utils/repo_paths.py` 中使用默认值；`HUGSIM_ROOT` 只影响 HUGSIM 相关相对路径和默认 HUGSIM 根目录。
 
 ## ⚡ Quick Start
 
@@ -109,7 +161,7 @@ ls "${HUGSIM_ROOT:-/root/clone/HUGSIM-ORI}/configs/scenarios/nuscenes" | head
 
 ### 2. 启动 actor-learner 训练
 
-使用 `orchestrator` 角色启动训练，它会负责拉起 learner 和多个 actor：
+使用 `orchestrator` 启动训练，它会负责拉起 learner 和多个 actor：
 
 ```bash
 cd /root/clone/ReconDreamer-RL
@@ -184,7 +236,7 @@ outputs/evaluate-auto/
 
 ## ⚙️ Configuration & Runtime Files
 
-训练配置位于 [`script/configs/`](script/configs/)。常见顶层字段包括：
+训练配置位于 [`script/configs/`](script/configs/)。实际运行时以启动命令 `--config` 指向的 YAML 为准；如果需要换数据盘、HUGSIM 仓库或 nuScenes 路径，优先修改当前运行 YAML 的 `env.hugsim.*` 字段。
 
 - `env`：环境后端、最大步数、渲染尺寸、scene sampling、reward 和 HUGSIM 参数。
 - `env.hugsim`：HUGSIM-ORI 路径、scenario、base config、3DGS asset、nuScenes 路径和 FIFO 启动参数。
@@ -200,6 +252,10 @@ env:
     repo: /root/clone/HUGSIM-ORI
     scenario_dir: /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes
     model_base: /OpenDataset/HUGSIM_data/scenes/nuscenes
+    recon_data_root: /root/clone/ReconDreamer-RL/assets/nus/data
+    nuscenes_root: /root/clone/ReconDreamer-RL/assets/nuscenes/v1.0-trainval
+    frame2token_dir: /root/clone/ReconDreamer-RL/assets/nus/information/frame2token
+    output_root: outputs/hugsim_rl
     pixi_cmd: pixi
 ```
 
@@ -237,7 +293,7 @@ TRAINING_LOCK        # learner 更新 / 权重发布阶段的互斥标记
 - [`framework/rollout/`](framework/rollout/README.md)：actor 侧 rollout 采样，并把轨迹打包成 shard。
 - [`framework/io/`](framework/io/README.md)：buffer、shard、STOP、TRAINING_LOCK、权重版本和原子保存。
 - [`framework/batch/`](framework/batch/README.md)：shard 到 training batch 的转换，包含 return、GAE 和 advantage normalization。
-- [`framework/algorithms/`](framework/algorithms/README.md)：PPO、ReinforcePP、SAC-style objective 与算法规格对象。
+- [`framework/algorithms/`](framework/algorithms/README.md)：PPO、ReinforcePP、SAC-style、GRPO objective 与算法规格对象，并包含 NuScenes PDM / CRAFT 等 GRPO counterfactual scorer。
 - [`framework/lightning/`](framework/lightning/README.md)：Lightning datamodule/module、training step、optimizer、checkpoint/version 发布和 WandB 日志。
 - [`framework/rewards/`](framework/rewards/README.md)：path-based tracking reward、collision、comfort 和 terminal penalty。
 - [`framework/rewardmodel/`](framework/rewardmodel/README.md)：结构化 reward / scorer 类型和配置。
@@ -249,7 +305,7 @@ TRAINING_LOCK        # learner 更新 / 权重发布阶段的互斥标记
 
 - **接入新策略模型**：实现 [`framework/agent/base.py`](framework/agent/base.py) 中的 Agent 协议，并在 [`framework/runner/agent_factory.py`](framework/runner/agent_factory.py) 中注册。
 - **添加新 reward**：优先在 [`framework/rewards/`](framework/rewards/README.md) 或 reward 配置中扩展，再由 [`framework/env_wrapper/rl_wrapper.py`](framework/env_wrapper/rl_wrapper.py) 接入。
-- **添加新算法目标**：在 [`framework/algorithms/`](framework/algorithms/README.md) 中定义 objective / spec，并确认 [`framework/lightning/trajectory_module.py`](framework/lightning/trajectory_module.py) 能调用。
+- **添加新算法**：在 [`framework/algorithms/`](framework/algorithms/README.md) 中定义 objective / spec，并确认 [`framework/lightning/trajectory_module.py`](framework/lightning/trajectory_module.py) 能调用。
 - **接入新环境后端**：在 [`framework/env_wrapper/`](framework/env_wrapper/README.md) 中封装 reset / step 语义，并通过 [`framework/runner/env_factory.py`](framework/runner/env_factory.py) 构建。
 - **修改配置字段**：同步检查训练入口、[`framework/runner/config_normalization.py`](framework/runner/config_normalization.py)、相关 factory 和 YAML 示例。
 
@@ -270,7 +326,7 @@ TRAINING_LOCK        # learner 更新 / 权重发布阶段的互斥标记
 - [`framework/env_wrapper/README.md`](framework/env_wrapper/README.md)：Recon / HUGSIM 环境包装。
 - [`framework/io/README.md`](framework/io/README.md)：buffer、shard、权重版本和 STOP 文件协议。
 - [`framework/batch/README.md`](framework/batch/README.md)：shard 到 training batch 的转换。
-- [`framework/algorithms/README.md`](framework/algorithms/README.md)：PPO / ReinforcePP / trajectory objective。
+- [`framework/algorithms/README.md`](framework/algorithms/README.md)：PPO / ReinforcePP / SAC-style / GRPO objective 与 NuScenes scorer。
 - [`framework/lightning/README.md`](framework/lightning/README.md)：Lightning learner 生命周期。
 - [`framework/rewards/README.md`](framework/rewards/README.md)：reward 计算与调试。
 
