@@ -146,10 +146,10 @@ def test_collect_single_env_shard_injects_current_gt_reference_info() -> None:
         store_obs=False,
     )
 
-    assert shard["replay"][0]["gt_sample_token_override"] == "tok-reset"
-    assert shard["replay"][0]["gt_frame_idx_override"] == 10
-    assert shard["replay"][1]["gt_sample_token_override"] == "tok-step-1"
-    assert shard["replay"][1]["gt_frame_idx_override"] == 11
+    assert shard["replay"][0]["grpo"]["scorer"]["gt_sample_token_override"] == "tok-reset"
+    assert shard["replay"][0]["grpo"]["scorer"]["gt_frame_idx_override"] == 10
+    assert shard["replay"][1]["grpo"]["scorer"]["gt_sample_token_override"] == "tok-step-1"
+    assert shard["replay"][1]["grpo"]["scorer"]["gt_frame_idx_override"] == 11
 
 
 def test_collect_single_env_shard_injects_front_obstacle_safety_context() -> None:
@@ -180,10 +180,11 @@ def test_collect_single_env_shard_injects_front_obstacle_safety_context() -> Non
     )
 
     replay = shard["replay"][0]
-    assert replay["front_obstacle_available"] is True
-    assert replay["front_obstacle_gap_m"] == 6.5
-    assert replay["front_obstacle_ttc_s"] == 1.2
-    assert replay["front_obstacle_category"] == "vehicle.car"
+    front_obstacle = replay["aux"]["front_obstacle"]
+    assert front_obstacle["available"] is True
+    assert front_obstacle["gap_m"] == 6.5
+    assert front_obstacle["ttc_s"] == 1.2
+    assert front_obstacle["category"] == "vehicle.car"
 
 
 def test_collect_single_env_shard_can_end_on_done_without_resetting() -> None:
@@ -281,10 +282,10 @@ def test_collect_vector_env_shards_injects_current_gt_reference_info() -> None:
         store_obs=False,
     )
 
-    assert shards[0]["replay"][0]["gt_sample_token_override"] == "tok-a-reset"
-    assert shards[0]["replay"][1]["gt_sample_token_override"] == "tok-a-step-1"
-    assert shards[1]["replay"][0]["gt_sample_token_override"] == "tok-b-reset"
-    assert shards[1]["replay"][1]["gt_sample_token_override"] == "tok-b-step-1"
+    assert shards[0]["replay"][0]["grpo"]["scorer"]["gt_sample_token_override"] == "tok-a-reset"
+    assert shards[0]["replay"][1]["grpo"]["scorer"]["gt_sample_token_override"] == "tok-a-step-1"
+    assert shards[1]["replay"][0]["grpo"]["scorer"]["gt_sample_token_override"] == "tok-b-reset"
+    assert shards[1]["replay"][1]["grpo"]["scorer"]["gt_sample_token_override"] == "tok-b-step-1"
 
 
 def test_replay_feature_ppo_batch_accepts_shard_without_obs(tmp_path: Path) -> None:

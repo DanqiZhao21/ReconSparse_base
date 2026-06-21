@@ -10,36 +10,7 @@ from framework.algorithms.trajectory_policy_core import (
 )
 
 
-def test_grpo_logprob_objective_remains_default() -> None:
-    log_probs = torch.log_softmax(torch.tensor([[1.0, 0.0, -1.0]], dtype=torch.float32), dim=1)
-    scores = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
-
-    loss = compute_grpo_objective(candidate_log_probs=log_probs, candidate_scores=scores)
-
-    advantages = (scores - scores.mean(dim=1, keepdim=True)) / (scores.std(dim=1, keepdim=True, unbiased=False) + 1e-6)
-    expected = -(advantages.detach() * log_probs).mean()
-    assert torch.allclose(loss.loss, expected)
-
-
-def test_grpo_expected_prob_objective_uses_candidate_logits() -> None:
-    logits = torch.tensor([[2.0, 0.0, -1.0]], dtype=torch.float32)
-    log_probs = torch.log_softmax(logits, dim=1)
-    scores = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
-
-    loss = compute_grpo_objective(
-        candidate_log_probs=log_probs,
-        candidate_scores=scores,
-        candidate_score_logits=logits,
-        objective="expected_prob",
-        temperature=1.0,
-    )
-
-    advantages = (scores - scores.mean(dim=1, keepdim=True)) / (scores.std(dim=1, keepdim=True, unbiased=False) + 1e-6)
-    expected = -(torch.softmax(logits, dim=1) * advantages.detach()).sum(dim=1).mean()
-    assert torch.allclose(loss.loss, expected)
-
-
-def test_grpo_clipped_ratio_objective_uses_old_candidate_log_probs() -> None:
+def test_grpo_objective_uses_old_new_candidate_logp_ratio() -> None:
     new_log_probs = torch.log_softmax(torch.tensor([[1.2, 0.2, -0.4]], dtype=torch.float32), dim=1)
     old_log_probs = torch.log_softmax(torch.tensor([[0.7, 0.4, -0.2]], dtype=torch.float32), dim=1)
     scores = torch.tensor([[3.0, 1.0, 2.0]], dtype=torch.float32)
@@ -48,7 +19,7 @@ def test_grpo_clipped_ratio_objective_uses_old_candidate_log_probs() -> None:
         candidate_log_probs=new_log_probs,
         old_candidate_log_probs=old_log_probs,
         candidate_scores=scores,
-        objective="clipped_ratio",
+        objective="grpo",
         clip_eps=0.2,
     )
 
@@ -68,7 +39,7 @@ def test_grpo_clipped_ratio_objective_uses_old_candidate_log_probs() -> None:
     assert torch.allclose(loss.clip_frac, ((ratio - 1.0).abs() > 0.2).float().mean())
 
 
-def test_grpo_clipped_ratio_requires_old_candidate_log_probs() -> None:
+def test_grpo_objective_requires_old_candidate_log_probs() -> None:
     log_probs = torch.log_softmax(torch.tensor([[1.0, 0.0, -1.0]], dtype=torch.float32), dim=1)
     scores = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
 
@@ -76,19 +47,22 @@ def test_grpo_clipped_ratio_requires_old_candidate_log_probs() -> None:
         compute_grpo_objective(
             candidate_log_probs=log_probs,
             candidate_scores=scores,
-            objective="clipped_ratio",
+            objective="grpo",
         )
 
 
-def test_grpo_objective_rejects_legacy_craft_alias() -> None:
+@pytest.mark.parametrize("objective", ["logprob", "expected_prob", "clipped_ratio", "ppo_ratio", "strict_grpo", "craft"])
+def test_grpo_objective_rejects_non_grpo_names(objective: str) -> None:
     log_probs = torch.log_softmax(torch.tensor([[1.0, 0.0, -1.0]], dtype=torch.float32), dim=1)
+    old_log_probs = torch.log_softmax(torch.tensor([[0.5, 0.1, -0.4]], dtype=torch.float32), dim=1)
     scores = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
 
     with pytest.raises(ValueError, match="Unsupported GRPO objective"):
         compute_grpo_objective(
             candidate_log_probs=log_probs,
+            old_candidate_log_probs=old_log_probs,
             candidate_scores=scores,
-            objective="craft",
+            objective=objective,
         )
 
 

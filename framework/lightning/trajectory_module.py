@@ -21,6 +21,7 @@ from framework.algorithms.trajectory_policy_core import (
 )
 from framework.lightning.config import ActorLearnerLightningConfig
 from framework.lightning_compat import L
+from framework.replay_schema import get_front_obstacle_aux, get_policy_model_inputs
 from framework.runner.logging import _exception_is_cuda_oom, log_cuda_memory_snapshot
 
 
@@ -146,41 +147,36 @@ class TrajectoryLightningModule(L.LightningModule):
         loss_requested = bool(grpo_enabled and grpo_coef > 0.0)
         if not loss_requested and not debug_requested and not aux_requested:
             return loss, metrics
-        objective_key = str(getattr(self.learner_config, "grpo_objective", "logprob")).strip().lower()
-        strict_ratio = objective_key in {"clipped_ratio", "ppo_ratio", "strict_grpo"}
+        objective_key = str(getattr(self.learner_config, "grpo_objective", "grpo")).strip().lower()
+        if objective_key != "grpo":
+            raise ValueError(f"learner_config.grpo_objective must be 'grpo', got {objective_key!r}")
 
         if candidates is None:
-            if strict_ratio:
-                raise RuntimeError(
-                    "Strict clipped-ratio GRPO requires actor-stored counterfactual candidates in replay. "
-                    "Expected replay entries with grpo_candidate_mode_indices, "
-                    "grpo_candidate_old_log_probs, and grpo_candidate_traj_xyyaw."
+            fused_fn = getattr(self.agent, "replay_policy_outputs_from_replay_batch", None)
+            if callable(fused_fn):
+                t0 = time.perf_counter()
+                outputs = fused_fn(
+                    replay,
+                    eta=float(self.learner_config.eta),
+                    num_candidates=int(self.learner_config.grpo_num_candidates),
+                    candidate_select=str(self.learner_config.grpo_candidate_select),
                 )
-            candidate_fn = getattr(self.agent, "sample_counterfactual_trajectories_from_replay_batch", None)
-            if not callable(candidate_fn):
-                if not loss_requested:
-                    return loss, metrics
+                if timing_parts is not None:
+                    timing_parts["fused_policy_s"] = timing_parts.get("fused_policy_s", 0.0) + float(time.perf_counter() - t0)
+                candidates = outputs.get("counterfactual", None) if isinstance(outputs, dict) else None
+            if candidates is None:
                 raise RuntimeError(
-                    "GRPO is enabled but the agent does not expose "
-                    "`sample_counterfactual_trajectories_from_replay_batch`."
+                    "GRPO requires actor-stored counterfactual candidates in replay. "
+                    "Expected replay['grpo']['candidates'] with mode_indices, "
+                    "old_log_probs, and traj_xyyaw."
                 )
-            t0 = time.perf_counter()
-            candidates = candidate_fn(
-                replay,
-                num_candidates=int(self.learner_config.grpo_num_candidates),
-                candidate_select=str(self.learner_config.grpo_candidate_select),
-            )
-            sample_s = float(time.perf_counter() - t0)
-            if timing_parts is not None:
-                timing_parts["grpo_sample_s"] = timing_parts.get("grpo_sample_s", 0.0) + sample_s
-            self._maybe_report_slow_step_part(name="grpo_sample", seconds=sample_s, batch_idx=batch_idx)
         else:
             if timing_parts is not None:
                 timing_parts.setdefault("grpo_sample_s", 0.0)
         candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
         old_candidate_log_probs = candidates.get("old_log_probs", None)
-        if strict_ratio and old_candidate_log_probs is None:
-            raise RuntimeError("Strict clipped-ratio GRPO requires candidates['old_log_probs']")
+        if old_candidate_log_probs is None:
+            raise RuntimeError("GRPO requires candidates['old_log_probs']")
         t0 = time.perf_counter()
         candidate_scores = score_counterfactual_trajectories(
             self.agent,
@@ -310,13 +306,17 @@ class TrajectoryLightningModule(L.LightningModule):
         max_ttc = float(getattr(self.learner_config, "aux_risk_decel_high_risk_ttc_s", 3.0))
         max_lateral = float(getattr(self.learner_config, "aux_risk_decel_lateral_m", 2.5))
         for rep in replay:
-            if not isinstance(rep, dict) or not bool(rep.get("front_obstacle_available", False)):
+            if not isinstance(rep, dict):
+                high_risk.append(False)
+                continue
+            front = get_front_obstacle_aux(rep)
+            if front is None or not bool(front.get("available", False)):
                 high_risk.append(False)
                 continue
             try:
-                gap_m = float(rep.get("front_obstacle_gap_m", float("inf")))
-                lateral_m = abs(float(rep.get("front_obstacle_lateral_m", float("inf"))))
-                ttc_s = float(rep.get("front_obstacle_ttc_s", float("inf")))
+                gap_m = float(front.get("gap_m", float("inf")))
+                lateral_m = abs(float(front.get("lateral_m", float("inf"))))
+                ttc_s = float(front.get("ttc_s", float("inf")))
             except Exception:
                 high_risk.append(False)
                 continue
@@ -343,7 +343,10 @@ class TrajectoryLightningModule(L.LightningModule):
                     except Exception:
                         speed = None
                 if speed is None:
-                    status = rep.get("status_feature", None)
+                    try:
+                        status = get_policy_model_inputs(rep).get("status_feature", None)
+                    except RuntimeError:
+                        status = None
                     if torch.is_tensor(status):
                         status_t = status.detach().to(dtype=torch.float32).view(-1)
                         if int(status_t.numel()) >= 6:

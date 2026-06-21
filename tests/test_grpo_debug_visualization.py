@@ -31,6 +31,24 @@ class _DebugAgent:
             "log_probs": torch.full((1, num_candidates), -0.25, dtype=torch.float32),
         }
 
+    def replay_policy_outputs_from_replay_batch(
+        self,
+        replay,
+        *,
+        eta: float = 1.0,
+        num_candidates: int,
+        candidate_select: str = "topk",
+    ):
+        del replay, eta, candidate_select
+        return {
+            "new_logp": torch.zeros((1,), dtype=torch.float32),
+            "counterfactual": {
+                "traj_xyyaw": torch.zeros((1, num_candidates, 4, 3), dtype=torch.float32),
+                "log_probs": torch.full((1, num_candidates), -0.25, dtype=torch.float32),
+                "old_log_probs": torch.full((1, num_candidates), -0.5, dtype=torch.float32),
+            },
+        }
+
     def dump_counterfactual_debug_from_replay_batch(
         self,
         replays,

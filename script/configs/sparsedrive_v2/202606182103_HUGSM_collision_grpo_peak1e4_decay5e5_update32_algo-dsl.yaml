@@ -265,7 +265,7 @@ train:
     allow_partial_updates_after_timeout: true
     restart_failed_actors: true
     max_actor_restarts: 2
-    max_updates: 64
+    max_updates: 32
   ddp:
     grad_accum_steps: 1
   eta: 1.0
@@ -308,7 +308,7 @@ train:
     coef: 2.0
     num_candidates: 16
     candidate_select: topk
-    objective: expected_prob
+    objective: grpo
     temperature: 1.0
     norm_eps: 1.0e-06
     use_rank_adv: false

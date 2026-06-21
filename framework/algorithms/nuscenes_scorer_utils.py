@@ -14,6 +14,8 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import torch
 
+from framework.replay_schema import get_grpo_scorer
+
 try:
     from reconsimulator.envs import nus_config as nus_cfg
 except Exception:
@@ -295,6 +297,12 @@ class NuScenesScorerUtils:
             valid_mask_any=row.get("gt_ego_fut_masks", row.get("gt_ego_fut_mask", row.get("gt_ego_fut_valid", None))),
         )
         return self._gt_to_env_xy(gt_local, cumulative=True)
+
+    @staticmethod
+    def _scorer_replay(replay: Mapping[str, Any]) -> dict[str, Any]:
+        if "grpo" in replay:
+            return dict(get_grpo_scorer(replay))
+        return dict(replay)
 
     @staticmethod
     def _gt_sample_token_for_replay(replay: Mapping[str, Any], sample_token: str) -> str:
@@ -1293,6 +1301,7 @@ class NuScenesScorerUtils:
         *,
         patch_radius: float,
     ) -> dict[str, Any]:
+        replay = self._scorer_replay(replay)
         sample_token = replay.get("sample_token", None)
         if sample_token is None:
             raise RuntimeError("NuScenesScorerUtils requires replay['sample_token']")
@@ -2066,6 +2075,7 @@ class NuScenesScorerUtils:
         scores = np.zeros((traj_np.shape[0], traj_np.shape[1]), dtype=np.float32)
         details: list[dict[str, Any]] = []
         for batch_idx, replay in enumerate(replays):
+            replay = self._scorer_replay(replay)
             sample_token = replay.get("sample_token", None)
             if sample_token is None:
                 raise RuntimeError("NuScenesScorerUtils requires replay['sample_token']")
@@ -2245,6 +2255,7 @@ class NuScenesScorerUtils:
     ) -> dict[str, torch.Tensor]:
         gt_arrays: list[np.ndarray] = []
         for replay in replays:
+            replay = self._scorer_replay(replay)
             sample_token = replay.get("sample_token", None)
             if sample_token is None:
                 raise RuntimeError("NuScenesScorerUtils requires replay['sample_token']")

@@ -176,6 +176,10 @@ actor-learner 通信层。
 
 这样可以先抓住主链路，再回头看各个子模块的细节。
 
+如果需要接入新的 egoAD/自车 agent，或者确认 actor 写入 buffer 的数据格式，先读：
+
+- `SHARD_SCHEMA.md`：说明 shard 外层字段、结构化 replay 分区、不同算法需要的字段，以及新 agent 的接入要求。
+
 ## 子目录 README
 
 各一级子目录都已经补充了更细的说明，适合按模块深入阅读：

@@ -44,7 +44,7 @@ def test_select_old_policy_sampled_candidates_uses_multinomial_indices(monkeypat
 def test_new_log_probs_for_stored_grpo_candidates_gathers_by_global_index() -> None:
     score_logits = torch.tensor([[1.0, 3.0, 0.0]], dtype=torch.float32)
     candidate_global_indices = torch.tensor([[20, 10, 30]], dtype=torch.long)
-    replay = {"grpo_candidate_mode_indices": torch.tensor([10, 30], dtype=torch.long)}
+    replay = {"grpo": {"candidates": {"mode_indices": torch.tensor([10, 30], dtype=torch.long)}}}
 
     new_log_probs = SparseDriveV2Policy._new_log_probs_for_stored_grpo_candidates_from_outputs(
         score_logits=score_logits,
@@ -59,7 +59,7 @@ def test_new_log_probs_for_stored_grpo_candidates_gathers_by_global_index() -> N
 def test_score_logits_for_stored_grpo_candidates_gathers_by_global_index() -> None:
     score_logits = torch.tensor([[1.0, 3.0, 0.0]], dtype=torch.float32)
     candidate_global_indices = torch.tensor([[20, 10, 30]], dtype=torch.long)
-    replay = {"grpo_candidate_mode_indices": torch.tensor([10, 30], dtype=torch.long)}
+    replay = {"grpo": {"candidates": {"mode_indices": torch.tensor([10, 30], dtype=torch.long)}}}
 
     selected_logits = SparseDriveV2Policy._score_logits_for_stored_grpo_candidates_from_outputs(
         score_logits=score_logits,
@@ -77,14 +77,22 @@ def test_logp_from_replay_batch_uses_single_loop_for_multiple_replays(monkeypatc
 
     replays = [
         {
-            "camera_feature": {"imgs": torch.zeros((1, 1), dtype=torch.float32)},
-            "status_feature": torch.zeros((1, 1), dtype=torch.float32),
-            "global_mode_idx": 11,
+            "policy": {
+                "model_inputs": {
+                    "camera_feature": {"imgs": torch.zeros((1, 1), dtype=torch.float32)},
+                    "status_feature": torch.zeros((1, 1), dtype=torch.float32),
+                },
+                "action_id": {"global_mode_idx": 11},
+            },
         },
         {
-            "camera_feature": {"imgs": torch.ones((1, 1), dtype=torch.float32)},
-            "status_feature": torch.ones((1, 1), dtype=torch.float32),
-            "global_mode_idx": 21,
+            "policy": {
+                "model_inputs": {
+                    "camera_feature": {"imgs": torch.ones((1, 1), dtype=torch.float32)},
+                    "status_feature": torch.ones((1, 1), dtype=torch.float32),
+                },
+                "action_id": {"global_mode_idx": 21},
+            },
         },
     ]
     forward_batch_sizes: list[int] = []
@@ -129,14 +137,22 @@ def test_logp_from_replay_batch_falls_back_single_replays(monkeypatch) -> None:
 
     replays = [
         {
-            "camera_feature": {"imgs": torch.zeros((1, 1), dtype=torch.float32)},
-            "status_feature": torch.zeros((1, 1), dtype=torch.float32),
-            "global_mode_idx": 11,
+            "policy": {
+                "model_inputs": {
+                    "camera_feature": {"imgs": torch.zeros((1, 1), dtype=torch.float32)},
+                    "status_feature": torch.zeros((1, 1), dtype=torch.float32),
+                },
+                "action_id": {"global_mode_idx": 11},
+            },
         },
         {
-            "camera_feature": {"imgs": torch.ones((1, 1), dtype=torch.float32)},
-            "status_feature": torch.ones((1, 1), dtype=torch.float32),
-            "global_mode_idx": 21,
+            "policy": {
+                "model_inputs": {
+                    "camera_feature": {"imgs": torch.ones((1, 1), dtype=torch.float32)},
+                    "status_feature": torch.ones((1, 1), dtype=torch.float32),
+                },
+                "action_id": {"global_mode_idx": 21},
+            },
         },
     ]
     forward_batch_sizes: list[int] = []
@@ -185,28 +201,46 @@ def test_replay_policy_outputs_strict_grpo_uses_single_loop(monkeypatch) -> None
 
     replays = [
         {
-            "camera_feature": {"imgs": torch.zeros((1, 1), dtype=torch.float32)},
-            "status_feature": torch.zeros((1, 1), dtype=torch.float32),
-            "global_mode_idx": 11,
-            "grpo_candidate_mode_indices": torch.tensor([11, 12], dtype=torch.long),
-            "grpo_candidate_old_log_probs": torch.tensor([-0.1, -0.2], dtype=torch.float32),
-            "grpo_candidate_traj_xyyaw": torch.zeros((2, 3, 3), dtype=torch.float32),
+            "policy": {
+                "model_inputs": {
+                    "camera_feature": {"imgs": torch.zeros((1, 1), dtype=torch.float32)},
+                    "status_feature": torch.zeros((1, 1), dtype=torch.float32),
+                },
+                "action_id": {"global_mode_idx": 11},
+            },
+            "grpo": {
+                "candidates": {
+                    "mode_indices": torch.tensor([11, 12], dtype=torch.long),
+                    "old_log_probs": torch.tensor([-0.1, -0.2], dtype=torch.float32),
+                    "traj_xyyaw": torch.zeros((2, 3, 3), dtype=torch.float32),
+                }
+            },
         },
         {
-            "camera_feature": {"imgs": torch.ones((1, 1), dtype=torch.float32)},
-            "status_feature": torch.ones((1, 1), dtype=torch.float32),
-            "global_mode_idx": 21,
-            "grpo_candidate_mode_indices": torch.tensor([21, 22], dtype=torch.long),
-            "grpo_candidate_old_log_probs": torch.tensor([-0.3, -0.4], dtype=torch.float32),
-            "grpo_candidate_traj_xyyaw": torch.ones((2, 3, 3), dtype=torch.float32),
+            "policy": {
+                "model_inputs": {
+                    "camera_feature": {"imgs": torch.ones((1, 1), dtype=torch.float32)},
+                    "status_feature": torch.ones((1, 1), dtype=torch.float32),
+                },
+                "action_id": {"global_mode_idx": 21},
+            },
+            "grpo": {
+                "candidates": {
+                    "mode_indices": torch.tensor([21, 22], dtype=torch.long),
+                    "old_log_probs": torch.tensor([-0.3, -0.4], dtype=torch.float32),
+                    "traj_xyyaw": torch.ones((2, 3, 3), dtype=torch.float32),
+                }
+            },
         },
     ]
     forward_batch_sizes: list[int] = []
 
     def fake_batched_features(batch_replays):
         return {
-            "camera_feature": {"imgs": torch.cat([rep["camera_feature"]["imgs"] for rep in batch_replays], dim=0)},
-            "status_feature": torch.cat([rep["status_feature"] for rep in batch_replays], dim=0),
+            "camera_feature": {
+                "imgs": torch.cat([rep["policy"]["model_inputs"]["camera_feature"]["imgs"] for rep in batch_replays], dim=0)
+            },
+            "status_feature": torch.cat([rep["policy"]["model_inputs"]["status_feature"] for rep in batch_replays], dim=0),
         }
 
     def fake_forward_on_model(model, features, targets=None):

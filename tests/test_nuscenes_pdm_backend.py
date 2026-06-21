@@ -36,6 +36,34 @@ def _fake_policy_model_with_traj_vocab(traj_vocab: torch.Tensor) -> torch.nn.Mod
     return model
 
 
+def _structured_replay(
+    *,
+    idx: int = 0,
+    global_mode_idx: int,
+    selected_path_idx: int = 0,
+    selected_vel_idx: int = 0,
+) -> dict:
+    return {
+        "schema_version": 2,
+        "policy": {
+            "backend": "sparsedrive_v2",
+            "schema_version": 1,
+            "model_inputs": {
+                "camera_feature": {
+                    "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
+                    "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
+                },
+                "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
+            },
+            "action_id": {"global_mode_idx": int(global_mode_idx)},
+        },
+        "debug": {
+            "selected_path_idx": int(selected_path_idx),
+            "selected_vel_idx": int(selected_vel_idx),
+        },
+    }
+
+
 def test_apply_trainable_prefixes_can_freeze_backbone_while_training_other_modules() -> None:
     module = torch.nn.Module()
     module._backbone = torch.nn.Sequential(torch.nn.Linear(2, 2))
@@ -106,7 +134,7 @@ def test_policy_pdm_score_hook_accepts_numpy_backend_scores(monkeypatch) -> None
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     scores = policy.pdm_score_counterfactuals_from_replay_batch(
-        [{"sample_token": "tok-a"}],
+        [{"schema_version": 2, "grpo": {"scorer": {"sample_token": "tok-a"}}}],
         torch.zeros((1, 2, 3, 3), dtype=torch.float32),
     )
 
@@ -179,10 +207,12 @@ def test_sparsedrivev2_replay_sampling_forwards_observations_as_one_batch(monkey
     assert len(logps) == 3
     assert len(replays) == 3
     assert all("mode_idx" not in rep for rep in replays)
-    assert [int(rep["selected_path_idx"]) for rep in replays] == [7, 7, 7]
-    assert [int(rep["selected_vel_idx"]) for rep in replays] == [5, 5, 5]
-    assert [int(rep["global_mode_idx"]) for rep in replays] == [75, 75, 75]
-    assert [tuple(rep["status_feature"].shape) for rep in replays] == [(1, 8), (1, 8), (1, 8)]
+    assert all("global_mode_idx" not in rep for rep in replays)
+    assert [int(rep["debug"]["selected_path_idx"]) for rep in replays] == [7, 7, 7]
+    assert [int(rep["debug"]["selected_vel_idx"]) for rep in replays] == [5, 5, 5]
+    assert [int(rep["policy"]["action_id"]["global_mode_idx"]) for rep in replays] == [75, 75, 75]
+    assert [tuple(rep["policy"]["model_inputs"]["status_feature"].shape) for rep in replays] == [(1, 8), (1, 8), (1, 8)]
+    assert [tuple(rep["env"]["plan_xyyaw"].shape) for rep in replays] == [(3, 3), (3, 3), (3, 3)]
 
 
 def test_sparsedrivev2_logp_from_replay_uses_global_mode_identity(monkeypatch) -> None:
@@ -194,16 +224,7 @@ def test_sparsedrivev2_logp_from_replay_uses_global_mode_identity(monkeypatch) -
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     replays = [
-        {
-            "camera_feature": {
-                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
-                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
-            },
-            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
-            "selected_path_idx": idx + 1,
-            "selected_vel_idx": idx + 2,
-            "global_mode_idx": [20, 11][idx],
-        }
+        _structured_replay(idx=idx, selected_path_idx=idx + 1, selected_vel_idx=idx + 2, global_mode_idx=[20, 11][idx])
         for idx in range(2)
     ]
 
@@ -246,16 +267,7 @@ def test_sparsedrivev2_logp_from_replay_requires_selected_global_mode_in_candida
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     replays = [
-        {
-            "camera_feature": {
-                "imgs": torch.zeros((1, 2, 3, 4, 5), dtype=torch.float32),
-                "lidar2img": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
-            },
-            "status_feature": torch.zeros((1, 8), dtype=torch.float32),
-            "selected_path_idx": 2,
-            "selected_vel_idx": 3,
-            "global_mode_idx": 23,
-        }
+        _structured_replay(idx=0, selected_path_idx=2, selected_vel_idx=3, global_mode_idx=23)
     ]
 
     def fake_forward_policy_on_model(model, features_dev, targets=None):
@@ -281,16 +293,7 @@ def test_sparsedrivev2_logp_from_replay_forces_selected_global_mode_into_candida
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     replays = [
-        {
-            "camera_feature": {
-                "imgs": torch.zeros((1, 2, 3, 4, 5), dtype=torch.float32),
-                "lidar2img": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
-            },
-            "status_feature": torch.zeros((1, 8), dtype=torch.float32),
-            "selected_path_idx": 2,
-            "selected_vel_idx": 3,
-            "global_mode_idx": 23,
-        }
+        _structured_replay(idx=0, selected_path_idx=2, selected_vel_idx=3, global_mode_idx=23)
     ]
 
     def fake_forward_policy_on_model(model, features_dev, targets=None):
@@ -328,16 +331,7 @@ def test_sparsedrivev2_logp_from_replay_recomputes_each_sample_independently(mon
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     replays = [
-        {
-            "camera_feature": {
-                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
-                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
-            },
-            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
-            "selected_path_idx": idx + 1,
-            "selected_vel_idx": idx + 2,
-            "global_mode_idx": [20, 11][idx],
-        }
+        _structured_replay(idx=idx, selected_path_idx=idx + 1, selected_vel_idx=idx + 2, global_mode_idx=[20, 11][idx])
         for idx in range(2)
     ]
 
@@ -389,16 +383,7 @@ def test_sparsedrivev2_fused_replay_policy_outputs_match_existing_hooks(monkeypa
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     replays = [
-        {
-            "camera_feature": {
-                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
-                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
-            },
-            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
-            "selected_path_idx": idx + 1,
-            "selected_vel_idx": idx + 2,
-            "global_mode_idx": [20, 11][idx],
-        }
+        _structured_replay(idx=idx, selected_path_idx=idx + 1, selected_vel_idx=idx + 2, global_mode_idx=[20, 11][idx])
         for idx in range(2)
     ]
 
@@ -457,16 +442,7 @@ def test_sparsedrivev2_counterfactual_candidates_recompute_each_sample_independe
     monkeypatch.setattr(SparseDriveV2Policy, "device", property(lambda self: self._device))
 
     replays = [
-        {
-            "camera_feature": {
-                "imgs": torch.full((1, 2, 3, 4, 5), float(idx), dtype=torch.float32),
-                "lidar2img": torch.full((1, 2, 4, 4), float(idx), dtype=torch.float32),
-            },
-            "status_feature": torch.full((1, 8), float(idx), dtype=torch.float32),
-            "selected_path_idx": idx + 1,
-            "selected_vel_idx": idx + 2,
-            "global_mode_idx": [20, 11][idx],
-        }
+        _structured_replay(idx=idx, selected_path_idx=idx + 1, selected_vel_idx=idx + 2, global_mode_idx=[20, 11][idx])
         for idx in range(2)
     ]
 

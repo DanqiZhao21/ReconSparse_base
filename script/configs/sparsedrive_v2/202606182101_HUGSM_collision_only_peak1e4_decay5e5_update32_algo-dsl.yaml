@@ -226,14 +226,14 @@ env:
         apply_on_timeout: false
         apply_on_env_done: false
 train:
-  algo: reinforcepp-nogrpo-aux
+  algo: reinforcepp-nogrpo-noaux
   wandb:
     enabled: true
     project: reconSparse
-    group: HUGSIM_202606182105_Collision_ReinforcePP_NoGRPO_AuxRiskDecel_Peak1e4_Decay5e5_Update64
+    group: HUGSIM_202606182101_CollisionOnly_ReinforcePP_NoGRPO_NoAux_Peak1e4_Decay5e5_Update64
   actor_learner:
     mode: async
-    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_202606182105_Collision_ReinforcePP_NoGRPO_AuxRiskDecel_Peak1e4_Decay5e5_Update64
+    buffer_dir: /root/clone/ReconDreamer-RL/outputs/actor_learner/HUGSIM_202606182101_CollisionOnly_ReinforcePP_NoGRPO_NoAux_Peak1e4_Decay5e5_Update64
     timestamp_buffer_dir: true
     learner_gpu_id: 0
     learner_gpu_ids:
@@ -265,7 +265,7 @@ train:
     allow_partial_updates_after_timeout: true
     restart_failed_actors: true
     max_actor_restarts: 2
-    max_updates: 64
+    max_updates: 32
   ddp:
     grad_accum_steps: 1
   eta: 1.0
@@ -308,13 +308,13 @@ train:
     coef: 0.0
     num_candidates: 0
     candidate_select: topk
-    objective: expected_prob
+    objective: grpo
     temperature: 1.0
     norm_eps: 1.0e-06
     use_rank_adv: false
     score_clip: null
     debug_visualize: false
-    debug_dir: outputs/visualize/HUGSIM_202606182105_Collision_ReinforcePP_NoGRPO_AuxRiskDecel_Peak1e4_Decay5e5_Update64
+    debug_dir: outputs/visualize/HUGSIM_202606182101_CollisionOnly_ReinforcePP_NoGRPO_NoAux_Peak1e4_Decay5e5_Update64
     debug_max_batches: 24
     debug_top_k: 8
     scorer:
@@ -349,10 +349,10 @@ train:
         term_red_light: 8.0
         term_stop_sign: 8.0
   auxiliary:
-    enable: true
+    enable: false
     risk_decel:
-      enable: true
-      coef: 0.5
+      enable: false
+      coef: 0.0
       dt_s: 0.5
       high_risk_gap_m: 10.0
       high_risk_ttc_s: 2.5

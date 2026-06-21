@@ -7,6 +7,11 @@ import numpy as np
 import torch
 
 from framework.rollout.timing import build_rollout_timing, extract_env_timing
+from framework.replay_schema import (
+    get_env_plan_xyyaw,
+    set_front_obstacle_aux,
+    set_grpo_scorer_fields,
+)
 from framework.utils.obs import obs_to_tensor
 
 
@@ -167,8 +172,9 @@ def _extract_external_plan_local_xyyaw(replay: Any) -> Optional[np.ndarray]:
     if not isinstance(replay, dict):
         return None
 
-    plan = replay.get("traj_xyyaw", None)
-    if plan is None:
+    try:
+        plan = get_env_plan_xyyaw(replay)
+    except RuntimeError:
         return None
 
     if torch.is_tensor(plan):
@@ -209,30 +215,23 @@ def _inject_gt_reference_from_info(replay: Any, info: Any) -> None:
     if not isinstance(replay, dict) or not isinstance(info, dict):
         return
     gt_sample_token = info.get("grpo_gt_sample_token", info.get("recon_cache_sample_token", None))
-    if gt_sample_token is not None and str(gt_sample_token):
-        replay["gt_sample_token_override"] = str(gt_sample_token)
     gt_frame_idx = info.get("grpo_gt_frame_idx", info.get("recon_cache_frame_idx", None))
+    fields: Dict[str, Any] = {}
+    if gt_sample_token is not None and str(gt_sample_token):
+        fields["gt_sample_token_override"] = str(gt_sample_token)
     if gt_frame_idx is not None:
         try:
-            replay["gt_frame_idx_override"] = int(gt_frame_idx)
+            fields["gt_frame_idx_override"] = int(gt_frame_idx)
         except Exception:
             pass
+    if fields:
+        set_grpo_scorer_fields(replay, **fields)
 
 
 def _inject_front_obstacle_context_from_info(replay: Any, info: Any) -> None:
     if not isinstance(replay, dict) or not isinstance(info, dict):
         return
-    keys = [
-        "front_obstacle_available",
-        "front_obstacle_gap_m",
-        "front_obstacle_lateral_m",
-        "front_obstacle_closing_speed_mps",
-        "front_obstacle_ttc_s",
-        "front_obstacle_category",
-    ]
-    for key in keys:
-        if key in info:
-            replay[key] = info[key]
+    set_front_obstacle_aux(replay, info=info)
 
 
 def _emit_heartbeat(heartbeat_fn: Any | None, phase: str, step: int | None = None, *, force: bool = False) -> None:

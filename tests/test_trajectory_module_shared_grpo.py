@@ -26,6 +26,24 @@ class _DummyAgent:
             "log_probs": torch.full((2, 3), -0.5, dtype=torch.float32),
         }
 
+    def replay_policy_outputs_from_replay_batch(
+        self,
+        replay,
+        *,
+        eta: float = 1.0,
+        num_candidates: int,
+        candidate_select: str = "topk",
+    ):
+        del replay, eta, candidate_select
+        return {
+            "new_logp": torch.tensor([0.1, 0.2], dtype=torch.float32),
+            "counterfactual": {
+                "traj_xyyaw": torch.zeros((2, num_candidates, 4, 3), dtype=torch.float32),
+                "log_probs": torch.full((2, num_candidates), -0.5, dtype=torch.float32),
+                "old_log_probs": torch.full((2, num_candidates), -0.6, dtype=torch.float32),
+            },
+        }
+
 
 class _FusedDummyAgent:
     def __init__(self) -> None:
@@ -468,7 +486,7 @@ def test_grpo_only_training_step_uses_only_counterfactual_objective(monkeypatch)
     assert module.latest_metrics["grpo_loss"] == 3.0
 
 
-def test_grpo_only_clipped_ratio_uses_actor_stored_old_candidate_log_probs(monkeypatch) -> None:
+def test_grpo_only_uses_actor_stored_old_candidate_log_probs(monkeypatch) -> None:
     agent = _FusedDummyAgent()
     learner_config = ActorLearnerLightningConfig(
         algo_kind="grpo_only",
@@ -482,7 +500,7 @@ def test_grpo_only_clipped_ratio_uses_actor_stored_old_candidate_log_probs(monke
         grpo_norm_eps=1.0e-6,
         grpo_use_rank_adv=False,
         grpo_score_clip=None,
-        grpo_objective="clipped_ratio",
+        grpo_objective="grpo",
     )
     module = TrajectoryLightningModule(agent=agent, learner_config=learner_config)
     seen = {}
@@ -518,7 +536,7 @@ def test_grpo_only_clipped_ratio_uses_actor_stored_old_candidate_log_probs(monke
     loss = module.training_step(batch, batch_idx=0)
 
     assert torch.allclose(loss.detach(), torch.tensor(3.0, dtype=torch.float32))
-    assert seen["objective"] == "clipped_ratio"
+    assert seen["objective"] == "grpo"
     assert torch.equal(seen["old_candidate_log_probs"], torch.full((2, 3), -0.6, dtype=torch.float32))
     assert seen["clip_eps"] == 0.2
     assert module.latest_metrics["grpo_approx_kl"] == torch.tensor(0.1, dtype=torch.float32).item()

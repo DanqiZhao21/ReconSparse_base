@@ -36,7 +36,7 @@ class ActorLearnerLightningConfig:
     grpo_norm_eps: float = 1e-6
     grpo_use_rank_adv: bool = False
     grpo_score_clip: float | None = None
-    grpo_objective: str = "logprob"
+    grpo_objective: str = "grpo"
     grpo_temperature: float = 1.0
     grpo_debug_visualize: bool = False
     grpo_debug_dir: str | None = None
@@ -116,6 +116,10 @@ def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
             "train.grpo.config_path is reserved for future external-yaml merging and is not supported yet"
         )
 
+    objective = str(shared_cfg.get("objective", "grpo")).strip().lower()
+    if objective != "grpo":
+        raise ValueError(f"train.grpo.objective must be 'grpo', got {objective!r}")
+
     resolved = {
         "enabled": bool(shared_cfg.get("enable", False)),
         "config_path": None if config_path is None else str(config_path),
@@ -125,7 +129,7 @@ def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "norm_eps": float(shared_cfg.get("norm_eps", 1e-6)),
         "use_rank_adv": bool(shared_cfg.get("use_rank_adv", False)),
         "score_clip": shared_cfg.get("score_clip", None),
-        "objective": str(shared_cfg.get("objective", "logprob")),
+        "objective": objective,
         "temperature": float(shared_cfg.get("temperature", 1.0)),
         "debug_visualize": bool(shared_cfg.get("debug_visualize", False)),
         "debug_dir": shared_cfg.get("debug_dir", None),

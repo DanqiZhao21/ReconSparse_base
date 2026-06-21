@@ -44,7 +44,7 @@ def test_shared_train_grpo_overrides_algorithm_grpo_fields() -> None:
             "norm_eps": 1.0e-6,
             "use_rank_adv": False,
             "score_clip": 1.5,
-            "objective": "expected_prob",
+            "objective": "grpo",
             "temperature": 0.7,
             "debug_visualize": False,
             "debug_dir": "outputs/grpo",
@@ -66,7 +66,7 @@ def test_shared_train_grpo_overrides_algorithm_grpo_fields() -> None:
     assert learner_cfg.grpo_norm_eps == 1.0e-6
     assert learner_cfg.grpo_use_rank_adv is False
     assert learner_cfg.grpo_score_clip == 1.5
-    assert learner_cfg.grpo_objective == "expected_prob"
+    assert learner_cfg.grpo_objective == "grpo"
     assert learner_cfg.grpo_temperature == 0.7
     assert learner_cfg.grpo_debug_visualize is False
     assert learner_cfg.grpo_debug_dir == "outputs/grpo"
@@ -217,7 +217,7 @@ def test_sac_algorithm_builds_policy_only_learner_config() -> None:
     assert learner_cfg.include_obs is False
 
 
-def test_explicit_grpo_objective_is_respected() -> None:
+def test_grpo_objective_defaults_to_grpo() -> None:
     algo = SimpleNamespace(
         variant="reinforcepp",
         policy_lr=1.0e-4,
@@ -233,7 +233,7 @@ def test_explicit_grpo_objective_is_respected() -> None:
         ddp_seed=0,
     )
     train_cfg = {
-        "grpo": {"enable": True, "coef": 0.2, "num_candidates": 4, "objective": "logprob"},
+        "grpo": {"enable": True, "coef": 0.2, "num_candidates": 4},
     }
 
     learner_cfg = actor_learner_lightning_config_from_algorithm(
@@ -243,7 +243,37 @@ def test_explicit_grpo_objective_is_respected() -> None:
         algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2, "rpp_norm_eps": 1.0e-8},
     )
 
-    assert learner_cfg.grpo_objective == "logprob"
+    assert learner_cfg.grpo_objective == "grpo"
+
+
+def test_grpo_objective_rejects_legacy_non_strict_values() -> None:
+    algo = SimpleNamespace(
+        variant="reinforcepp",
+        policy_lr=1.0e-4,
+        value_lr=None,
+        weight_decay=0.0,
+        eta=1.0,
+        clip_eps=0.2,
+        kl_coef=0.0,
+        epochs=1,
+        grad_accum_steps=1,
+        max_grad_norm=0.5,
+        use_distributed_sampler=True,
+        ddp_seed=0,
+    )
+    train_cfg = {
+        "grpo": {"enable": True, "coef": 0.2, "num_candidates": 4, "objective": "expected_prob"},
+    }
+
+    import pytest
+
+    with pytest.raises(ValueError, match="train.grpo.objective"):
+        actor_learner_lightning_config_from_algorithm(
+            algo,
+            train_cfg=train_cfg,
+            actor_learner_cfg={"mode": "async", "num_actors": 1, "shards_per_update": 1},
+            algo_meta={"algo_key": "reinforcepp", "eta": 1.0, "clip_eps": 0.2, "rpp_norm_eps": 1.0e-8},
+        )
 
 
 def test_auxiliary_risk_decel_config_is_respected() -> None:

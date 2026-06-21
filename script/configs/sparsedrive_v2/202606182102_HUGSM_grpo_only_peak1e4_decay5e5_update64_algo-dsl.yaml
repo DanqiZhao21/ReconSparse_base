@@ -308,7 +308,7 @@ train:
     coef: 2.0
     num_candidates: 16
     candidate_select: topk
-    objective: expected_prob
+    objective: grpo
     temperature: 1.0
     norm_eps: 1.0e-06
     use_rank_adv: false

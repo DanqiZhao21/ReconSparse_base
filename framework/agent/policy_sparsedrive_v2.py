@@ -14,6 +14,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .base import Agent
 from reconsimulator.envs import nus_config as nus_cfg
+from framework.replay_schema import (
+    get_grpo_scorer,
+    get_policy_action_id,
+    get_policy_model_inputs,
+    make_policy_replay,
+    require_grpo_candidate_field,
+    set_env_plan,
+    set_grpo_candidates,
+    set_grpo_scorer_fields,
+)
 from framework.utils.nuscenes_token import resolve_sample_token
 from framework.utils.repo_paths import resolve_ego_ads_subdir
 
@@ -991,9 +1001,10 @@ class SparseDriveV2Policy(Agent):
     def _global_mode_indices_from_replay(replays: Sequence[Dict[str, Any]], *, device: torch.device) -> torch.Tensor:
         values: List[int] = []
         for idx, replay in enumerate(replays):
-            if "global_mode_idx" not in replay:
-                raise RuntimeError(f"SparseDriveV2 replay missing global_mode_idx at index {idx}")
-            values.append(int(replay["global_mode_idx"]))
+            action_id = get_policy_action_id(replay)
+            if "global_mode_idx" not in action_id:
+                raise RuntimeError(f"SparseDriveV2 policy replay missing action_id.global_mode_idx at index {idx}")
+            values.append(int(action_id["global_mode_idx"]))
         return torch.as_tensor(values, dtype=torch.long, device=device)
 
     @staticmethod
@@ -1137,17 +1148,19 @@ class SparseDriveV2Policy(Agent):
                 frame_idx=observation.get("frame_idx", None),
             )
         if token is not None:
-            replay["sample_token"] = str(token)
+            set_grpo_scorer_fields(replay, sample_token=str(token))
         try:
-            replay["scene_id"] = int(observation.get("scene_id", 0))
+            set_grpo_scorer_fields(replay, scene_id=int(observation.get("scene_id", 0)))
         except Exception:
             pass
         try:
-            replay["frame_idx"] = int(observation.get("frame_idx", 0))
+            set_grpo_scorer_fields(replay, frame_idx=int(observation.get("frame_idx", 0)))
         except Exception:
             pass
         try:
-            replay["timestamp_s"] = float(observation.get("timestamp", 0.0))
+            debug = replay.setdefault("debug", {})
+            if isinstance(debug, dict):
+                debug["timestamp_s"] = float(observation.get("timestamp", 0.0))
         except Exception:
             pass
 
@@ -1211,35 +1224,48 @@ class SparseDriveV2Policy(Agent):
             selected_mode_idx = int(selected_mode_indices_cpu[idx].item())
             logp = selected_logps[idx]
             traj_xyyaw = traj_xyyaw_batch[idx]
-            replay = self._detach_replay_features(features)
+            replay_features = self._detach_replay_features(features)
             selected_global_idx = int(all_global_indices[idx, selected_mode_idx].item())
             selected_path_idx = int(all_path_indices[idx, selected_mode_idx].item())
             selected_vel_idx = int(all_vel_indices[idx, selected_mode_idx].item())
-            replay.update(
-                {
+            replay: Dict[str, Any] = {
+                "schema_version": 2,
+                "policy": make_policy_replay(
+                    backend="sparsedrive_v2",
+                    model_inputs={
+                        "camera_feature": replay_features["camera_feature"],
+                        "status_feature": replay_features["status_feature"],
+                    },
+                    action_id={"global_mode_idx": int(selected_global_idx)},
+                ),
+                "debug": {
                     "selected_path_idx": int(selected_path_idx),
                     "selected_vel_idx": int(selected_vel_idx),
-                    "global_mode_idx": int(selected_global_idx),
-                    "traj_xyyaw": traj_xyyaw.detach().cpu().clone(),
                     "candidate_scores": scores.detach().cpu().clone(),
                     "execute_mode": self._execute_mode,
                     "feature_missing_fields": list(features.get("feature_missing_fields", [])),
-                }
+                },
+            }
+            set_env_plan(
+                replay,
+                plan_xyyaw=traj_xyyaw.detach().cpu().clone(),
+                plan_frame="ego",
+                action_flag=2,
             )
-            if self._grpo_num_candidates > 0:
+            grpo_num_candidates = int(getattr(self, "_grpo_num_candidates", 0) or 0)
+            if grpo_num_candidates > 0:
                 strict_candidates = self._select_strict_grpo_old_policy_candidates(
                     score_logits=score_logits[idx : idx + 1],
                     candidate_trajs=out["candidate_trajectories"][idx : idx + 1],
                     candidate_global_indices=all_global_indices[idx : idx + 1].to(device=score_logits.device),
-                    num_candidates=int(self._grpo_num_candidates),
+                    num_candidates=int(grpo_num_candidates),
                 )
-                replay.update(
-                    {
-                        "grpo_candidate_mode_indices": strict_candidates["mode_indices"][0].detach().cpu().clone(),
-                        "grpo_candidate_old_log_probs": strict_candidates["old_log_probs"][0].detach().cpu().clone(),
-                        "grpo_candidate_traj_xyyaw": strict_candidates["traj_xyyaw"][0].detach().cpu().clone(),
-                        "grpo_candidate_old_score_logits": strict_candidates["score_logits"][0].detach().cpu().clone(),
-                    }
+                set_grpo_candidates(
+                    replay,
+                    mode_indices=strict_candidates["mode_indices"][0].detach().cpu().clone(),
+                    old_log_probs=strict_candidates["old_log_probs"][0].detach().cpu().clone(),
+                    traj_xyyaw=strict_candidates["traj_xyyaw"][0].detach().cpu().clone(),
+                    score_logits=strict_candidates["score_logits"][0].detach().cpu().clone(),
                 )
             self._update_replay_with_observation_metadata(replay, observations[idx])
             actions.append(self._build_env_action(traj_xyyaw))
@@ -1272,14 +1298,18 @@ class SparseDriveV2Policy(Agent):
             parts = [self.logp_from_replay_batch([replay], eta=1.0).view(1) for replay in replays]
             return torch.cat(parts, dim=0)
 
-        camera_keys = list(replays[0]["camera_feature"].keys())
+        first_inputs = get_policy_model_inputs(replays[0])
+        camera_feature = first_inputs.get("camera_feature", None)
+        if not isinstance(camera_feature, dict):
+            raise RuntimeError("SparseDriveV2 replay policy.model_inputs requires camera_feature")
+        camera_keys = list(camera_feature.keys())
         batched_camera = {
-            key: torch.cat([rep["camera_feature"][key] for rep in replays], dim=0)
+            key: torch.cat([get_policy_model_inputs(rep)["camera_feature"][key] for rep in replays], dim=0)
             for key in camera_keys
         }
         batched_features = {
             "camera_feature": batched_camera,
-            "status_feature": torch.cat([rep["status_feature"] for rep in replays], dim=0),
+            "status_feature": torch.cat([get_policy_model_inputs(rep)["status_feature"] for rep in replays], dim=0),
         }
         batched_dev = self._to_device_features(batched_features, self.device)
 
@@ -1442,9 +1472,7 @@ class SparseDriveV2Policy(Agent):
         values: List[torch.Tensor] = []
         expected_k: int | None = None
         for idx, replay in enumerate(replays):
-            raw = replay.get("grpo_candidate_mode_indices", None)
-            if raw is None:
-                raise RuntimeError(f"Strict GRPO replay missing grpo_candidate_mode_indices at index {idx}")
+            raw = require_grpo_candidate_field(replay, "mode_indices", index=idx)
             tensor = torch.as_tensor(raw, dtype=torch.long, device=device).view(-1)
             if expected_k is None:
                 expected_k = int(tensor.numel())
@@ -1465,9 +1493,7 @@ class SparseDriveV2Policy(Agent):
         values: List[torch.Tensor] = []
         expected_k: int | None = None
         for idx, replay in enumerate(replays):
-            raw = replay.get("grpo_candidate_old_log_probs", None)
-            if raw is None:
-                raise RuntimeError(f"Strict GRPO replay missing grpo_candidate_old_log_probs at index {idx}")
+            raw = require_grpo_candidate_field(replay, "old_log_probs", index=idx)
             tensor = torch.as_tensor(raw, dtype=torch.float32, device=device).view(-1)
             if expected_k is None:
                 expected_k = int(tensor.numel())
@@ -1488,9 +1514,7 @@ class SparseDriveV2Policy(Agent):
         values: List[torch.Tensor] = []
         expected_shape: tuple[int, ...] | None = None
         for idx, replay in enumerate(replays):
-            raw = replay.get("grpo_candidate_traj_xyyaw", None)
-            if raw is None:
-                raise RuntimeError(f"Strict GRPO replay missing grpo_candidate_traj_xyyaw at index {idx}")
+            raw = require_grpo_candidate_field(replay, "traj_xyyaw", index=idx)
             tensor = torch.as_tensor(raw, dtype=torch.float32, device=device)
             if tensor.ndim != 3 or int(tensor.shape[-1]) < 3:
                 raise RuntimeError(
@@ -1581,7 +1605,10 @@ class SparseDriveV2Policy(Agent):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         forced_replay = dict(replay)
-        forced_replay["global_mode_idx"] = int(global_index)
+        forced_policy = dict(get_policy_action_id(replay))
+        forced_policy["global_mode_idx"] = int(global_index)
+        forced_replay["policy"] = dict(replay["policy"])
+        forced_replay["policy"]["action_id"] = forced_policy
         batched_dev = self._batched_replay_features([forced_replay])
         target = torch.as_tensor([int(global_index)], dtype=torch.long, device=self.device)
         out = self._forward_policy_with_forced_global_indices(batched_dev, target)
@@ -1765,7 +1792,7 @@ class SparseDriveV2Policy(Agent):
                     )
                     new_logp[missing_idx] = single_outputs["new_logp"].view(())
         logp_all = torch.log_softmax(score_logits, dim=1)
-        if all(isinstance(replay, dict) and "grpo_candidate_mode_indices" in replay for replay in replays):
+        if all(isinstance(replay, dict) and isinstance(replay.get("grpo", {}).get("candidates", None), dict) for replay in replays):
             recovered_rows = [
                 self._strict_grpo_log_probs_and_logits_for_stored_candidates(
                     replay,
@@ -1892,18 +1919,19 @@ class SparseDriveV2Policy(Agent):
                 f"Bad replay indices: {bad_indices[:8]}"
             )
 
-        camera_feature = replays[0].get("camera_feature", None)
+        first_inputs = get_policy_model_inputs(replays[0])
+        camera_feature = first_inputs.get("camera_feature", None)
         if not isinstance(camera_feature, dict) or "imgs" not in camera_feature:
-            raise RuntimeError("SparseDriveV2 value replay batch is missing camera_feature['imgs']")
+            raise RuntimeError("SparseDriveV2 value replay batch is missing policy.model_inputs.camera_feature['imgs']")
 
         batched_camera = {
-            key: torch.cat([rep["camera_feature"][key] for rep in replays], dim=0)
+            key: torch.cat([get_policy_model_inputs(rep)["camera_feature"][key] for rep in replays], dim=0)
             for key in camera_feature.keys()
         }
         try:
-            batched_status = torch.cat([rep["status_feature"] for rep in replays], dim=0)
+            batched_status = torch.cat([get_policy_model_inputs(rep)["status_feature"] for rep in replays], dim=0)
         except KeyError as exc:
-            raise RuntimeError("SparseDriveV2 value replay batch requires status_feature") from exc
+            raise RuntimeError("SparseDriveV2 value replay batch requires policy.model_inputs.status_feature") from exc
 
         return self._to_device_features(
             {
@@ -2026,7 +2054,8 @@ class SparseDriveV2Policy(Agent):
         from framework.algorithms.trajectory_policy_core import _as_score_tensor
 
         scorer = self._ensure_counterfactual_scorer_backend()
-        return _as_score_tensor(scorer.score(replays, traj_xyyaw), device=self.device)
+        scorer_replays = [dict(get_grpo_scorer(replay)) for replay in replays]
+        return _as_score_tensor(scorer.score(scorer_replays, traj_xyyaw), device=self.device)
 
     def dump_counterfactual_debug_from_replay_batch(
         self,
@@ -2040,8 +2069,9 @@ class SparseDriveV2Policy(Agent):
     ) -> None:
         del candidate_scores
         scorer = self._ensure_counterfactual_scorer_backend()
+        scorer_replays = [dict(get_grpo_scorer(replay)) for replay in replays]
         scorer.dump_debug_artifacts(
-            replays,
+            scorer_replays,
             traj_xyyaw,
             out_dir=out_dir,
             step_tag=step_tag,
@@ -2051,16 +2081,14 @@ class SparseDriveV2Policy(Agent):
     def replay_is_compatible(self, replay: Dict[str, Any]) -> bool:
         if not isinstance(replay, dict):
             return False
-        camera_feature = replay.get("camera_feature", None)
-        status_feature = replay.get("status_feature", None)
-        if not isinstance(camera_feature, dict):
+        try:
+            model_inputs = get_policy_model_inputs(replay)
+            action_id = get_policy_action_id(replay)
+        except RuntimeError:
             return False
-        if not torch.is_tensor(status_feature):
-            return False
-        for key in ("global_mode_idx", "selected_path_idx", "selected_vel_idx"):
-            if key not in replay:
-                return False
-        return len(camera_feature) > 0
+        camera_feature = model_inputs.get("camera_feature", None)
+        status_feature = model_inputs.get("status_feature", None)
+        return isinstance(camera_feature, dict) and len(camera_feature) > 0 and torch.is_tensor(status_feature) and "global_mode_idx" in action_id
 
     def logp_from_replay(self, replay: Dict[str, Any], *, eta: float = 1.0) -> torch.Tensor:
         return self.logp_from_replay_batch([replay], eta=float(eta)).view(())

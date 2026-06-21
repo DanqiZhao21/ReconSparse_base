@@ -265,7 +265,7 @@ def compute_grpo_objective(
     score_norm_eps: float = 1e-6,
     use_rank_adv: bool = False,
     score_clip: float | None = None,
-    objective: str = "logprob",
+    objective: str = "grpo",
     temperature: float = 1.0,
     clip_eps: float = 0.2,
 ) -> TrajectoryGRPOObjective:
@@ -291,51 +291,30 @@ def compute_grpo_objective(
         score_std = scores.std(dim=1, keepdim=True, unbiased=False)
         advantages = (scores - score_mean) / (score_std + float(score_norm_eps))
 
+    del candidate_score_logits, temperature
     objective_key = str(objective).strip().lower()
-    if objective_key in {"logprob", "reinforce", "grpo"}:
-        loss = -(advantages.detach() * candidate_log_probs).mean()
-        approx_kl = torch.zeros((), device=candidate_log_probs.device, dtype=torch.float32)
-        clip_frac = torch.zeros((), device=candidate_log_probs.device, dtype=torch.float32)
-        ratio_mean = torch.ones((), device=candidate_log_probs.device, dtype=torch.float32)
-    elif objective_key == "expected_prob":
-        logits = candidate_score_logits
-        if logits is None:
-            logits = candidate_log_probs
-        logits = logits.to(device=candidate_log_probs.device, dtype=torch.float32)
-        if tuple(logits.shape) != tuple(candidate_log_probs.shape):
-            raise ValueError(
-                "candidate_score_logits must match candidate_log_probs shape for expected_prob objective; "
-                f"got logits={tuple(logits.shape)} log_probs={tuple(candidate_log_probs.shape)}"
-            )
-        temp = max(1.0e-6, float(temperature))
-        probs = torch.softmax(logits / temp, dim=1)
-        loss = -(probs * advantages.detach()).sum(dim=1).mean()
-        approx_kl = torch.zeros((), device=candidate_log_probs.device, dtype=torch.float32)
-        clip_frac = torch.zeros((), device=candidate_log_probs.device, dtype=torch.float32)
-        ratio_mean = torch.ones((), device=candidate_log_probs.device, dtype=torch.float32)
-    elif objective_key in {"clipped_ratio", "ppo_ratio", "strict_grpo"}:
-        if old_candidate_log_probs is None:
-            raise ValueError("objective='clipped_ratio' requires old_candidate_log_probs")
-        old_log_probs = old_candidate_log_probs.to(device=candidate_log_probs.device, dtype=torch.float32)
-        if tuple(old_log_probs.shape) != tuple(candidate_log_probs.shape):
-            raise ValueError(
-                "old_candidate_log_probs must match candidate_log_probs shape for clipped_ratio objective; "
-                f"got old={tuple(old_log_probs.shape)} new={tuple(candidate_log_probs.shape)}"
-            )
-        log_ratio = candidate_log_probs - old_log_probs
-        ratio = torch.exp(log_ratio)
-        adv_detached = advantages.detach()
-        unclipped = ratio * adv_detached
-        clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_eps), 1.0 + float(clip_eps))
-        clipped = clipped_ratio * adv_detached
-        loss = -torch.min(unclipped, clipped).mean()
-        approx_kl = ((ratio - 1.0) - log_ratio).mean()
-        clip_frac = ((ratio - 1.0).abs() > float(clip_eps)).to(dtype=torch.float32).mean()
-        ratio_mean = ratio.mean()
-    else:
+    if objective_key != "grpo":
         raise ValueError(
-            f"Unsupported GRPO objective={objective!r}; expected 'logprob', 'expected_prob', or 'clipped_ratio'"
+            f"Unsupported GRPO objective={objective!r}; expected 'grpo'"
         )
+    if old_candidate_log_probs is None:
+        raise ValueError("objective='grpo' requires old_candidate_log_probs")
+    old_log_probs = old_candidate_log_probs.to(device=candidate_log_probs.device, dtype=torch.float32)
+    if tuple(old_log_probs.shape) != tuple(candidate_log_probs.shape):
+        raise ValueError(
+            "old_candidate_log_probs must match candidate_log_probs shape for GRPO; "
+            f"got old={tuple(old_log_probs.shape)} new={tuple(candidate_log_probs.shape)}"
+        )
+    log_ratio = candidate_log_probs - old_log_probs
+    ratio = torch.exp(log_ratio)
+    adv_detached = advantages.detach()
+    unclipped = ratio * adv_detached
+    clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_eps), 1.0 + float(clip_eps))
+    clipped = clipped_ratio * adv_detached
+    loss = -torch.min(unclipped, clipped).mean()
+    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+    clip_frac = ((ratio - 1.0).abs() > float(clip_eps)).to(dtype=torch.float32).mean()
+    ratio_mean = ratio.mean()
     score_mean = scores.mean(dim=1)
     score_std = scores.std(dim=1, unbiased=False)
     score_min = scores.min(dim=1).values
