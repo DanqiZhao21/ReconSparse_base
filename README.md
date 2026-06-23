@@ -141,33 +141,8 @@ rm -rf /root/clone/ReconDreamer-RL/.cache/torch_extensions/gsplat_cuda_legacy
 
 ### 策略后端资源
 
-策略代码默认从 [`egoADs/`](egoADs/) 下解析；如果对应子目录不存在，代码才会回退到仓库根目录同名目录。当前主配置使用 SparseDriveV2：
+Egocar 策略代码默认从 [`egoADs/`](egoADs/) 下解析。根目录环境已经整理了 actor-learner 训练 sparsedrive-v2 需要的组合依赖。如果改用 DiffusionDriveV2 或 SparseDrive，需要在 conda 环境中更新相关依赖。
 
-```yaml
-agent:
-  type: sparsedrive_v2
-  ckpt: SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
-```
-
-因此需要确认以下文件或软链接存在：
-
-```bash
-ls -l egoADs/SparseDriveV2/ckpt
-ls -l egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
-ls -l egoADs/SparseDriveV2/ckpt/resnet34.bin
-ls -l egoADs/SparseDriveV2/ckpt/kmeans
-```
-
-SparseDriveV2 的原始环境文件位于 [`egoADs/SparseDriveV2/environment.yml`](egoADs/SparseDriveV2/environment.yml)，但它是该外部策略项目自己的 Python 3.9 / torch 2.0.1 环境说明；在本仓库训练主链路中，不要用它覆盖根目录 [`environment.yml`](environment.yml)。根目录环境已经整理了 actor-learner 训练需要的组合依赖。
-
-如果改用 DiffusionDriveV2 或 SparseDrive，需要同步确认对应资源：
-
-```bash
-ls -l egoADs/DiffusionDriveV2/ckpt
-ls -l egoADs/SparseDrive/ckpt
-```
-
-并检查运行 YAML 中的 `agent.type`、`agent.ckpt`、`agent.config` 是否和实际策略一致。
 
 ### HUGSIM-ORI 独立环境
 
@@ -500,4 +475,5 @@ TRAINING_LOCK        # learner 更新 / 权重发布阶段的互斥标记
 - [`framework/lightning/README.md`](framework/lightning/README.md)：Lightning learner 生命周期。
 - [`framework/rewards/README.md`](framework/rewards/README.md)：reward 计算与调试。
 
-主训练入口始终是 [`script/train_actor_learner_v2.py`](script/train_actor_learner_v2.py)。修改 actor-learner 主链路时，请保持 shard、runtime files、checkpoint/version 发布和 actor reload 行为的一致性。
+训练框架环境配置可以参考 [GigaAI-research/ReconDreamer-RL](https://github.com/GigaAI-research/ReconDreamer-RL) 和 [swc-17/SparseDriveV2](https://github.com/swc-17/SparseDriveV2)。
+
