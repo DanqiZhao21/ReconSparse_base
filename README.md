@@ -1,6 +1,6 @@
-# 🚗 ReconDreamer-RL
+# 🚗 ReconSparse
 
-ReconDreamer-RL 是一个面向自动驾驶闭环仿真的强化学习训练仓库。它把策略模型、重建仿真环境、actor-learner 采样训练、PPO / ReinforcePP / SAC-style objective、reward shaping、checkpoint 发布和训练后评估组织在同一个训练工程中。
+ReconSparse 是一个面向自动驾驶闭环仿真的强化学习训练仓库。它把策略模型、重建仿真环境、actor-learner 采样训练、PPO / ReinforcePP / SAC-style objective、reward shaping、checkpoint 发布和训练后评估组织在同一个训练工程中。
 
 当前主训练路径采用文件缓冲区形式的 actor-learner：
 
