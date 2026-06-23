@@ -84,6 +84,80 @@ class _FusedDummyAgent:
         }
 
 
+class _AuxOnlyFusedDummyAgent:
+    def __init__(self) -> None:
+        self.trainable_module = torch.nn.Linear(1, 1)
+        self.fused_calls = 0
+
+    def replay_policy_outputs_from_replay_batch(
+        self,
+        replay,
+        *,
+        eta: float = 1.0,
+        num_candidates: int,
+        candidate_select: str = "topk",
+    ):
+        del replay, eta, num_candidates, candidate_select
+        self.fused_calls += 1
+        return {
+            "new_logp": torch.tensor([0.1, 0.2], dtype=torch.float32),
+            "counterfactual": {
+                "traj_xyyaw": torch.zeros((2, 3, 4, 3), dtype=torch.float32),
+                "log_probs": torch.full((2, 3), -0.5, dtype=torch.float32),
+                "score_logits": torch.zeros((2, 3), dtype=torch.float32),
+            },
+        }
+
+
+def test_auxiliary_only_does_not_require_grpo_old_log_probs(monkeypatch) -> None:
+    agent = _AuxOnlyFusedDummyAgent()
+    learner_config = ActorLearnerLightningConfig(
+        algo_kind="reinforcepp",
+        optimizer_config=LearnerOptimizerConfig(policy_lr=1.0e-4, value_lr=5.0e-5, weight_decay=0.0),
+        eta=1.0,
+        clip_eps=0.2,
+        kl_coef=0.0,
+        grpo_enabled=False,
+        grpo_coef=0.0,
+        grpo_num_candidates=0,
+        aux_risk_decel_enabled=True,
+        aux_risk_decel_coef=1.0,
+    )
+    module = TrajectoryLightningModule(agent=agent, learner_config=learner_config)
+
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.compute_reinforce_objective",
+        lambda **kwargs: SimpleNamespace(loss=torch.tensor(2.0, dtype=torch.float32)),
+    )
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.compute_reinforce_metrics",
+        lambda **kwargs: {"loss_pi": torch.tensor(2.0, dtype=torch.float32)},
+    )
+    monkeypatch.setattr(
+        "framework.lightning.trajectory_module.compute_risk_decel_auxiliary_objective",
+        lambda **kwargs: SimpleNamespace(
+            loss=torch.tensor(0.25, dtype=torch.float32),
+            active_count=torch.tensor(1.0, dtype=torch.float32),
+            decel_prob_mean=torch.tensor(0.75, dtype=torch.float32),
+            accel_prob_mean=torch.tensor(0.25, dtype=torch.float32),
+        ),
+    )
+
+    batch = {
+        "replay": [{"front_obstacle": {"available": False}}, {"front_obstacle": {"available": False}}],
+        "adv": torch.tensor([0.2, 0.4], dtype=torch.float32),
+        "ret": torch.tensor([1.0, 1.5], dtype=torch.float32),
+        "old_logp": torch.tensor([-0.3, -0.4], dtype=torch.float32),
+    }
+
+    loss = module.training_step(batch, batch_idx=0)
+
+    assert torch.is_tensor(loss)
+    assert torch.allclose(loss.detach(), torch.tensor(2.25, dtype=torch.float32))
+    assert agent.fused_calls == 1
+    assert module.latest_metrics["aux_risk_decel_loss"] == 0.25
+
+
 def test_ppo_shared_grpo_uses_fused_replay_policy_outputs(monkeypatch) -> None:
     agent = _FusedDummyAgent()
     learner_config = ActorLearnerLightningConfig(

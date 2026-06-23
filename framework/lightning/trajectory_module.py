@@ -173,35 +173,37 @@ class TrajectoryLightningModule(L.LightningModule):
         else:
             if timing_parts is not None:
                 timing_parts.setdefault("grpo_sample_s", 0.0)
-        candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
-        old_candidate_log_probs = candidates.get("old_log_probs", None)
-        if old_candidate_log_probs is None:
-            raise RuntimeError("GRPO requires candidates['old_log_probs']")
-        t0 = time.perf_counter()
-        candidate_scores = score_counterfactual_trajectories(
-            self.agent,
-            replay,
-            candidates["traj_xyyaw"],
-            device=device,
-        )
-        score_s = float(time.perf_counter() - t0)
-        if timing_parts is not None:
-            timing_parts["grpo_score_s"] = timing_parts.get("grpo_score_s", 0.0) + score_s
-        self._maybe_report_slow_step_part(name="grpo_score", seconds=score_s, batch_idx=batch_idx)
-        t0 = time.perf_counter()
-        self._maybe_dump_grpo_debug(
-            replay=replay,
-            traj_xyyaw=candidates["traj_xyyaw"],
-            candidate_scores=candidate_scores,
-            batch_idx=batch_idx,
-        )
-        debug_s = float(time.perf_counter() - t0)
-        if timing_parts is not None:
-            timing_parts["grpo_debug_s"] = timing_parts.get("grpo_debug_s", 0.0) + debug_s
-        self._maybe_report_slow_step_part(name="grpo_debug", seconds=debug_s, batch_idx=batch_idx)
         out_loss = loss
         out_metrics = dict(metrics)
+        if loss_requested or debug_requested:
+            t0 = time.perf_counter()
+            candidate_scores = score_counterfactual_trajectories(
+                self.agent,
+                replay,
+                candidates["traj_xyyaw"],
+                device=device,
+            )
+            score_s = float(time.perf_counter() - t0)
+            if timing_parts is not None:
+                timing_parts["grpo_score_s"] = timing_parts.get("grpo_score_s", 0.0) + score_s
+            self._maybe_report_slow_step_part(name="grpo_score", seconds=score_s, batch_idx=batch_idx)
+            t0 = time.perf_counter()
+            self._maybe_dump_grpo_debug(
+                replay=replay,
+                traj_xyyaw=candidates["traj_xyyaw"],
+                candidate_scores=candidate_scores,
+                batch_idx=batch_idx,
+            )
+            debug_s = float(time.perf_counter() - t0)
+            if timing_parts is not None:
+                timing_parts["grpo_debug_s"] = timing_parts.get("grpo_debug_s", 0.0) + debug_s
+            self._maybe_report_slow_step_part(name="grpo_debug", seconds=debug_s, batch_idx=batch_idx)
+
         if loss_requested:
+            candidate_log_probs = candidates["log_probs"].to(device=device, dtype=torch.float32)
+            old_candidate_log_probs = candidates.get("old_log_probs", None)
+            if old_candidate_log_probs is None:
+                raise RuntimeError("GRPO requires candidates['old_log_probs']")
             t0 = time.perf_counter()
             grpo_loss = compute_grpo_objective(
                 candidate_log_probs=candidate_log_probs,
