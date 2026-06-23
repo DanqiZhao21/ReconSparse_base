@@ -13,12 +13,12 @@ cd /root/clone/ReconDreamer-RL
 
 python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   --scene 0051 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605251610_HUGSM_reinforcepp_closed_loop_closeCloselopop_openGRPOCraft.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
   
 python tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori.py \
   --hugsim-scene scene-0411-medium-00 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606051203_HUGSM_reinforcepp_closed_loop_steppath_hd_collision_only_extreme_NoGRPOCraft_substeps1.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
   --mode-select greedy
 """

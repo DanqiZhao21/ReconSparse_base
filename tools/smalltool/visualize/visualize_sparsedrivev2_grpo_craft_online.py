@@ -1,9 +1,9 @@
 
 '''
-# 注意改动一下scene 以及output 的地址
+# Update the scene id and output path for each run.
 python /root/clone/ReconDreamer-RL/tools/smalltool/visualize/visualize_sparsedrivev2_grpo_CRAFT_online.py \
-  --config script/configs/sparsedrive_v2/reinforcepp_closed_loop_sparsedrive_v2_craft.yaml \
-  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/20260519_grpo_only_craft_ver01_latest.ckpt \
+  --config script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
+  --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
   --scene 123 \
   --out /root/clone/ReconDreamer-RL/outputs/visualize/CRAFT_online_visualize/online_sdv2_craft_grpo_scene123 \
   --num-candidates 16 \

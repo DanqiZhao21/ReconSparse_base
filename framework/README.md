@@ -88,7 +88,7 @@ export HUGSIM_ROOT=/root/clone/HUGSIM-ORI
 ```bash
 cd /root/clone/ReconDreamer-RL
 
-CONFIG=script/configs/sparsedrive_v2/202606151204_HUGSM_reinforcepp_closed_loop_steppath_hd_EncourageProgress_CollisionPenalty_advnorm_NoGRPOCraft_substeps1.yaml
+CONFIG=script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 python -u script/train_actor_learner_v2.py \
@@ -127,7 +127,7 @@ cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 python -u script/train_eval_pipeline.py \
-  --reinforcepp-config script/configs/sparsedrive_v2/202606151204_HUGSM_reinforcepp_closed_loop_steppath_hd_EncourageProgress_CollisionPenalty_advnorm_NoGRPOCraft_substeps1.yaml
+  --reinforcepp-config script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 ```
 
 也可以使用 shell wrapper：

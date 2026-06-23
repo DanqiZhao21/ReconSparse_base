@@ -1,5 +1,5 @@
 # ----------------------
-# 临时文件 / 缓存
+# Temporary files and caches
 # ----------------------
 *.log
 *.tmp
@@ -8,28 +8,28 @@
 *.npz
 
 # ----------------------
-# PyTorch / Lightning 输出
+# PyTorch / Lightning outputs
 # ----------------------
 /lightning_logs/
 /checkpoints/
 /*.ckpt
 
 # ----------------------
-# 数据集 / 大文件
+# Datasets and large artifacts
 # ----------------------
 /OpenDataset/
 /*.pkl
 *.xz
 
 # ----------------------
-# 你指定不上传的目录
+# Local-only directories
 # ----------------------
 /visual/
-/assets/   # 软链接也会被忽略
+/assets/   # symbolic links are ignored as well
 /DiffusionDriveV2/gtrs_traj/
 gtrs_traj/
 # ----------------------
-# Python / IDE 相关
+# Python and IDE files
 # ----------------------
 __pycache__/
 *.pyc
@@ -50,28 +50,40 @@ tmp/
 
 script/train_actor_learner_v2_0311.py
 script/train_actor_learner_v2_0307.py
+script/debug_*.py
+script/eval_human_policy.py
+script/evaluate_existing_sparsedrive_v2_ckpts.py
 
 flash-attention/
 
 egoADs/
 
 test/
+tests/
 docs/
 
-script/configs/sparsedrive_v2/old/
+# Only keep the canonical SparseDriveV2 training template under version control.
+/script/configs/**/*.yaml
+!/script/configs/
+!/script/configs/sparsedrive_v2/
+!/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 
 
 
 AGENTS.md
 /README_old.md
 /craftdrive-keyu.pdf
+/Reinforce++.pdf
+/pyrightconfig.json
 RL-cky/
 
-# tools 目录只保留可复用的可视化工具，其它本地小工具不纳入版本控制
+# Keep only reusable visualization tools under version control.
 /tools/*
 !/tools/smalltool/
 /tools/smalltool/*
 !/tools/smalltool/visualize/
 !/tools/smalltool/visualize/**
+/tools/smalltool/visualize/generate_video_sparsedrive_v2-HUGSIMori-detailed.py
+/tools/smalltool/visualize/replay_expert_vs_csv_video.py
 /tools/smalltool/visualize/**/__pycache__/
 /tools/smalltool/visualize/**/*.py[cod]

@@ -18,8 +18,8 @@ cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
   --role orchestrator \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606151204_HUGSM_reinforcepp_closed_loop_steppath_hd_EncourageProgress_CollisionPenalty_advnorm_NoGRPOCraft_substeps1.yaml
-#如果一直启动不起来卡在gsplat编译:
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
+# If startup stalls during gsplat compilation:
 rm -rf /root/clone/ReconDreamer-RL/.cache/torch_extensions/gsplat_cuda_legacy
 
 '''

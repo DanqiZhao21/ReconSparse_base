@@ -223,7 +223,7 @@ Symbolic links only define local data entrypoints. The effective runtime paths a
 ```bash
 PYTHONPATH=/root/clone/ReconDreamer-RL python -u script/train_actor_learner_v2.py \
   --role orchestrator \
-  --config script/configs/sparsedrive_v2/xxx.yaml
+  --config script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 ```
 
 HUGSIM-related paths are mainly configured under `env.hugsim`:
@@ -330,7 +330,7 @@ Use the `orchestrator` role to launch the learner and actors:
 ```bash
 cd /root/clone/ReconDreamer-RL
 
-CONFIG=script/configs/sparsedrive_v2/202606151204_HUGSM_reinforcepp_closed_loop_steppath_hd_EncourageProgress_CollisionPenalty_advnorm_NoGRPOCraft_substeps1.yaml
+CONFIG=script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 python -u script/train_actor_learner_v2.py \
@@ -369,7 +369,7 @@ cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 python -u script/train_eval_pipeline.py \
-  --reinforcepp-config script/configs/sparsedrive_v2/202606151204_HUGSM_reinforcepp_closed_loop_steppath_hd_EncourageProgress_CollisionPenalty_advnorm_NoGRPOCraft_substeps1.yaml
+  --reinforcepp-config script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 ```
 
 Wrapper scripts are also available:

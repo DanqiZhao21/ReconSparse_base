@@ -3,7 +3,7 @@
 
 Example:
 CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_grpo_hugsim_online.py \
-  --config script/configs/sparsedrive_v2/202605280811_HUGSM_reinforcepp_closed_loop_Noclose_GRPOCrafty.yaml \
+  --config script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
   --scene-name YOUR_HUGSIM_SCENE_NAME \
   --duration-s 8 \
@@ -16,7 +16,7 @@ CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/visualize_sparsedrivev2_
   /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0411-medium-00.yaml
   
 CUDA_VISIBLE_DEVICES=2 python tools/smalltool/visualize/visualize_sparsedrivev2_grpo_hugsim_online.py \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202606130003_HUGSM_reinforcepp_closed_loop_steppath_hd_collision_only_extreme_GRPOPdm_auxRiskDecel_substeps1.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/20260610_164918_3_ColisionOnly_NoCraft_ReinforcePP_NoGRPO_ver01_latest.ckpt \
   --scenario-path /root/clone/HUGSIM-ORI/configs/scenarios/nuscenes/scene-0062-medium-00.yaml \
   --max-steps 42 \

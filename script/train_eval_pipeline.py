@@ -16,23 +16,23 @@ import yaml
 
 '''
 #####################
-默认只跑 reinforcepp
-只有显式加 --ppo 才跑 ppo
+Runs only reinforcepp by default.
+Add --ppo explicitly to run PPO as well.
 #####################
 cd /root/clone/ReconDreamer-RL
 
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 python -u script/train_eval_pipeline.py \
-  --reinforcepp-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+  --reinforcepp-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 
 #####################
-PPO版本
+PPO variant
 #####################
 PYTHONPATH=/root/clone/ReconDreamer-RL \
 python -u script/train_eval_pipeline.py \
   --ppo \
-  --ppo-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/xxx.yaml \
-  --reinforcepp-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605211155_reinforcepp_closed_loop_sparsedrive_v2_craft_closeNo_openGRPO.yaml
+  --ppo-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
+  --reinforcepp-config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml
 '''
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +42,8 @@ DEFAULT_TRAIN_PYTHON = Path("/root/miniconda3/envs/recondreamerNew-rl/bin/python
 DEFAULT_HUGSIM_TEMPLATE = HUGSIM_ROOT / "configs" / "sim" / "nuscenes_eval_sparsedrive_v2_ppo_grpo_ver14.yaml"
 DEFAULT_SCENARIO_DIR = HUGSIM_ROOT / "configs" / "scenarios" / "nuscenes"
 DEFAULT_EVAL_OUTPUT_ROOT = HUGSIM_ROOT / "outputs" / "evaluate-auto"
-DEFAULT_PPO_CONFIG = REPO_ROOT / "script" / "configs" / "sparsedrive_v2" / "ppo_closed_loop_sparsedrive_v2.yaml"
-DEFAULT_REINFORCEPP_CONFIG = REPO_ROOT / "script" / "configs" / "sparsedrive_v2" / "reinforcepp_closed_loop_sparsedrive_v2.yaml"
+DEFAULT_PPO_CONFIG = REPO_ROOT / "script" / "configs" / "sparsedrive_v2" / "20260616_template_HUGSM_algo-dsl.yaml"
+DEFAULT_REINFORCEPP_CONFIG = REPO_ROOT / "script" / "configs" / "sparsedrive_v2" / "20260616_template_HUGSM_algo-dsl.yaml"
 DEFAULT_RUN_ROOT = REPO_ROOT / "outputs" / "TrainEvaluationAuto"
 DEFAULT_EVAL_SLOTS = ["0:0", "1:1", "2:2", "3:3", "4:4", "5:5", "6:6", "7:7"]
 DEFAULT_MAX_SCENES = 88

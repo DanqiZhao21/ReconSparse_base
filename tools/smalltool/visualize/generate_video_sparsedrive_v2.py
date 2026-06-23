@@ -9,20 +9,20 @@ Pipeline per step:
 Unavailable parts are kept as placeholders (e.g., exact mode log-prob from V2).
 
 
-新参数：
+Reward detail output:
 
 --reward-detail-format ipynb
-默认就是 ipynb。如果某次不想生成，可以用：
+The default is ipynb. To disable generation for a run, use:
 
 --reward-detail-format none
 
 cd /root/clone/ReconDreamer-RL
 
-#在线生成reward可视化视频
+# Generate an online reward visualization video.
 
 CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
   --scene 123 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/old/20260521_reinforcepp_closed_loop_sparsedrive_v2_craft_corrective_progress_grpo.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt \
   --out /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_CraftGrpo+CraftCloseReward.ipynb.mp4 \
   --traj-csv /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/scene123_CraftGrpo+CraftCloseReward_bev.csv \
@@ -31,7 +31,7 @@ CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/generate_video_sparsedri
   --save-keyframes \
   --debug
 
-绘制已经有shard:
+Render an existing shard:
 python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
   --from-shard /root/clone/ReconDreamer-RL/outputs/actor_learner_reinforcepp_craft_safety/buffer/consumed/actor0_e0_v16_t1779248747_8378e3e7.pt \
   --out /root/clone/ReconDreamer-RL/outputs/RewardCheckandVideo/actor0_e0_v16_t1779248747_8378e3e7_shard_replay.mp4 \
@@ -40,10 +40,10 @@ python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
   --reward-detail-format ipynb \
   --save-keyframes
   
-精简版本：
+Minimal example:
 CUDA_VISIBLE_DEVICES=1 python tools/smalltool/visualize/generate_video_sparsedrive_v2.py \
   --scene 36 \
-  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/202605250049_reinforcepp_closed_loop_sparsedrive_v2_craft_closeCloseloop_openGRPOCraft-FullPara.yaml \
+  --config /root/clone/ReconDreamer-RL/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml \
   --ckpt /root/clone/ReconDreamer-RL/egoADs/SparseDriveV2/ckpt/sparsedrive_navsimv2.ckpt
 """
 

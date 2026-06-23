@@ -35,8 +35,8 @@ env:
       use_hugsim_inserted_objects: true
     substeps_per_rl_step: 1
   #############################
-  #此处需要手动选择env reward模式
-  #手动调节各个具体的参数weight以及threshold
+  # Select the environment reward mode here.
+  # Tune individual reward weights and thresholds manually.
   #############################
   reward:                
     mode: step_path
@@ -233,46 +233,46 @@ env:
         apply_on_env_done: false
 train:
   ###########################################################################
-  # 手动选择训练算法组合，只改这一行即可切换主实验类型。
+  # Select the training algorithm composition here. Change only this line to switch the primary experiment type.
   #
-  # 格式:
+  # Format:
   #   <closed_loop>-<grpo_switch>-<aux_switch>
   #
-  # 第一段 closed_loop:
-  #   reinforcepp       闭环 REINFORCE++ / policy gradient
-  #   ppo               闭环 PPO，使用 value/critic 路径
-  #   sac               闭环 SAC-style policy objective
-  #   noclosereward     不使用闭环 reward loss，只保留 GRPO/aux 路径
+  # First segment, closed_loop:
+  #   reinforcepp       Closed-loop REINFORCE++ / policy gradient
+  #   ppo               Closed-loop PPO with the value / critic path
+  #   sac               Closed-loop SAC-style policy objective
+  #   noclosereward     Disable closed-loop reward loss and keep only the GRPO / auxiliary path
   #
-  # 第二段 grpo_switch:
-  #   grpo              启用 train.grpo，并使用 train.grpo.scorer
-  #   nogrpo            关闭 GRPO；normalization 会把 coef 和 num_candidates 归零
+  # Second segment, grpo_switch:
+  #   grpo              Enable train.grpo and use train.grpo.scorer
+  #   nogrpo            Disable GRPO; normalization sets coef and num_candidates to zero
   #
-  # 第三段 aux_switch:
-  #   aux               启用 train.auxiliary；具体 loss 看 train.auxiliary.*.coef
-  #   noaux             关闭 auxiliary；normalization 会把 auxiliary loss 权重归零
+  # Third segment, aux_switch:
+  #   aux               Enable train.auxiliary; loss weights are defined by train.auxiliary.*.coef
+  #   noaux             Disable auxiliary losses; normalization sets auxiliary loss weights to zero
   #
-  # 常用组合:
-  #   reinforcepp-nogrpo-noaux      闭环 REINFORCE++ baseline
-  #   reinforcepp-grpo-noaux        闭环 REINFORCE++ + 开环 GRPO
-  #   reinforcepp-grpo-aux          闭环 REINFORCE++ + GRPO + auxiliary loss
-  #   ppo-nogrpo-noaux              闭环 PPO baseline
-  #   ppo-grpo-noaux                闭环 PPO + GRPO
-  #   sac-nogrpo-noaux              闭环 SAC baseline
-  #   sac-grpo-aux                  闭环 SAC + GRPO + auxiliary loss
-  #   noclosereward-grpo-noaux      只训练 GRPO objective，不使用闭环 reward loss
+  # Common combinations:
+  #   reinforcepp-nogrpo-noaux      Closed-loop REINFORCE++ baseline
+  #   reinforcepp-grpo-noaux        Closed-loop REINFORCE++ + open-loop GRPO
+  #   reinforcepp-grpo-aux          Closed-loop REINFORCE++ + GRPO + auxiliary loss
+  #   ppo-nogrpo-noaux              Closed-loop PPO baseline
+  #   ppo-grpo-noaux                Closed-loop PPO + GRPO
+  #   sac-nogrpo-noaux              Closed-loop SAC baseline
+  #   sac-grpo-aux                  Closed-loop SAC + GRPO + auxiliary loss
+  #   noclosereward-grpo-noaux      Train only the GRPO objective without closed-loop reward loss
   #   noclosereward-grpo-aux        GRPO-only + auxiliary loss
   #
-  # 自动派生:
-  #   train.algo 会被 normalization 改写成主算法名，如 reinforcepp。
-  #   train.algo_spec 会保存这里填写的完整组合字符串。
-  #   train.closed_loop.kind 会由第一段自动生成，不要在源 YAML 手写。
-  #   train.grpo.enable 和 train.auxiliary.enable 会由第二/第三段自动生成。
+  # Derived automatically:
+  #   train.algo is normalized to the primary algorithm name, e.g. reinforcepp.
+  #   train.algo_spec stores the full composition string defined here.
+  #   train.closed_loop.kind is generated from the first segment; do not write it manually in the source YAML.
+  #   train.grpo.enable and train.auxiliary.enable are generated from the second and third segments.
   #
-  # 注意:
-  #   noclosereward 必须搭配 grpo，否则没有有效训练 objective。
-  #   如果选择 grpo，请同步确认 train.grpo.coef、objective、candidate_select、scorer。
-  #   如果选择 aux，请同步确认 train.auxiliary.risk_decel.coef 等具体 loss 参数。
+  # Notes:
+  #   noclosereward must be paired with grpo; otherwise no effective training objective remains.
+  #   When selecting grpo, also check train.grpo.coef, objective, candidate_select, and scorer.
+  #   When selecting aux, also check train.auxiliary.risk_decel.coef and other concrete loss parameters.
   ###########################################################################
   algo: reinforcepp-nogrpo-noaux
   wandb:

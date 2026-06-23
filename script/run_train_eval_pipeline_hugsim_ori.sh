@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_REINFORCEPP_CONFIG="$REPO_ROOT/script/configs/sparsedrive_v2/202605251610_HUGSM_reinforcepp_closed_loop_closeCloselopop_openGRPOCraft-try.yaml"
+DEFAULT_REINFORCEPP_CONFIG="$REPO_ROOT/script/configs/sparsedrive_v2/20260616_template_HUGSM_algo-dsl.yaml"
 
 DEFAULT_EVAL_SEED=1
 HAS_EXPLICIT_REINFORCEPP_CONFIG=0
