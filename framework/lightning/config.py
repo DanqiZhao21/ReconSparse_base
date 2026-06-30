@@ -116,12 +116,15 @@ def resolve_grpo_config(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
             "train.grpo.config_path is reserved for future external-yaml merging and is not supported yet"
         )
 
+    enabled = bool(shared_cfg.get("enable", False))
     objective = str(shared_cfg.get("objective", "grpo")).strip().lower()
-    if objective != "grpo":
+    if enabled and objective != "grpo":
         raise ValueError(f"train.grpo.objective must be 'grpo', got {objective!r}")
+    if not enabled:
+        objective = "grpo"
 
     resolved = {
-        "enabled": bool(shared_cfg.get("enable", False)),
+        "enabled": enabled,
         "config_path": None if config_path is None else str(config_path),
         "coef": float(shared_cfg.get("coef", 0.0)),
         "num_candidates": int(shared_cfg.get("num_candidates", 0)),

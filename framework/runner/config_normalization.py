@@ -201,6 +201,7 @@ def normalize_train_algorithm_cfg(cfg: Dict[str, Any]) -> None:
     grpo_cfg["enable"] = bool(grpo_enabled)
     if not bool(grpo_enabled):
         grpo_cfg["coef"] = 0.0
+        grpo_cfg["objective"] = "grpo"
         grpo_cfg["num_candidates"] = 0
     train_cfg["grpo"] = grpo_cfg
 
