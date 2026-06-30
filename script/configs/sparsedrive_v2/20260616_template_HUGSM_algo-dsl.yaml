@@ -413,3 +413,12 @@ agent:
   trainable_prefixes: [_trajectory_head.decoder.layers.1.metric_heads]
   frozen_prefixes:
   - _backbone
+
+# 只开 metric heads
+# - _trajectory_head.decoder.layers.1.metric_heads
+
+#不只是“选候选”，而是轻微改变 planning 表征，建议先开最后一层 decoder
+# - _trajectory_head.decoder.layers.1
+
+# 开放整个 trajectory head
+# - _trajectory_head

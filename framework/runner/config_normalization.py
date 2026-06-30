@@ -25,6 +25,7 @@ _CLOSED_LOOP_ALGO_ALIASES = {
 }
 _GRPO_TOKENS = {"grpo", "nogrpo", "no_grpo"}
 _AUX_TOKENS = {"aux", "auxi", "auxiliary", "noaux", "noauxi", "no_aux", "no_auxiliary"}
+_AUXILIARY_CANDIDATE_DEFAULT = 16
 
 
 def timestamp_actor_learner_buffer_dir(cfg: Dict[str, Any], *, timestamp: str) -> str | None:
@@ -195,16 +196,6 @@ def normalize_train_algorithm_cfg(cfg: Dict[str, Any]) -> None:
     closed_loop_cfg["kind"] = str(closed_loop)
     train_cfg["closed_loop"] = closed_loop_cfg
 
-    grpo_cfg = train_cfg.get("grpo", {}) or {}
-    if not isinstance(grpo_cfg, dict):
-        grpo_cfg = {}
-    grpo_cfg["enable"] = bool(grpo_enabled)
-    if not bool(grpo_enabled):
-        grpo_cfg["coef"] = 0.0
-        grpo_cfg["objective"] = "grpo"
-        grpo_cfg["num_candidates"] = 0
-    train_cfg["grpo"] = grpo_cfg
-
     aux_cfg = train_cfg.get("auxiliary", None)
     if aux_cfg is None:
         aux_cfg = {}
@@ -220,6 +211,25 @@ def normalize_train_algorithm_cfg(cfg: Dict[str, Any]) -> None:
         risk_cfg["coef"] = 0.0
     aux_cfg["risk_decel"] = risk_cfg
     train_cfg["auxiliary"] = aux_cfg
+
+    grpo_cfg = train_cfg.get("grpo", {}) or {}
+    if not isinstance(grpo_cfg, dict):
+        grpo_cfg = {}
+    grpo_cfg["enable"] = bool(grpo_enabled)
+    if not bool(grpo_enabled):
+        grpo_cfg["coef"] = 0.0
+        grpo_cfg["objective"] = "grpo"
+        if bool(risk_cfg.get("enable", False)):
+            aux_candidate_default = int(
+                risk_cfg.get("num_candidates", _AUXILIARY_CANDIDATE_DEFAULT) or _AUXILIARY_CANDIDATE_DEFAULT
+            )
+            grpo_cfg["num_candidates"] = max(
+                1,
+                int(grpo_cfg.get("num_candidates", aux_candidate_default) or aux_candidate_default),
+            )
+        else:
+            grpo_cfg["num_candidates"] = 0
+    train_cfg["grpo"] = grpo_cfg
 
     cfg["train"] = train_cfg
 

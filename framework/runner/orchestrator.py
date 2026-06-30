@@ -214,6 +214,7 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
     actor_procs: List[subprocess.Popen] = []
     reported_actor_exits: set[int] = set()
     actor_restart_counts: Dict[int, int] = {}
+    learner_exit: tuple[int, int] | None = None
     try:
         for aid in range(num_actors):
             gpu_id = int(actor_gpu_plan[aid]) if aid < len(actor_gpu_plan) else -1
@@ -287,6 +288,8 @@ def orchestrator_main(cfg: Dict[str, Any], *, config_path: str | None = None) ->
             _terminate_process(proc, timeout_s=15.0)
         for proc in learner_procs:
             _terminate_process(proc, timeout_s=15.0)
+    if learner_exit is not None and int(learner_exit[1]) != 0:
+        raise RuntimeError(f"learner rank={learner_exit[0]} exited code={learner_exit[1]}")
 
 
 __all__ = ["LearnerLaunchSpec", "build_learner_launch_specs", "orchestrator_main"]

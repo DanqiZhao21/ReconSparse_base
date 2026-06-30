@@ -76,7 +76,7 @@ def build_agent(cfg: Dict[str, Any], *, device: torch.device) -> Any:
             trainable_prefixes=trainable_prefixes,
             frozen_prefixes=frozen_prefixes,
             nuscenes_scorer_config=nuscenes_scorer_config,
-            grpo_num_candidates=(int(grpo_cfg.get("num_candidates", 0) or 0) if bool(grpo_cfg.get("enable", False)) else 0),
+            grpo_num_candidates=int(grpo_cfg.get("num_candidates", 0) or 0),
         )
     from framework.agent.policy_diffusiondrivev2 import DiffusionDriveV2Policy
 
